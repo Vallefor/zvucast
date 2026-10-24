@@ -346,6 +346,21 @@ fn sleep_stop(stop: &AtomicBool, total: Duration) {
     }
 }
 
+fn loopback_args(zone_id: &str) -> Vec<String> {
+    let sink = sink_name(zone_id);
+    let source = monitor_name(zone_id);
+    let mut args = virtual_output::loopback_front(&process_name(zone_id));
+    args.push("--capture-props".into());
+    args.push(format!(
+        "media.class=Audio/Sink node.name={sink} node.description=ZvucastSpotify audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.virtual=true"
+    ));
+    args.push("--playback-props".into());
+    args.push(format!(
+        "media.class=Audio/Source node.name={source} node.description=ZvucastSpotifyMonitor audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.passive=true node.virtual=true"
+    ));
+    args
+}
+
 fn ensure_cable(zone_id: &str) -> Result<Option<Child>> {
     let sink = sink_name(zone_id);
     let source = monitor_name(zone_id);
@@ -354,20 +369,7 @@ fn ensure_cable(zone_id: &str) -> Result<Option<Child>> {
     }
     let _ = Command::new("pkill").args(["-f", &format!("pw-loopback --name {}", process_name(zone_id))]).status();
     let mut child = Command::new("pw-loopback")
-        .arg("--name")
-        .arg(process_name(zone_id))
-        .arg("--channels")
-        .arg("2")
-        .arg("--channel-map")
-        .arg("[ FL, FR ]")
-        .arg("--capture-props")
-        .arg(format!(
-            "media.class=Audio/Sink node.name={sink} node.description=ZvucastSpotify audio.rate=48000 node.latency=128/48000 node.virtual=true"
-        ))
-        .arg("--playback-props")
-        .arg(format!(
-            "media.class=Audio/Source node.name={source} node.description=ZvucastSpotifyMonitor audio.rate=48000 node.latency=128/48000 node.passive=true node.virtual=true"
-        ))
+        .args(loopback_args(zone_id))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -540,6 +542,25 @@ mod tests {
         assert_eq!(zone_source("hall", true, true).as_deref(), Some("zvucast-spotify-hall-monitor"));
         assert_eq!(zone_source("hall", false, true).as_deref(), Some("zvucast-hall-monitor"));
         assert_eq!(zone_source("hall", false, false), None);
+    }
+
+    #[test]
+    fn spotify_cable_is_three_milliseconds_and_locks_quantum() {
+        let args = loopback_args("hall");
+        assert!(
+            args.windows(2).any(|pair| pair == ["--latency", "3"]),
+            "{args:?}"
+        );
+        assert_eq!(args[1], process_name("hall"));
+        for flag in ["--capture-props", "--playback-props"] {
+            let props = args
+                .windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].as_str())
+                .unwrap_or("");
+            assert!(props.contains("node.lock-quantum=true"), "{flag}: {props}");
+            assert!(props.contains("node.latency=128/48000"), "{flag}: {props}");
+        }
     }
 
     #[test]

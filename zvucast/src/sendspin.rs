@@ -1222,6 +1222,21 @@ fn adopted_cable_still_up<E>(dump: Result<&str, E>, zone_id: &str) -> bool {
     }
 }
 
+fn loopback_args(zone_id: &str) -> Vec<String> {
+    let sink = sink_name(zone_id);
+    let source = monitor_name(zone_id);
+    let mut args = virtual_output::loopback_front(&sink);
+    args.push("--capture-props".into());
+    args.push(format!(
+        "media.class=Audio/Sink node.name={sink} node.description=ZvucastSendspin audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.virtual=true"
+    ));
+    args.push("--playback-props".into());
+    args.push(format!(
+        "media.class=Audio/Source node.name={source} node.description=ZvucastSendspinMonitor audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.passive=true node.virtual=true"
+    ));
+    args
+}
+
 async fn ensure_cable(
     zone_id: &str,
     cable: &mut Option<Child>,
@@ -1235,25 +1250,11 @@ async fn ensure_cable(
         kill_child(old);
     }
     let sink = sink_name(zone_id);
-    let source = monitor_name(zone_id);
     let _ = Command::new("pkill")
         .args(["-f", &loopback_pkill_pattern(zone_id)])
         .status();
     let mut child = Command::new("pw-loopback")
-        .arg("--name")
-        .arg(&sink)
-        .arg("--channels")
-        .arg("2")
-        .arg("--channel-map")
-        .arg("[ FL, FR ]")
-        .arg("--capture-props")
-        .arg(format!(
-            "media.class=Audio/Sink node.name={sink} node.description=ZvucastSendspin audio.rate=48000 node.latency=128/48000 node.virtual=true"
-        ))
-        .arg("--playback-props")
-        .arg(format!(
-            "media.class=Audio/Source node.name={source} node.description=ZvucastSendspinMonitor audio.rate=48000 node.latency=128/48000 node.passive=true node.virtual=true"
-        ))
+        .args(loopback_args(zone_id))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1594,6 +1595,25 @@ mod tests {
         let sink = "zvucast-sendspin-z1";
         assert!(output_is_sink(sink, sink));
         assert!(!output_is_sink("zvucast-sendspin-z10", sink));
+    }
+
+    #[test]
+    fn sendspin_cable_is_three_milliseconds_and_locks_quantum() {
+        let args = loopback_args("z1");
+        assert!(
+            args.windows(2).any(|pair| pair == ["--latency", "3"]),
+            "{args:?}"
+        );
+        assert_eq!(args[1], sink_name("z1"));
+        for flag in ["--capture-props", "--playback-props"] {
+            let props = args
+                .windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].as_str())
+                .unwrap_or("");
+            assert!(props.contains("node.lock-quantum=true"), "{flag}: {props}");
+            assert!(props.contains("node.latency=128/48000"), "{flag}: {props}");
+        }
     }
 
     #[test]

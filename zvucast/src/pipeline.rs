@@ -744,16 +744,21 @@ fn attach_pw_zone(
     Ok(())
 }
 
+/// Два буфера и сброс вниз: монитор не копит очередь дольше кванта.
+fn monitor_queue(name: String) -> Result<gst::Element> {
+    Ok(gst::ElementFactory::make("queue")
+        .property("name", name)
+        .property_from_str("leaky", "downstream")
+        .property("max-size-buffers", 2u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .build()?)
+}
+
 /// Ветка монитора в живой микшер зоны. Пейлоадер и line-in не трогает.
 fn add_monitor_branch(pipe: &gst::Pipeline, mix: &gst::Element, token: &str) -> Result<()> {
     let src = live_appsrc(&format!("cap-{token}"))?;
-    let hold = gst::ElementFactory::make("queue")
-        .property("name", format!("mhold-{token}"))
-        .property_from_str("leaky", "downstream")
-        .property("max-size-buffers", 8u32)
-        .property("max-size-bytes", 0u32)
-        .property("max-size-time", 0u64)
-        .build()?;
+    let hold = monitor_queue(format!("mhold-{token}"))?;
     let conv = gst::ElementFactory::make("audioconvert")
         .property("name", format!("mconv-{token}"))
         .build()?;
@@ -772,16 +777,12 @@ fn add_monitor_branch(pipe: &gst::Pipeline, mix: &gst::Element, token: &str) -> 
     pipe.add_many(head)?;
     gst::Element::link_many(head)?;
 
-    let mq = gst::ElementFactory::make("queue")
-        .property("name", format!("mq-{token}"))
-        .build()?;
+    let mq = monitor_queue(format!("mq-{token}"))?;
     pipe.add(&mq)?;
     tee.link(&mq)?;
     link_queue_to_mixer(&mq, mix, 0.5)?;
 
-    let mlq = gst::ElementFactory::make("queue")
-        .property("name", format!("mlq-{token}"))
-        .build()?;
+    let mlq = monitor_queue(format!("mlq-{token}"))?;
     let lev = gst::ElementFactory::make("level")
         .property("name", format!("lev-{token}"))
         .build()?;
@@ -1454,6 +1455,43 @@ mod tests {
         }
         pipe.set_state(gst::State::Null).unwrap();
         assert!(got, "level-сообщений не было");
+    }
+
+    #[test]
+    fn monitor_branch_queues_hold_two_buffers() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
+        let zones = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![zproto::Endpoint {
+                ip: "192.0.2.36".into(),
+                port: 5004,
+            }],
+            source: Some("zvucast-hall-monitor".into()),
+        }];
+        let pipe = build_tx_unicast_pw(&cfg, &zones, 0, Some("line"), &mut LoopbackUdp).unwrap();
+        let head = pipe
+            .by_name("cap")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .peer()
+            .unwrap()
+            .parent_element()
+            .unwrap();
+        assert_eq!(
+            head.property::<u32>("max-size-buffers"),
+            8,
+            "голова line-in остаётся на восьми буферах"
+        );
+        for name in ["mhold-hall", "mq-hall", "mlq-hall"] {
+            let queue = pipe.by_name(name).unwrap_or_else(|| panic!("нет {name}"));
+            assert_eq!(queue.property::<u32>("max-size-buffers"), 2, "{name}");
+            assert_eq!(queue.property::<u32>("max-size-bytes"), 0, "{name}");
+            assert_eq!(queue.property::<u64>("max-size-time"), 0, "{name}");
+            let leaky = queue.property_value("leaky").serialize().expect("leaky");
+            assert_eq!(leaky.as_str(), "downstream", "{name}: {leaky}");
+        }
     }
 
     #[test]

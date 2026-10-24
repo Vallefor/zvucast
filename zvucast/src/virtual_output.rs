@@ -29,9 +29,28 @@ fn process_name(zone_id: &str) -> String {
     format!("zvucast-zone-{zone_id}")
 }
 
+/// `--latency` pw-loopback, миллисекунды. Рядом с квантом 128/48000:
+/// без флага модуль держит свой запас, и кабель длиннее кванта.
+pub const LOOPBACK_LATENCY_MS: &str = "3";
+
+/// Аргументы pw-loopback до `--capture-props`.
+pub fn loopback_front(name: &str) -> Vec<String> {
+    vec![
+        "--name".into(),
+        name.into(),
+        "--channels".into(),
+        "2".into(),
+        "--channel-map".into(),
+        "[ FL, FR ]".into(),
+        "--latency".into(),
+        LOOPBACK_LATENCY_MS.into(),
+    ]
+}
+
 /// Plasma считает устройство виртуальным без флага HARDWARE и прячет его.
 /// pipewire-pulse ставит HARDWARE, когда `node.virtual` не true.
 /// Пробел и двоеточие в «Zvucast: Зал» без кавычек — синтаксическая ошибка pw-loopback.
+/// `node.lock-quantum` на обоих концах не даёт кабелю раздуть квант графа.
 fn pw_value(value: &str) -> String {
     let clean = value.replace('"', "");
     if clean.chars().any(|c| c.is_whitespace() || matches!(c, ':' | '=')) {
@@ -43,7 +62,7 @@ fn pw_value(value: &str) -> String {
 
 fn capture_props(name: &str, description: &str) -> String {
     format!(
-        "media.class=Audio/Sink node.name={name} node.description={} audio.rate=48000 node.latency=128/48000 node.virtual=false",
+        "media.class=Audio/Sink node.name={name} node.description={} audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.virtual=false",
         pw_value(description)
     )
 }
@@ -51,7 +70,7 @@ fn capture_props(name: &str, description: &str) -> String {
 /// Источник кабеля в списке микрофонов не нужен.
 fn playback_props(name: &str, description: &str) -> String {
     format!(
-        "media.class=Audio/Source node.name={name} node.description={} audio.rate=48000 node.latency=128/48000 node.passive=true node.virtual=true",
+        "media.class=Audio/Source node.name={name} node.description={} audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.passive=true node.virtual=true",
         pw_value(description)
     )
 }
@@ -273,12 +292,7 @@ impl Cables {
         let capture = capture_props(&sink, &label);
         let playback = playback_props(&source, &format!("{label}Monitor"));
         let child = Command::new("pw-loopback")
-            .arg("--name")
-            .arg(process_name(&zone.zone_id))
-            .arg("--channels")
-            .arg("2")
-            .arg("--channel-map")
-            .arg("[ FL, FR ]")
+            .args(loopback_front(&process_name(&zone.zone_id)))
             .arg("--capture-props")
             .arg(capture)
             .arg("--playback-props")
@@ -342,6 +356,26 @@ fn stop_slot_in_place(slot: &mut Running) {
 mod tests {
     use super::*;
     use crate::inputs::virtual_capture_channels;
+
+    #[test]
+    fn loopback_front_passes_three_millisecond_latency() {
+        let front = loopback_front("zvucast-zone-hall");
+        assert_eq!(LOOPBACK_LATENCY_MS, "3");
+        assert!(
+            front.windows(2).any(|pair| pair == ["--latency", "3"]),
+            "{front:?}"
+        );
+    }
+
+    #[test]
+    fn cable_props_lock_the_quantum() {
+        let sink = capture_props("zvucast-hall", "Zvucast: Зал");
+        let source = playback_props("zvucast-hall-monitor", "Zvucast: ЗалMonitor");
+        assert!(sink.contains("node.lock-quantum=true"), "{sink}");
+        assert!(source.contains("node.lock-quantum=true"), "{source}");
+        assert!(sink.contains("node.latency=128/48000"), "{sink}");
+        assert!(source.contains("node.latency=128/48000"), "{source}");
+    }
 
     #[test]
     fn sink_is_visible_to_the_applet() {
