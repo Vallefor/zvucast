@@ -238,8 +238,9 @@ pub fn write_script(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf
 }
 
 /// Скрипт сам берёт `/var/lock/zvucast-update`. Второй `flock` до `systemd-run`
-/// гонялся бы с ним, поэтому блокировку здесь не открываем. Код 2 — отказ
-/// «уже обновляется»; иначе `systemd-run` возвращается сразу после старта юнита.
+/// гонялся бы с ним, поэтому блокировку здесь не открываем. `--wait` нет:
+/// `systemd-run` возвращается, когда юнит стартовал. Любой ненулевой статус
+/// этого запуска — «уже обновляется». Ноль — служба стартовала.
 pub fn spawn_apply(
     script: &std::path::Path,
     file: &std::path::Path,
@@ -256,13 +257,14 @@ pub fn spawn_apply(
         .arg(from)
         .arg(to)
         .status()?;
-    if status.code() == Some(2) {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "уже обновляется"));
-    }
+    map_systemd_run_status(status)
+}
+
+fn map_systemd_run_status(status: std::process::ExitStatus) -> std::io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, format!("systemd-run: {status}")))
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "уже обновляется"))
     }
 }
 
@@ -422,5 +424,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("адрес"));
+    }
+
+    #[test]
+    fn any_nonzero_systemd_run_status_is_already_updating() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        assert!(map_systemd_run_status(ExitStatus::from_raw(0)).is_ok());
+        for code in [1, 2] {
+            let err = map_systemd_run_status(ExitStatus::from_raw(code << 8)).unwrap_err();
+            assert_eq!(err.to_string(), "уже обновляется");
+        }
     }
 }
