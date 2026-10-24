@@ -51,4 +51,36 @@ set -e
 test "$code" -ne 0
 grep -q '"result":"rolled_back"' "$work/status.json"
 test "$(cat "$work/zvucast")" = old
+
+# First restart of the agent fails. The agent never stays active, so the
+# short observe window must still end in a rollback.
+printf 'old' > "$work/zvucast"
+rm -f "$work/zvucast.prev" "$work/status.json"
+: > "$work/sys.log"
+cat > "$work/systemctl" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$SYSTEMCTL_LOG"
+if [[ "$1" == "restart" && "$2" == "zvucast-agent" ]]; then
+  restarts=$(grep -c 'restart zvucast-agent' "$SYSTEMCTL_LOG" || true)
+  if [[ "${restarts:-0}" -eq 1 ]]; then
+    exit 1
+  fi
+fi
+if [[ "$1" == "is-active" && "$3" == "zvucast-agent" ]]; then
+  exit 1
+fi
+exit 0
+EOF
+chmod +x "$work/systemctl"
+set +e
+SYSTEMCTL_LOG="$work/sys.log" \
+PATH="$work:$PATH" SYSTEMCTL="$work/systemctl" \
+ZVUCAST_BIN_DIR="$work" ZVUCAST_LOCK="$work/lock" ZVUCAST_STATUS="$work/status.json" \
+ZVUCAST_STABLE_SECONDS=1 ZVUCAST_OBSERVE_SECONDS=1 ZVUCAST_POLL_SECONDS=0 \
+bash "$script" "$work/payload" "$sum" "0.1.0+dev" "0.1.0"
+code=$?
+set -e
+test "$code" -ne 0
+grep -q '"result":"rolled_back"' "$work/status.json"
+test "$(cat "$work/zvucast")" = old
 echo ok

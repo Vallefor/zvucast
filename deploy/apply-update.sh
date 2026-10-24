@@ -38,10 +38,10 @@ write_status() {
 
 restart_controller=0
 write_status ok
-"$systemctl" restart zvucast-agent
+"$systemctl" restart zvucast-agent || true
 if "$systemctl" is-active --quiet zvucast-controller; then
-  "$systemctl" restart zvucast-controller
   restart_controller=1
+  "$systemctl" restart zvucast-controller || true
 fi
 
 deadline=$((SECONDS + observe))
@@ -64,8 +64,8 @@ write_status rolled_back
 if [[ -e "$bin_dir/zvucast.prev" ]]; then
   mv -f "$bin_dir/zvucast.prev" "$bin_dir/zvucast"
 fi
-"$systemctl" restart zvucast-agent
+"$systemctl" restart zvucast-agent || true
 if [[ "$restart_controller" == 1 ]]; then
-  "$systemctl" restart zvucast-controller
+  "$systemctl" restart zvucast-controller || true
 fi
 exit 1
