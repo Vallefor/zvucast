@@ -437,4 +437,27 @@ mod tests {
             assert_eq!(err.to_string(), "уже обновляется");
         }
     }
+
+    #[test]
+    fn write_script_in_another_directory_leaves_the_first_file() {
+        let root = std::env::temp_dir().join(format!(
+            "zvucast-script-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let first_dir = root.join("one");
+        let second_dir = root.join("two");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = write_script(&first_dir).unwrap();
+        let bytes = std::fs::read(&first).unwrap();
+        let second = write_script(&second_dir).unwrap();
+        assert_eq!(first, first_dir.join("apply-update.sh"));
+        assert_eq!(second, second_dir.join("apply-update.sh"));
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

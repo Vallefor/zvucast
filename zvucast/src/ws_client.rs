@@ -432,8 +432,9 @@ async fn run_apply(url: String, sha256: String, from: String, to: String) -> Res
 }
 
 fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Result<(), String> {
-    let dir = std::path::Path::new("/run");
-    let file = dir.join(format!(
+    // Свой каталог на попытку: вторая запись не обрезает apply-update.sh,
+    // который bash первой службы ещё читает. Имя юнита общее и по-прежнему отказывает.
+    let dir = std::path::Path::new("/run").join(format!(
         "zvucast-update-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -441,8 +442,10 @@ fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Resu
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join("zvucast");
     std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
-    let script = crate::update::write_script(dir).map_err(|e| e.to_string())?;
+    let script = crate::update::write_script(&dir).map_err(|e| e.to_string())?;
     crate::update::spawn_apply(&script, &file, &sha256, &from, &to).map_err(|e| e.to_string())?;
     tracing::info!("обновление: служба zvucast-apply-update запущена");
     Ok(())
