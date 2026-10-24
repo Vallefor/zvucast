@@ -46,6 +46,9 @@ export interface NodeView {
   channel_map: ChannelMap | null
   dup: boolean
   roles: string[]
+  version: string
+  target: string
+  update_note: string | null
   capture_device: string | null
   playback_device: string | null
   ip: string
@@ -89,6 +92,10 @@ export interface ZoneView {
 
 export const api = {
   nodes: (): Promise<NodeView[]> => fetch('/api/nodes').then((r) => r.json()),
+  release: (): Promise<{ version: string; assets: Record<string, { url: string; sha256: string }> }> =>
+    fetch('/api/release').then((r) => r.json()),
+  updateNode: (id: string) => fetch(`/api/nodes/${id}/update`, { method: 'POST' }),
+  updateAll: () => fetch('/api/update-all', { method: 'POST' }),
   nodeCmd: (id: string, cmd: 'start' | 'stop') =>
     fetch(`/api/nodes/${id}/${cmd}`, { method: 'POST' }),
   // display_name: null — сброс к системному имени (серийник из node_id).

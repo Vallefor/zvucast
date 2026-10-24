@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
+import { offer } from '../update'
 import { Badge, Button, Popup, useRun, useUi } from '../ui'
 
 const POLL_MS = 2000
+/// Свой POST: столько ждём hello с версией релиза, потом «не вернулся».
+const UPDATE_WAIT_MS = 90_000
+
+type ReleaseView = Awaited<ReturnType<typeof api.release>>
+type PendingUpdate = { at: number; version: string; note: string | null }
 const DSCP_PRESETS = [
   { label: 'CS0', value: 0 },
   { label: 'CS3', value: 24 },
@@ -297,6 +303,9 @@ export default function Nodes() {
   const { confirm, toast } = useUi()
   const [nodes, setNodes] = useState<NodeView[]>([])
   const [master, setMaster] = useState<MasterInfo | null>(null)
+  const [release, setRelease] = useState<ReleaseView | null>(null)
+  const [pending, setPending] = useState<Record<string, PendingUpdate>>({})
+  const [now, setNow] = useState(() => Date.now())
   const [movedTo, setMovedTo] = useState<string | null>(null)
   const [settingsId, setSettingsId] = useState<string | null>(null)
 
@@ -307,6 +316,28 @@ export default function Nodes() {
       if (!alive) return
       setNodes(ns)
       setMaster(m)
+      setPending((prev) => {
+        const ids = Object.keys(prev)
+        if (ids.length === 0) return prev
+        let changed = false
+        const next = { ...prev }
+        for (const n of ns) {
+          const wait = next[n.node_id]
+          const rolled = n.update_note === 'rolled_back' && wait?.note !== 'rolled_back'
+          if (wait && (n.version === wait.version || rolled)) {
+            delete next[n.node_id]
+            changed = true
+          }
+        }
+        return changed ? next : prev
+      })
+      try {
+        const rel = await api.release()
+        if (!alive) return
+        setRelease(rel)
+      } catch (e) {
+        console.error(e)
+      }
     }
     load().catch(console.error)
     const t = setInterval(() => load().catch(console.error), POLL_MS)
@@ -315,6 +346,12 @@ export default function Nodes() {
       clearInterval(t)
     }
   }, [])
+
+  useEffect(() => {
+    if (Object.keys(pending).length === 0) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [pending])
 
   const masterNodeId =
     master?.node_id ?? nodes.find((n) => n.ip === location.hostname)?.node_id ?? null
@@ -339,6 +376,76 @@ export default function Nodes() {
       return
     }
     toast('Роль мастера передана, но адрес новой панели не пришёл')
+  }
+
+  const beginWait = (ids: string[], version: string) => {
+    if (ids.length === 0) return
+    const at = Date.now()
+    setNow(at)
+    setPending((prev) => {
+      const next = { ...prev }
+      for (const id of ids) {
+        next[id] = {
+          at,
+          version,
+          note: nodes.find((node) => node.node_id === id)?.update_note ?? null,
+        }
+      }
+      return next
+    })
+  }
+
+  const updateOne = (n: NodeView) => {
+    const version = release?.version
+    if (!version) return
+    void run(api.updateNode(n.node_id), 'обновление').then((ok) => {
+      if (ok) beginWait([n.node_id], version)
+    })
+  }
+
+  const updateAll = async () => {
+    let response: Response
+    try {
+      response = await api.updateAll()
+    } catch (e) {
+      console.error(e)
+      toast('обновление: нет связи')
+      return
+    }
+    if (!response.ok) {
+      toast(`обновление: HTTP ${response.status}`)
+      return
+    }
+    let ids: string[] = []
+    try {
+      const body: unknown = await response.json()
+      if (Array.isArray(body)) ids = body.filter((id): id is string => typeof id === 'string')
+    } catch (e) {
+      console.error(e)
+    }
+    if (release?.version) beginWait(ids, release.version)
+  }
+
+  const versionCell = (n: NodeView, compact = false) => {
+    const assetPresent = release != null && Object.prototype.hasOwnProperty.call(release.assets, n.target)
+    const kind = release
+      ? offer(n.online, n.target, n.version, release.version, assetPresent)
+      : 'hidden'
+    const wait = pending[n.node_id]
+    const updating = wait != null && n.version !== wait.version && now - wait.at < UPDATE_WAIT_MS
+    const late = wait != null && n.version !== wait.version && now - wait.at >= UPDATE_WAIT_MS
+    return (
+      <div className="row">
+        <span className="num">{n.version || '—'}</span>
+        {updating && <span>обновляется</span>}
+        {late && <span>не вернулся</span>}
+        {n.update_note === 'rolled_back' && <span>откат</span>}
+        {kind === 'missing' && <span>нет файла в релизе</span>}
+        {kind === 'ready' && !updating && (
+          <Button className={compact ? 'btn-compact' : undefined} onClick={() => updateOne(n)}>Обновить</Button>
+        )}
+      </div>
+    )
   }
 
   const actions = (n: NodeView, compact = false) => (
@@ -385,6 +492,7 @@ export default function Nodes() {
           <Button onClick={() => void run(fetch('/api/stop-all', { method: 'POST' }), 'стоп всех')}>
             Стоп всех
           </Button>
+          <Button onClick={() => void updateAll()}>Обновить все</Button>
         </div>
       </div>
 
@@ -405,6 +513,7 @@ export default function Nodes() {
               <th>Очередь</th>
               <th>PTP, мкс</th>
               <th>Uptime</th>
+              <th>Версия</th>
               <th></th>
             </tr>
           </thead>
@@ -432,6 +541,7 @@ export default function Nodes() {
                   <td className="num">{row[5][1]}</td>
                   <td className="num">{row[6][1]}</td>
                   <td className="num">{row[7][1]}</td>
+                  <td>{versionCell(n, true)}</td>
                   <td className="row">{actions(n, true)}</td>
                 </tr>
               )
@@ -459,6 +569,10 @@ export default function Nodes() {
               <span style={{ display: 'contents' }}>
                 <dt>Интерфейс</dt>
                 <dd>{linkLabel(n.link)}</dd>
+              </span>
+              <span style={{ display: 'contents' }}>
+                <dt>Версия</dt>
+                <dd>{versionCell(n)}</dd>
               </span>
               {facts(n).map(([k, v]) => (
                 <span key={k} style={{ display: 'contents' }}>
