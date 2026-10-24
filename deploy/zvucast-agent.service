@@ -1,0 +1,19 @@
+[Unit]
+Description=zvucast agent
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+# v1 работает от root: AmbientCapabilities без User= действуют только от root
+# (CAP_SYS_TIME — подстройка PTP-часов, CAP_SYS_NICE — RT-приоритет gst).
+# Hardening (выделенный юзер + ограниченный набор capabilities) — Phase 3.
+Environment=RUST_LOG=info
+# PipeWire слушает в сессии пользователя, не в системной. uid на платах и на PC — 1000.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/zvucast agent --config /etc/zvucast.toml
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_SYS_TIME CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target

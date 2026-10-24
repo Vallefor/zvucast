@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8"><title>Zvucast — мастер не найден</title>
+<style>
+ body{font:14px system-ui;margin:2em;max-width:40em}
+ #msg{margin:1em 0;padding:.6em 1em;border:1px solid #ccc;border-radius:6px}
+ button{font-size:14px;padding:.4em 1em}
+</style>
+<h1>Zvucast</h1>
+<h2>Мастер не найден</h2>
+<p>Агент работает, но контроллер (мастер) в сети не обнаружен.</p>
+<div id="msg">Проверяю статус…</div>
+<button id="claim" onclick="claim()">Стать мастером</button>
+<script>
+// Страница агента :8081 — видна, пока ws_client не подключился к мастеру.
+// Статус поллим: ws_connected=true — мастер появился, claim больше не нужен.
+function msg(t){ document.getElementById('msg').textContent = t; }
+async function status(){
+ try{
+  const r = await fetch('/api/master/status');
+  const j = await r.json();
+  if(j.ws_connected){
+   msg('Мастер найден — контроллер доступен, эта страница больше не нужна.');
+   document.getElementById('claim').disabled = true;
+  } else {
+   msg('Мастер не найден. Можно назначить этот узел мастером.');
+  }
+ }catch(e){ msg('Статус недоступен: ' + e); }
+}
+async function claim(){
+ msg('Запрос на передачу роли мастера…');
+ document.getElementById('claim').disabled = true;
+ try{
+  const r = await fetch('/api/master/claim', {method:'POST'});
+  if(r.status === 409){
+   msg('Мастер уже жив — claim отклонён.');
+   document.getElementById('claim').disabled = true;
+  } else if(r.ok){
+   msg('Контроллер запускается… обновите страницу через несколько секунд.');
+  } else {
+   msg('Ошибка claim: HTTP ' + r.status);
+   document.getElementById('claim').disabled = false;
+  }
+ }catch(e){
+  msg('Ошибка сети: ' + e);
+  document.getElementById('claim').disabled = false;
+ }
+}
+status();
+setInterval(status, 3000);
+</script>

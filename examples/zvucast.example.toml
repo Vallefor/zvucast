@@ -1,0 +1,14 @@
+name = "node"
+role = "rx"
+controller = "ws://192.0.2.1:8080/ws"
+alsa_device = "plughw:CARD=Device"
+sync_interface = "eth0"
+
+[pipeline]
+jb_ms = 5
+rx_buffer_us = 5000
+rx_latency_us = 1000
+tx_buffer_us = 40000
+tx_latency_us = 10000
+mcast_group = "239.0.0.1"
+port = 5004

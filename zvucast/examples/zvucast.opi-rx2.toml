@@ -1,0 +1,14 @@
+name = "opi-rx2"
+role = "rx"
+controller = "ws://192.0.2.204:8080/ws"
+alsa_device = "plughw:CARD=Codec"
+sync_interface = "end0"
+
+[pipeline]
+jb_ms = 2
+rx_buffer_us = 5000
+rx_latency_us = 1000
+tx_buffer_us = 10000
+tx_latency_us = 2500
+mcast_group = "239.0.0.1"
+port = 5004

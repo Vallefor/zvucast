@@ -1,0 +1,20 @@
+[Unit]
+Description=zvucast controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# v1 работает от root: AmbientCapabilities без User= действуют только от root
+# (CAP_SYS_TIME — подстройка PTP-часов, CAP_SYS_NICE — RT-приоритет gst).
+# Hardening (выделенный юзер + ограниченный набор capabilities) — Phase 3.
+Environment=RUST_LOG=info
+# /etc/zvucast может отсутствовать на свежем узле — контроллер его не создаёт
+# (только claim-агента делает create_dir_all), поэтому директория — до старта.
+ExecStartPre=/usr/bin/mkdir -p /etc/zvucast
+ExecStart=/usr/local/bin/zvucast controller --listen 0.0.0.0:8080 --state /etc/zvucast/state.json
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_SYS_TIME CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,915 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use zproto::{ChannelMap, PipelineState, ZoneEndpoints};
+
+const RATE_HZ: i64 = 48_000;
+const SLOW_RESTART_DELAY: Duration = Duration::from_secs(10);
+/// Период пробуждения bus-watch-потока для проверки stop-флага.
+///
+/// gst_bus_set_flushing НЕ будит gst_poll_wait в gst_bus_timed_pop_filtered
+/// (GstPoll-реализация с gst 1.26+, проверено на 1.26.0 и 1.28.7): NONE-таймаут
+/// без своего флага остановки — вечный pop.
+const BUS_WATCH_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Stats {
+    pub dropped: u64,
+    pub rendered: u64,
+    pub queue_ms: i64,
+    pub rms_l: f64,
+    pub rms_r: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupEvent {
+    Failed(String),
+    Underrun,
+}
+
+pub struct Runner {
+    pipeline: gst::Pipeline,
+    /// level name="lev" (теперь и в tx тоже)
+    pub level: Option<gst::Element>,
+    /// alsasink name="asink" (только rx)
+    pub sink: Option<gst::Element>,
+    /// карта ALSA из playback-устройства (только rx) — для queue_ms из /proc/asound
+    alsa_card: Option<String>,
+    /// момент последнего успешного start(); None до первого старта
+    started_at: Mutex<Option<Instant>>,
+    rms: Arc<Mutex<RmsBook>>,
+    stop_flag: Arc<AtomicBool>,
+    /// pw-record общего line-in.
+    captures: Vec<MonitorCapture>,
+    /// pw-record монитора зоны. Снимается отдельно, чтобы не ронять RTP.
+    monitors: Vec<ZoneMonitor>,
+    /// pw-play колонок. Нет, пока rx не через PipeWire.
+    playback: Option<DesktopPlay>,
+}
+
+struct ZoneMonitor {
+    zone_id: String,
+    node: String,
+    capture: MonitorCapture,
+}
+
+/// Читает source кабеля отдельным процессом. pipewiresrc в агенте на этом
+/// узле не забирает буферы: его цикл блокируется в set_state.
+struct MonitorCapture {
+    stop: Arc<AtomicBool>,
+    child: Mutex<Option<Child>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl MonitorCapture {
+    fn start(appsrc: gst::Element, node: &str) -> Result<Self> {
+        let mut child = Command::new("pw-record")
+            .args([
+                "--target",
+                node,
+                "--rate",
+                "48000",
+                "--channels",
+                "2",
+                "--format",
+                "s16",
+                "--latency",
+                PW_LATENCY,
+                "--raw",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("pw-record не запустился")?;
+        let stdout = child.stdout.take().context("pw-record без stdout")?;
+        let appsrc = appsrc
+            .dynamic_cast::<gst_app::AppSrc>()
+            .map_err(|_| anyhow::anyhow!("cap не appsrc"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("zvucast-capture".into())
+            .spawn(move || feed_capture(stdout, appsrc, stop_thread))
+            .context("поток захвата")?;
+        Ok(Self {
+            stop,
+            child: Mutex::new(Some(child)),
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        if let Ok(mut slot) = self.thread.lock() {
+            if let Some(thread) = slot.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl Drop for MonitorCapture {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Воспроизведение зоны отдельным pw-play. pipewiresink в агенте этого не
+/// делает: в PAUSED он гасит поток, а ссылки на выход остаются active, и
+/// часы колонок встают, пока жив процесс.
+struct DesktopPlay {
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl DesktopPlay {
+    fn start(appsink: gst::Element, sink_node: Option<String>) -> Result<Self> {
+        let appsink = appsink
+            .dynamic_cast::<gst_app::AppSink>()
+            .map_err(|_| anyhow::anyhow!("asink не appsink"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(None));
+        let stop_thread = stop.clone();
+        let child_thread = child.clone();
+        let thread = std::thread::Builder::new()
+            .name("zvucast-play".into())
+            .spawn(move || play_desktop(appsink, child_thread, stop_thread, sink_node))
+            .context("поток воспроизведения")?;
+        Ok(Self {
+            stop,
+            child,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        close_player(&self.child);
+        if let Ok(mut slot) = self.thread.lock() {
+            if let Some(thread) = slot.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl Drop for DesktopPlay {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn play_desktop(
+    appsink: gst_app::AppSink,
+    child: Arc<Mutex<Option<Child>>>,
+    stop: Arc<AtomicBool>,
+    sink_node: Option<String>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(200)) else {
+            // Нет RTP — процесс не должен висеть suspended со ссылками.
+            // В Null try_pull возвращается сразу, без паузы это был бы пустой цикл.
+            close_player(&child);
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let Some(buffer) = sample.buffer() else { continue };
+        let Ok(map) = buffer.map_readable() else { continue };
+        if map.is_empty() {
+            continue;
+        }
+        if !write_player(&child, map.as_slice(), sink_node.as_deref()) {
+            close_player(&child);
+        }
+    }
+    close_player(&child);
+}
+
+fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> bool {
+    let Ok(mut guard) = slot.lock() else { return false };
+    if guard.is_none() {
+        match spawn_player(sink_node) {
+            Ok(child) => *guard = Some(child),
+            Err(e) => {
+                tracing::warn!("pw-play: {e:#}");
+                return false;
+            }
+        }
+    }
+    let Some(child) = guard.as_mut() else { return false };
+    let Some(stdin) = child.stdin.as_mut() else { return false };
+    stdin.write_all(bytes).and_then(|_| stdin.flush()).is_ok()
+}
+
+fn spawn_player(sink_node: Option<&str>) -> Result<Child> {
+    let configured = sink_node
+        .filter(|name| !crate::inputs::is_virtual_sink_name(name))
+        .map(str::to_string);
+    let target = configured
+        .or_else(crate::pipeline::desktop_playback_target)
+        .context("нет sink кроме zvucast")?;
+    Command::new("pw-play")
+        .args([
+            "--raw",
+            "--rate",
+            "48000",
+            "--channels",
+            "2",
+            "--format",
+            "s16",
+            "--latency",
+            PW_LATENCY,
+            "--target",
+            &target,
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("pw-play не запустился")
+}
+
+fn close_player(slot: &Mutex<Option<Child>>) {
+    let Ok(mut guard) = slot.lock() else { return };
+    let Some(mut child) = guard.take() else { return };
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Кадры для `pw-cat --latency` (число без единицы — это кадры, не миллисекунды).
+/// 128 @ 48 кГц = 2.7 мс: период UCA202 и HiFiBerry. 20 мс раньше сидели
+/// сверху кванта и не отдавались в звук.
+const PW_LATENCY: &str = "128";
+const CAPTURE_BYTES: usize = 128 * 2 * 2;
+
+fn feed_capture(mut stdout: impl Read, appsrc: gst_app::AppSrc, stop: Arc<AtomicBool>) {
+    let mut buf = [0u8; CAPTURE_BYTES];
+    while !stop.load(Ordering::Relaxed) {
+        if stdout.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let mut gstbuf = match gst::Buffer::with_size(buf.len()) {
+            Ok(buf) => buf,
+            Err(_) => break,
+        };
+        {
+            let Some(gstbuf) = gstbuf.get_mut() else { break };
+            let Ok(mut map) = gstbuf.map_writable() else { break };
+            map.as_mut().copy_from_slice(&buf);
+        }
+        match appsrc.push_buffer(gstbuf) {
+            Ok(_) => {}
+            Err(gst::FlowError::Flushing) | Err(gst::FlowError::Eos) => break,
+            Err(_) => {}
+        }
+    }
+}
+
+impl Runner {
+    /// tx-половина: alsasrc на capture-устройстве; всегда unicast-сборка
+    /// (build_tx_unicast) — пустой набор эндпоинтов = tx молчит (tee без
+    /// веток), multicast-фолбэка нет. alsasink'а нет — карта для queue_ms
+    /// не извлекается.
+    pub fn new_tx(
+        pipeline_cfg: &crate::config::PipelineCfg,
+        device: &str,
+        zones: &[ZoneEndpoints],
+        dscp: u8,
+        bind: &mut dyn crate::pipeline::LocalUdp,
+    ) -> Result<Runner> {
+        let pipeline = crate::pipeline::build_tx_unicast(pipeline_cfg, device, zones, dscp, bind)?;
+        Ok(Runner::from_pipeline_with_card(pipeline, None))
+    }
+
+    /// tx через PipeWire (build_tx_unicast_pw). capture_device не открывается:
+    /// на десктопе ALSA занят сессией PipeWire.
+    pub fn new_tx_pw(
+        pipeline_cfg: &crate::config::PipelineCfg,
+        zones: &[ZoneEndpoints],
+        dscp: u8,
+        target: Option<&str>,
+        bind: &mut dyn crate::pipeline::LocalUdp,
+    ) -> Result<Runner> {
+        let pipeline = crate::pipeline::build_tx_unicast_pw(pipeline_cfg, zones, dscp, target, bind)?;
+        let mut runner = Runner::from_pipeline_with_card(pipeline, None);
+        if let Some(target) = target {
+            let src = runner.pipeline.by_name("cap").context("tx pw: нет appsrc cap")?;
+            runner.captures.push(MonitorCapture::start(
+                src,
+                crate::pipeline::capture_node_name(target),
+            )?);
+        }
+        for zone in zones {
+            let Some(node) = zone.source.as_deref() else { continue };
+            let name = crate::pipeline::capture_appsrc_name(&zone.zone_id);
+            let src = runner
+                .pipeline
+                .by_name(&name)
+                .with_context(|| format!("tx pw: нет appsrc {name}"))?;
+            runner.monitors.push(ZoneMonitor {
+                zone_id: zone.zone_id.clone(),
+                node: node.to_string(),
+                capture: MonitorCapture::start(src, node)?,
+            });
+        }
+        Ok(runner)
+    }
+
+    /// Монитор входит в микс зоны или выходит из него. Пейлоадер и line-in
+    /// остаются: новый RTP сбросил бы метки и колонка потеряла бы другие источники.
+    pub fn reconcile_monitors(&mut self, zones: &[ZoneEndpoints]) -> Result<()> {
+        crate::pipeline::reconcile_pw_monitors(&self.pipeline, zones)?;
+        let wanted: Vec<(String, String)> = zones
+            .iter()
+            .filter_map(|z| z.source.clone().map(|node| (z.zone_id.clone(), node)))
+            .collect();
+        self.monitors.retain(|monitor| {
+            let keep = wanted
+                .iter()
+                .any(|(id, node)| id == &monitor.zone_id && node == &monitor.node);
+            if !keep {
+                monitor.capture.shutdown();
+            }
+            keep
+        });
+        for (zone_id, node) in wanted {
+            if self.monitors.iter().any(|m| m.zone_id == zone_id) {
+                continue;
+            }
+            let src = self
+                .pipeline
+                .by_name(&crate::pipeline::capture_appsrc_name(&zone_id))
+                .with_context(|| format!("tx pw: нет appsrc зоны {zone_id}"))?;
+            self.monitors.push(ZoneMonitor {
+                zone_id,
+                node: node.clone(),
+                capture: MonitorCapture::start(src, &node)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// rx-половина: udpsrc → … → alsasink(slave-method=skew); карта ALSA
+    /// из device — для queue_ms из /proc/asound. cm — матрица микширования
+    /// зон (channel-matrix → mix-matrix в mconv).
+    pub fn new_rx(
+        pipeline_cfg: &crate::config::PipelineCfg,
+        device: &str,
+        cm: &ChannelMap,
+        ports: &[u16],
+        branches: &[(u16, ChannelMap)],
+        bind: &mut dyn crate::pipeline::LocalUdp,
+    ) -> Result<Runner> {
+        let pipeline = crate::pipeline::build_rx_ports(pipeline_cfg, device, cm, ports, branches, bind)?;
+        let alsa_card = alsa_card_from_device(device);
+        Ok(Runner::from_pipeline_with_card(pipeline, alsa_card))
+    }
+
+    /// rx-половина через PipeWire (build_rx_pw): карты ALSA нет →
+    /// queue_ms в телеметрии будет -1 (alsasink-only метрика /proc/asound).
+    /// cm — матрица микширования зон (как в new_rx).
+    pub fn new_rx_pw(
+        pipeline_cfg: &crate::config::PipelineCfg,
+        cm: &ChannelMap,
+        sink_node: Option<&str>,
+        ports: &[u16],
+        branches: &[(u16, ChannelMap)],
+        bind: &mut dyn crate::pipeline::LocalUdp,
+    ) -> Result<Runner> {
+        let pipeline = crate::pipeline::build_rx_pw_ports(pipeline_cfg, cm, ports, branches, bind)?;
+        let mut runner = Runner::from_pipeline_with_card(pipeline, None);
+        let sink = runner.pipeline.by_name("asink").context("appsink asink")?;
+        runner.playback = Some(DesktopPlay::start(sink, sink_node.map(str::to_string))?);
+        Ok(runner)
+    }
+
+    pub fn reconcile_mix(
+        &self,
+        ports: &[u16],
+        jb_ms: u32,
+        branches: &[(u16, ChannelMap)],
+        bind: &mut dyn crate::pipeline::LocalUdp,
+    ) -> Result<()> {
+        crate::pipeline::reconcile_mix(&self.pipeline, ports, jb_ms, branches, bind)
+    }
+
+    /// Запас существующих веток, без перешивки портов и без дропа runner.
+    pub fn set_jitter_latency(&self, ports: &[u16], jb_ms: u32) {
+        crate::pipeline::set_jitter_latency(&self.pipeline, ports, jb_ms);
+    }
+
+    pub fn from_pipeline_for_test(pipeline: gst::Pipeline) -> Runner {
+        Runner::from_pipeline_with_card(pipeline, None)
+    }
+
+    /// Доступ к пайплайну в тестах (проверка структуры собранных элементов).
+    #[cfg(test)]
+    pub(crate) fn pipeline(&self) -> &gst::Pipeline {
+        &self.pipeline
+    }
+
+    fn from_pipeline_with_card(pipeline: gst::Pipeline, alsa_card: Option<String>) -> Runner {
+        Runner {
+            level: pipeline.by_name("lev"),
+            sink: pipeline.by_name("asink"),
+            pipeline,
+            alsa_card,
+            started_at: Mutex::new(None),
+            rms: Arc::new(Mutex::new(RmsBook::default())),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            captures: Vec::new(),
+            monitors: Vec::new(),
+            playback: None,
+        }
+    }
+
+    pub fn start(&self) -> Result<()> {
+        // в gst-rs 0.23 set_state возвращает Err при StateChangeReturn::Failure
+        self.stop_flag.store(false, Ordering::Relaxed);
+        self.pipeline.set_state(gst::State::Playing)?;
+        tracing::info!(
+            current = ?self.pipeline.current_state(),
+            pending = ?self.pipeline.pending_state(),
+            "pipeline set_state(Playing)"
+        );
+        if let Ok(mut t) = self.started_at.lock() {
+            *t = Some(Instant::now());
+        }
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        // pw-play не гасим. start() его не создаёт заново: после Stop/Start
+        // пайплайн снова Playing, а колонка остаётся без потока. Пока
+        // пайплайн в Null, тот же поток сам закрывает pw-play — сэмплов нет.
+        // Поток присоединяется в Drop.
+        for capture in &self.captures {
+            capture.shutdown();
+        }
+        for monitor in &self.monitors {
+            monitor.capture.shutdown();
+        }
+        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+            tracing::warn!("set_state(Null) не удался: {e}");
+        }
+        // bus-watch-поток выйдет из цикла при ближайшем пробуждении (≤BUS_WATCH_POLL)
+        self.stop_flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn state(&self) -> PipelineState {
+        match self.pipeline.current_state() {
+            gst::State::Playing | gst::State::Paused => PipelineState::Playing,
+            _ => PipelineState::Stopped,
+        }
+    }
+
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats::default();
+        if let Some(sink) = &self.sink {
+            if sink.has_property("stats", None) {
+                let st = sink.property::<gst::Structure>("stats");
+                s.dropped = st.get::<u64>("dropped").unwrap_or_default();
+                s.rendered = st.get::<u64>("rendered").unwrap_or_default();
+            }
+        }
+        s.queue_ms = self.alsa_card.as_deref().map_or(-1, read_alsa_queue_ms);
+        if let Ok(rms) = self.rms.lock() {
+            let (l, r) = rms.loudest();
+            s.rms_l = l;
+            s.rms_r = r;
+        }
+        s
+    }
+
+    pub fn spawn_bus_watch(&self, tx: mpsc::Sender<SupEvent>) -> JoinHandle<()> {
+        let bus = self
+            .pipeline
+            .bus()
+            .expect("у gst::Pipeline всегда есть шина");
+        let rms = self.rms.clone();
+        let stop = self.stop_flag.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let Some(msg) = bus.timed_pop_filtered(
+                    gst::ClockTime::from_mseconds(BUS_WATCH_POLL.as_millis() as u64),
+                    &[
+                        gst::MessageType::Error,
+                        gst::MessageType::Warning,
+                        gst::MessageType::Element,
+                    ],
+                ) else {
+                    continue;
+                };
+                if let Some(ev) = handle_message(&msg, &rms) {
+                    let failed = matches!(ev, SupEvent::Failed(_));
+                    if let Err(e) = tx.send(ev) {
+                        tracing::debug!("SupEvent {:?} не доставлен: {e}", e.0);
+                    }
+                    if failed {
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Время с последнего успешного start(); Duration::ZERO до первого старта.
+    /// При рестарте того же Runner (повторный start) отсчёт начинается заново.
+    pub fn uptime(&self) -> Duration {
+        self.started_at
+            .lock()
+            .ok()
+            .and_then(|t| *t)
+            .map_or(Duration::ZERO, |t| t.elapsed())
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        // pipewiresrc, брошенный в READY, роняет процесс в libgstpipewire
+        // (SIGSEGV при dispose). В Null — до того, как пайплайн уничтожится.
+        self.stop();
+    }
+}
+
+/// "plughw:CARD=Codec,DEV=0" → "Codec"; без CARD= — None
+fn alsa_card_from_device(device: &str) -> Option<String> {
+    device
+        .split(',')
+        .find_map(|part| part.split_once("CARD=").map(|(_, c)| c.trim().to_string()))
+        .filter(|c| !c.is_empty())
+}
+
+/// Задержка playback-очереди (мс) из /proc/asound/<card>/pcm0p/sub0/status:
+/// delay (сэмплы) при state: RUNNING, пересчёт сэмплы→мс. Логика и формат —
+/// как в measurement/sinkmon.c. Любая ошибка → -1 (метрика недоступна).
+fn read_alsa_queue_ms(card: &str) -> i64 {
+    let path = format!("/proc/asound/{card}/pcm0p/sub0/status");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return -1;
+    };
+    match parse_alsa_status(&text) {
+        Some(samples) => samples * 1000 / RATE_HZ,
+        None => -1,
+    }
+}
+
+/// Парсинг status-файла ALSA: delay (сэмплы) только при state: RUNNING.
+fn parse_alsa_status(text: &str) -> Option<i64> {
+    let mut running = false;
+    let mut delay: Option<i64> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("state") {
+            if rest.split(':').nth(1).is_some_and(|v| v.contains("RUNNING")) {
+                running = true;
+            }
+        } else if let Some(rest) = line.strip_prefix("delay") {
+            if let Some(v) = rest
+                .split(':')
+                .nth(1)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+            {
+                delay = Some(v);
+            }
+        }
+    }
+    if running { delay.filter(|&d| d >= 0) } else { None }
+}
+
+#[derive(Default)]
+struct RmsBook {
+    slots: HashMap<String, (f64, f64, Instant)>,
+}
+
+impl RmsBook {
+    fn note(&mut self, key: &str, l: f64, r: f64) {
+        self.slots.insert(key.to_string(), (l, r, Instant::now()));
+    }
+
+    /// Самый громкий level за последние 500 мс. Тишина общей головы не
+    /// затирает зону, которая играет со своего выхода.
+    fn loudest(&self) -> (f64, f64) {
+        let cutoff = Instant::now() - Duration::from_millis(500);
+        let mut best: Option<(f64, f64)> = None;
+        for (l, r, at) in self.slots.values() {
+            if *at < cutoff {
+                continue;
+            }
+            let score = l.max(*r);
+            match best {
+                Some((bl, br)) if bl.max(br) >= score => {}
+                _ => best = Some((*l, *r)),
+            }
+        }
+        best.unwrap_or((0.0, 0.0))
+    }
+}
+
+fn handle_message(msg: &gst::MessageRef, rms: &Mutex<RmsBook>) -> Option<SupEvent> {
+    use gst::MessageView;
+    match msg.view() {
+        MessageView::Element(e) => {
+            let s = e.structure()?;
+            if s.name() == "level" {
+                if let Ok(arr) = s.get::<gst::glib::ValueArray>("rms") {
+                    let l = arr
+                        .first()
+                        .and_then(|v| v.get::<f64>().ok())
+                        .unwrap_or(f64::NEG_INFINITY);
+                    let r = arr
+                        .get(1)
+                        .and_then(|v| v.get::<f64>().ok())
+                        .unwrap_or(l);
+                    let key = msg.src().map(|o| o.name().to_string()).unwrap_or_else(|| "lev".into());
+                    if let Ok(mut g) = rms.lock() {
+                        g.note(&key, l, r);
+                    }
+                }
+                None
+            } else if s.name() == "GstAudioSink"
+                || s.to_string().to_lowercase().contains("underrun")
+            {
+                Some(SupEvent::Underrun)
+            } else {
+                None
+            }
+        }
+        MessageView::Warning(w) => {
+            let text = w.debug().map(|d| d.to_lowercase()).unwrap_or_default();
+            if text.contains("underrun") {
+                Some(SupEvent::Underrun)
+            } else {
+                None
+            }
+        }
+        MessageView::Error(e) => Some(SupEvent::Failed(e.error().to_string())),
+        _ => None,
+    }
+}
+
+pub struct RestartPolicy {
+    attempts: u32,
+    max_fast: u32,
+}
+
+impl RestartPolicy {
+    pub fn new(max_fast: u32) -> RestartPolicy {
+        RestartPolicy { attempts: 0, max_fast }
+    }
+
+    pub fn next_delay(&mut self) -> Duration {
+        self.attempts += 1;
+        if self.attempts <= self.max_fast {
+            Duration::ZERO
+        } else {
+            SLOW_RESTART_DELAY
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sine_pipeline() -> gst::Pipeline {
+        gst::parse::launch(
+            "audiotestsrc volume=0.5 ! audio/x-raw,rate=48000,channels=2 ! \
+             level name=lev ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap()
+    }
+
+    const ALSA_STATUS_RUNNING: &str = "state: RUNNING\n\
+owner_pid   : 892\n\
+trigger_time: 7569.410828042\n\
+tstamp      : 7569.410828042\n\
+delay       : 4800\n\
+avail       : 960\n\
+avail_max   : 1936\n\
+hw_ptr      : 313632\n\
+appl_ptr    : 313632\n";
+
+    #[test]
+    fn alsa_status_parsing() {
+        assert_eq!(parse_alsa_status(ALSA_STATUS_RUNNING), Some(4800));
+        // не RUNNING → метрика недоступна
+        let prepared = ALSA_STATUS_RUNNING.replace("state: RUNNING", "state: PREPARED");
+        assert_eq!(parse_alsa_status(&prepared), None);
+        // нет поля delay → None
+        let no_delay = ALSA_STATUS_RUNNING
+            .lines()
+            .filter(|l| !l.starts_with("delay"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_alsa_status(&no_delay), None);
+        // отрицательный delay недопустим (как d >= 0 в sinkmon.c)
+        let negative = ALSA_STATUS_RUNNING.replacen("delay       : 4800", "delay       : -5", 1);
+        assert_eq!(parse_alsa_status(&negative), None);
+        assert_eq!(parse_alsa_status(""), None);
+    }
+
+    #[test]
+    fn alsa_card_from_device_parsing() {
+        assert_eq!(alsa_card_from_device("plughw:CARD=Codec").as_deref(), Some("Codec"));
+        assert_eq!(
+            alsa_card_from_device("plughw:CARD=CODEC,DEV=0").as_deref(),
+            Some("CODEC")
+        );
+        assert_eq!(alsa_card_from_device("hw:CARD=PCH,DEV=1").as_deref(), Some("PCH"));
+        assert_eq!(alsa_card_from_device("default"), None);
+        assert_eq!(alsa_card_from_device("hw:0,0"), None);
+        assert_eq!(alsa_card_from_device("plughw:CARD=").as_deref(), None);
+    }
+
+    #[test]
+    fn runner_new_rx_pw_builds() {
+        gst::init().unwrap();
+        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), None, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        assert!(r.pipeline().by_name("asink").is_some());
+    }
+
+    #[test]
+    fn stop_leaves_the_playback_thread_alive() {
+        gst::init().unwrap();
+        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), None, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        r.stop();
+        let alive = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| std::fs::read_to_string(e.path().join("comm")).ok().is_some_and(|n| n.trim() == "zvucast-play"));
+        assert!(alive, "Stop не должен убивать поток pw-play: Start его не поднимает");
+        drop(r);
+    }
+
+    #[test]
+    fn queue_ms_is_minus_one_for_unknown_card() {
+        assert_eq!(read_alsa_queue_ms("NoSuchCardZvucast"), -1);
+    }
+
+    #[test]
+    fn restart_policy_backoff() {
+        let mut p = RestartPolicy::new(3);
+        assert_eq!(p.next_delay(), Duration::ZERO);
+        assert_eq!(p.next_delay(), Duration::ZERO);
+        assert_eq!(p.next_delay(), Duration::ZERO);
+        assert_eq!(p.next_delay(), Duration::from_secs(10));
+        assert_eq!(p.next_delay(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn runner_new_builds_pipeline_for_both_roles() {
+        gstreamer::init().unwrap();
+        let rx = Runner::new_rx(&crate::config::PipelineCfg::default_rx(), "plughw:CARD=Whatever", &ChannelMap::default(), &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        assert_eq!(rx.state(), PipelineState::Stopped);
+        assert!(rx.level.is_some(), "level name=lev есть в rx");
+        assert!(rx.sink.is_some(), "alsasink name=asink есть в rx");
+
+        let tx = Runner::new_tx(&crate::config::PipelineCfg::default_tx(), "plughw:CARD=Whatever", &[], 0, &mut crate::pipeline::LoopbackUdp).unwrap();
+        assert_eq!(tx.state(), PipelineState::Stopped);
+        assert!(tx.level.is_some(), "level есть и в tx (rms в телеметрии tx)");
+        assert!(tx.sink.is_none(), "в tx нет alsasink");
+    }
+
+    #[test]
+    fn new_tx_with_empty_endpoints_builds_branchless_tee() {
+        gstreamer::init().unwrap();
+        let r = Runner::new_tx(&crate::config::PipelineCfg::default_tx(), "plughw:CARD=Whatever", &[], 0, &mut crate::pipeline::LoopbackUdp).unwrap();
+        let children = r.pipeline().children();
+        assert!(children.iter().any(|e| e.factory().unwrap().name() == "tee"),
+                "tee на месте");
+        assert!(children.iter().any(|e| e.name() == "usilence"),
+                "пустой набор держит fakesink, иначе level не течёт");
+        assert!(!children.iter().any(|e| e.factory().unwrap().name() == "udpsink"),
+                "udpsink нет: пустой набор = тишина, не multicast");
+    }
+
+    #[test]
+    fn stats_flow_for_test_pipeline() {
+        gstreamer::init().unwrap();
+        let r = Runner::from_pipeline_for_test(sine_pipeline());
+        r.spawn_bus_watch(mpsc::channel().0);
+        r.start().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.stats().rms_l == 0.0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let st = r.stats();
+        assert!(st.rms_l < 0.0 && st.rms_l > -20.0, "rms_l={}", st.rms_l);
+        assert!(st.rms_r < 0.0 && st.rms_r > -20.0, "rms_r={}", st.rms_r);
+        assert!(
+            (st.rms_l - st.rms_r).abs() < 0.01,
+            "каналы совпадают: {} vs {}",
+            st.rms_l,
+            st.rms_r
+        );
+        // fakesink не публикует stats, alsa_card нет — fallback-значения
+        assert_eq!(st.rendered, 0);
+        assert_eq!(st.dropped, 0);
+        assert_eq!(st.queue_ms, -1);
+        assert_eq!(r.state(), PipelineState::Playing);
+
+        r.stop();
+        assert_eq!(r.state(), PipelineState::Stopped);
+    }
+
+    #[test]
+    fn uptime_counts_from_start() {
+        gstreamer::init().unwrap();
+        let r = Runner::from_pipeline_for_test(sine_pipeline());
+        assert_eq!(r.uptime(), Duration::ZERO, "до старта uptime=0");
+
+        r.start().unwrap();
+        let u1 = r.uptime();
+        assert!(u1 > Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(r.uptime() > u1, "uptime растёт после start()");
+        r.stop();
+    }
+
+    #[test]
+    fn bus_watch_exits_on_stop() {
+        gstreamer::init().unwrap();
+        let r = Runner::from_pipeline_for_test(sine_pipeline());
+        let watch = r.spawn_bus_watch(mpsc::channel().0);
+        r.start().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        r.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watch.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(watch.is_finished(), "bus-watch-поток не завершился после stop()");
+    }
+
+    #[test]
+    fn bus_watch_reports_underrun() {
+        gstreamer::init().unwrap();
+        let r = Runner::from_pipeline_for_test(sine_pipeline());
+        let (tx, rx) = mpsc::channel();
+        r.spawn_bus_watch(tx);
+        r.start().unwrap();
+
+        // синтетическое element-сообщение от GstAudioSink (так постит alsasink)
+        let msg = gst::message::Element::new(gst::Structure::builder("GstAudioSink").build());
+        r.pipeline.post_message(msg).unwrap();
+
+        let ev = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ждём Underrun");
+        assert_eq!(ev, SupEvent::Underrun);
+        r.stop();
+    }
+
+    #[test]
+    fn bus_watch_reports_error_and_exits() {
+        gstreamer::init().unwrap();
+        // identity error-after=1 → детерминированный GST_MESSAGE_ERROR в рантайме
+        let pipe = gst::parse::launch(
+            "audiotestsrc num-buffers=10 ! audio/x-raw,rate=48000,channels=2 ! \
+             identity error-after=1 ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let r = Runner::from_pipeline_for_test(pipe);
+        let (tx, rx) = mpsc::channel();
+        let watch = r.spawn_bus_watch(tx);
+        r.start().unwrap();
+
+        let ev = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ждём Failed");
+        match ev {
+            SupEvent::Failed(detail) => assert!(!detail.is_empty()),
+            other => panic!("ожидали Failed, получили {other:?}"),
+        }
+        // после Error поток bus-watch завершается
+        watch.join().unwrap();
+        r.stop();
+    }
+}
