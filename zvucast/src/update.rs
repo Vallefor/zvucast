@@ -51,7 +51,7 @@ pub fn asset_url_ok(url: &str, target: &str) -> bool {
 pub fn redirect_host_ok(host: &str) -> bool {
     matches!(
         host,
-        "github.com" | "release-assets.githubusercontent.com" | "objects.githubusercontent.com"
+        "release-assets.githubusercontent.com" | "objects.githubusercontent.com"
     )
 }
 
@@ -155,10 +155,11 @@ mod tests {
 
     #[test]
     fn redirects_only_to_github_asset_hosts() {
-        assert!(redirect_host_ok("github.com"));
+        assert!(!redirect_host_ok("github.com"));
         assert!(redirect_host_ok("release-assets.githubusercontent.com"));
         assert!(redirect_host_ok("objects.githubusercontent.com"));
         assert!(!redirect_host_ok("example.com"));
+        assert!(!redirect_host_ok("objects.githubusercontent.com.evil.com"));
     }
 
     #[test]
