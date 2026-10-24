@@ -288,31 +288,37 @@ fn apply_unit_state(unit: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// `ok` и `rolled_back` забирает новый процесс агента. Иной текст или пустой
-/// файл — этот процесс ещё жив, юнит кончился без итога.
-pub fn apply_outcome(text: Option<&str>) -> Result<(), String> {
-    if status_settled(text) {
-        Ok(())
-    } else {
-        Err("служба завершилась".into())
+/// Итог уже завершившегося юнита для агента, который ещё жив.
+/// `Ok(None)` — в файле `ok`: событие не шлём, его заберёт новый процесс.
+/// `Ok(Some("rolled_back"))` — `UpdateFinished` с этой деталью. Restart мог
+/// не сменить процесс, а `take_apply_result` уже отработал на старте.
+/// `Err` — `UpdateFailed`. `rolled_back` в ошибку не превращается.
+pub fn apply_outcome(text: Option<&str>) -> Result<Option<&'static str>, String> {
+    match status_result(text) {
+        Some("ok") => Ok(None),
+        Some("rolled_back") => Ok(Some("rolled_back")),
+        _ => Err("служба завершилась".into()),
     }
 }
 
-fn status_settled(text: Option<&str>) -> bool {
-    let Some(text) = text else {
-        return false;
-    };
+fn status_result(text: Option<&str>) -> Option<&'static str> {
+    let text = text?;
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
+        return None;
     };
-    matches!(v.get("result").and_then(|r| r.as_str()), Some("ok" | "rolled_back"))
+    match v.get("result").and_then(|r| r.as_str()) {
+        Some("ok") => Some("ok"),
+        Some("rolled_back") => Some("rolled_back"),
+        _ => None,
+    }
 }
 
 /// После нуля от `systemd-run`. Рестарт агента (успех и откат) может убить
 /// этот цикл: новый процесс читает файл статуса. Смерть ожидания сама по себе
-/// `UpdateFailed` не шлёт — ошибка только если юнит уже кончился, а в файле
-/// нет `ok` и нет `rolled_back`.
-pub fn wait_apply_unit() -> Result<(), String> {
+/// событие не шлёт. Ошибка — только если юнит кончился без `ok` и без
+/// `rolled_back`. `rolled_back` возвращается отдельно, чтобы живой процесс
+/// послал `UpdateFinished`, не `UpdateFailed`.
+pub fn wait_apply_unit() -> Result<Option<&'static str>, String> {
     while unit_state_running(&apply_unit_state(APPLY_UNIT)) {
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -490,8 +496,16 @@ mod tests {
         assert!(apply_outcome(None).is_err());
         assert!(apply_outcome(Some("не json")).is_err());
         assert!(apply_outcome(Some(r#"{"result":"failed","from":"a","to":"b"}"#)).is_err());
-        assert!(apply_outcome(Some(r#"{"result":"ok","from":"0.1.0+dev","to":"0.1.0"}"#)).is_ok());
-        assert!(apply_outcome(Some(r#"{"result":"rolled_back","from":"0.1.0+dev","to":"0.1.0"}"#)).is_ok());
+        assert_eq!(
+            apply_outcome(Some(r#"{"result":"ok","from":"0.1.0+dev","to":"0.1.0"}"#)).unwrap(),
+            None
+        );
+        // Живой процесс шлёт UpdateFinished, не UpdateFailed. Повтор от нового
+        // процесса контроллер переносит.
+        assert_eq!(
+            apply_outcome(Some(r#"{"result":"rolled_back","from":"0.1.0+dev","to":"0.1.0"}"#)).unwrap(),
+            Some("rolled_back")
+        );
     }
 
     #[test]

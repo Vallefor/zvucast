@@ -342,14 +342,25 @@ async fn connect_once(
                                         tokio::spawn(async move {
                                             let outcome = run_apply(url, sha256, from, to).await;
                                             updating.store(false, Ordering::Release);
-                                            if let Err(detail) = outcome {
-                                                tracing::warn!("обновление: {detail}");
-                                                let msg = AgentMsg::Event {
-                                                    kind: EventKind::UpdateFailed,
-                                                    detail,
-                                                };
-                                                let _ = tx.send(msg).await;
-                                            }
+                                            let msg = match outcome {
+                                                // restart не сменил процесс: файл
+                                                // rolled_back уже есть, а take_apply_result
+                                                // на старте его не перечитает. Новый
+                                                // процесс, если поднимется, пришлёт то же.
+                                                Ok(Some(detail)) => AgentMsg::Event {
+                                                    kind: EventKind::UpdateFinished,
+                                                    detail: detail.to_string(),
+                                                },
+                                                Ok(None) => return,
+                                                Err(detail) => {
+                                                    tracing::warn!("обновление: {detail}");
+                                                    AgentMsg::Event {
+                                                        kind: EventKind::UpdateFailed,
+                                                        detail,
+                                                    }
+                                                }
+                                            };
+                                            let _ = tx.send(msg).await;
                                         });
                                     }
                                 } else if cmds.send(ctl).await.is_err() {
@@ -424,14 +435,14 @@ async fn dial_bound(
     Ok(ws)
 }
 
-async fn run_apply(url: String, sha256: String, from: String, to: String) -> Result<(), String> {
+async fn run_apply(url: String, sha256: String, from: String, to: String) -> Result<Option<&'static str>, String> {
     let bytes = crate::update::download_asset(&url, crate::update::baked_target(), &sha256).await?;
     tokio::task::spawn_blocking(move || stage_apply(bytes, sha256, from, to))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Result<(), String> {
+fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Result<Option<&'static str>, String> {
     // Свой каталог на попытку: вторая запись не обрезает apply-update.sh,
     // который bash первой службы ещё читает. Имя юнита общее и по-прежнему отказывает.
     let dir = std::path::Path::new("/run").join(format!(
@@ -450,8 +461,8 @@ fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Resu
     tracing::info!("обновление: служба zvucast-apply-update запущена");
     // Рестарт из скрипта убивает этот процесс на успехе и на откате. Ожидание
     // без `--wait`: если нас убьют, событие не уходит, новый процесс читает
-    // файл. Если юнит кончился, а мы живы и файла `ok`/`rolled_back` нет —
-    // UpdateFailed, id на контроллере не зависает.
+    // файл. Если юнит кончился, а мы живы: нет `ok`/`rolled_back` —
+    // UpdateFailed; `rolled_back` — UpdateFinished, процесс restart не сменил.
     crate::update::wait_apply_unit()
 }
 

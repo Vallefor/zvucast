@@ -842,6 +842,20 @@ mod updating_set {
         assert!(matches!(rx.try_recv().unwrap(), CtlMsg::ApplyUpdate { .. }));
     }
 
+    #[tokio::test]
+    async fn rolled_back_twice_clears_the_id_and_a_second_update_is_not_blocked() {
+        let st = AppState::new();
+        let mut rx = register(&st, "0.1.0+dev").await;
+        st.updating.lock().await.insert("n1".into(), "0.1.0".into());
+        record_node_event(&st, "n1", zproto::EventKind::UpdateFinished, "rolled_back".into()).await;
+        record_node_event(&st, "n1", zproto::EventKind::UpdateFinished, "rolled_back".into()).await;
+        assert!(!st.updating.lock().await.contains_key("n1"));
+        let note = st.reg.lock().await.list().into_iter().find(|n| n.node_id == "n1").unwrap().update_note;
+        assert_eq!(note.as_deref(), Some("rolled_back"));
+        apply_update(&st, "n1", "aarch64", &release_010()).await.unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), CtlMsg::ApplyUpdate { .. }));
+    }
+
     async fn hello_node(st: &AppState, id: &str, ip: &str) -> mpsc::Receiver<CtlMsg> {
         let (tx, rx) = mpsc::channel(1);
         st.reg.lock().await.hello(
