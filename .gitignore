@@ -1,3 +1,6 @@
 /target/
 dist/
+!web/dist/
+!web/dist/index.html
+web/dist/assets/
 scripts/private-patterns.local
