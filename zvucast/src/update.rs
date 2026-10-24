@@ -188,6 +188,8 @@ pub async fn fetch_latest() -> Result<(String, String), String> {
 
 fn github_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::custom(|try_| {
             let host = try_.url().host_str().unwrap_or("");
             if redirect_host_ok(host) {
