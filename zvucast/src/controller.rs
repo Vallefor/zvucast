@@ -1791,7 +1791,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     let (mut sink, mut stream) = socket.split();
 
     // Первый кадр обязан быть Hello — иначе закрываем соединение.
-    let (node_id, name, roles, version, capture_device, playback_device, inputs, outputs, supports_virtual_output, link) = loop {
+    let (node_id, name, roles, version, target, capture_device, playback_device, inputs, outputs, supports_virtual_output, link) = loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => match serde_json::from_str::<AgentMsg>(&text) {
                 Ok(AgentMsg::Hello {
@@ -1799,14 +1799,14 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                     name,
                     roles,
                     version,
-                    target: _,
+                    target,
                     capture_device,
                     playback_device,
                     inputs,
                     outputs,
                     supports_virtual_output,
                     link,
-                }) => break (node_id, name, roles, version, capture_device, playback_device, inputs, outputs, supports_virtual_output, link),
+                }) => break (node_id, name, roles, version, target, capture_device, playback_device, inputs, outputs, supports_virtual_output, link),
                 _ => {
                     tracing::warn!("ws: первое сообщение не Hello — закрываем");
                     return;
@@ -1829,7 +1829,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     st.reg
         .lock()
         .await
-        .hello(&node_id, &name, roles.clone(), version, capture_device.clone(), playback_device.clone(), ip, cmd_tx);
+        .hello(&node_id, &name, roles.clone(), version, target, capture_device.clone(), playback_device.clone(), ip, cmd_tx);
     let reported = if inputs.is_empty() && roles.contains(&Role::Tx) {
         crate::inputs::fallback_inputs(capture_device.as_deref())
     } else {

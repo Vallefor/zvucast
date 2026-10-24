@@ -13,6 +13,9 @@ pub struct NodeView {
     pub display_name: Option<String>,
     pub channel_map: Option<ChannelMap>,
     pub roles: Vec<Role>,
+    pub version: String,
+    pub target: String,
+    pub update_note: Option<String>,
     pub capture_device: Option<String>,
     pub playback_device: Option<String>,
     pub ip: String,
@@ -55,8 +58,9 @@ struct NodeRec {
     playback_device: Option<String>,
     ip: String,
     link: Option<zproto::LinkKind>,
-    #[allow(dead_code)]
     version: String,
+    target: String,
+    update_note: Option<String>,
     dup: bool,
     last_telem: Option<(Instant, Telemetry)>,
     last_event: Option<(EventKind, String)>,
@@ -126,10 +130,12 @@ impl Registry {
     }
 
     /// Регистрация узла (Hello по WS), ключ — `node_id`. Повторный hello от
-    /// того же node_id заменяет канал команд, имя, набор ролей и устройства,
-    /// переводит узел online; телеметрия сбрасывается; счётчик hello_seq
-    /// инкрементится (факт re-hello для пушера — см. `hello_seqs`). Мета (display_name,
-    /// channel_map) не трогается — она живёт отдельно (`set_meta`).
+    /// того же node_id заменяет канал команд, имя, набор ролей, версию, target
+    /// и устройства, переводит узел online; телеметрия сбрасывается; счётчик
+    /// hello_seq инкрементится (факт re-hello для пушера — см. `hello_seqs`).
+    /// Мета (display_name, channel_map) не трогается — она живёт отдельно
+    /// (`set_meta`). `update_note` тоже не сбрасывается: итог отката приходит
+    /// отдельно (`set_update_note`) и не должен затираться следующим hello.
     /// `ip` — адрес peer'а WS-соединения (подставляет controller).
     /// `dup` выставляется, если узел с этим node_id уже online с другого ip
     /// (два агента с одним id одновременно); совпадение ip — обычный re-hello.
@@ -140,6 +146,7 @@ impl Registry {
         name: &str,
         roles: Vec<Role>,
         version: String,
+        target: String,
         capture_device: Option<String>,
         playback_device: Option<String>,
         ip: String,
@@ -151,6 +158,7 @@ impl Registry {
                 rec.name = name.to_string();
                 rec.roles = roles;
                 rec.version = version;
+                rec.target = target;
                 rec.capture_device = capture_device;
                 rec.playback_device = playback_device;
                 rec.ip = ip;
@@ -171,6 +179,8 @@ impl Registry {
                         ip,
                         link: None,
                         version,
+                        target,
+                        update_note: None,
                         dup,
                         last_telem: None,
                         last_event: None,
@@ -185,6 +195,13 @@ impl Registry {
             }
         }
         self.bump_version();
+    }
+
+    /// Итог обновления узла. `None` стирает заметку. Неизвестный узел — no-op.
+    pub fn set_update_note(&mut self, node_id: &str, note: Option<String>) {
+        if let Some(rec) = self.nodes.get_mut(node_id) {
+            rec.update_note = note;
+        }
     }
 
     /// Задать мету узла (display_name и/или канальную матрицу). Полное
@@ -330,6 +347,9 @@ impl Registry {
                     display_name: meta.and_then(|m| m.display_name.clone()),
                     channel_map: meta.and_then(|m| m.channel_map),
                     roles: rec.roles.clone(),
+                    version: rec.version.clone(),
+                    target: rec.target.clone(),
+                    update_note: rec.update_note.clone(),
                     capture_device: rec.capture_device.clone(),
                     playback_device: rec.playback_device.clone(),
                     ip: rec.ip.clone(),
@@ -490,7 +510,22 @@ mod tests {
 
     fn hello(r: &mut Registry, name: &str) {
         let (tx, _rx) = mpsc::channel(1);
-        r.hello(&format!("id-{name}"), name, vec![Role::Rx], "0.1".into(), None, None, "192.0.2.1".into(), tx);
+        r.hello(&format!("id-{name}"), name, vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.1".into(), tx);
+    }
+
+    #[test]
+    fn list_shows_version_target_and_note() {
+        let mut r = Registry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        r.hello(
+            "n1", "pi", vec![Role::Rx], "0.1.0+dev".into(), "aarch64".into(),
+            None, None, "192.0.2.10".into(), tx,
+        );
+        r.set_update_note("n1", Some("rolled_back".into()));
+        let v = r.list().into_iter().find(|n| n.node_id == "n1").unwrap();
+        assert_eq!(v.version, "0.1.0+dev");
+        assert_eq!(v.target, "aarch64");
+        assert_eq!(v.update_note.as_deref(), Some("rolled_back"));
     }
 
     #[test]
@@ -508,7 +543,7 @@ mod tests {
     fn lifecycle() {
         let (tx, _rx) = mpsc::channel(1);
         let mut r = Registry::new();
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx);
         assert_eq!(r.list()[0].name, "opi");
         assert!(r.list()[0].online);
         r.telemetry("id-opi", telem());
@@ -524,8 +559,8 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, mut rx2) = mpsc::channel(1);
         let mut r = Registry::new();
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx1);
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.2".into(), None, None, "192.0.2.36".into(), tx2);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx1);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.2".into(), String::new(), None, None, "192.0.2.36".into(), tx2);
         assert!(r.list()[0].online);
         r.send_cmd("id-opi", CtlMsg::Start).unwrap();
         assert!(matches!(rx2.try_recv(), Ok(CtlMsg::Start)));
@@ -548,7 +583,7 @@ mod tests {
     fn sweep_keeps_fresh_online() {
         let (tx, _rx) = mpsc::channel(1);
         let mut r = Registry::new();
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx);
         r.telemetry("id-opi", telem());
         r.sweep(now_plus(3), Duration::from_secs(5));
         assert!(r.list()[0].online, "свежая телеметрия — online");
@@ -559,7 +594,7 @@ mod tests {
     fn send_to_closed_channel_is_closed_error() {
         let (tx, rx) = mpsc::channel(1);
         let mut r = Registry::new();
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx);
         drop(rx);
         assert!(matches!(r.send_cmd("id-opi", CtlMsg::Stop), Err(RegistryError::Closed)));
     }
@@ -569,10 +604,10 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let mut r = Registry::new();
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx1.clone());
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx1.clone());
         assert!(r.is_current_tx("id-opi", &tx1));
         assert!(!r.is_current_tx("id-opi", &tx2));
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.2".into(), None, None, "192.0.2.36".into(), tx2.clone());
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.2".into(), String::new(), None, None, "192.0.2.36".into(), tx2.clone());
         assert!(!r.is_current_tx("id-opi", &tx1), "после re-hello старый канал не текущий");
         assert!(r.is_current_tx("id-opi", &tx2));
         assert!(!r.is_current_tx("ghost", &tx1));
@@ -612,9 +647,9 @@ mod tests {
         let (tx1, _r1) = mpsc::channel(1);
         let (tx2, _r2) = mpsc::channel(1);
         let (tx3, _r3) = mpsc::channel(1);
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx1);
-        r.hello("id-pi4", "pi4", vec![Role::Tx], "0.1".into(), None, None, "192.0.2.204".into(), tx2);
-        r.hello("id-rx2", "rx2", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.99".into(), tx3);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx1);
+        r.hello("id-pi4", "pi4", vec![Role::Tx], "0.1".into(), String::new(), None, None, "192.0.2.204".into(), tx2);
+        r.hello("id-rx2", "rx2", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.99".into(), tx3);
         r.mark_offline("id-rx2");
         let eps = r.rx_endpoints();
         assert_eq!(eps, vec![Endpoint { ip: "192.0.2.36".into(), port: 5004 }]);
@@ -624,7 +659,7 @@ mod tests {
     fn endpoints_recomputed_on_online_change() {
         let mut r = Registry::new();
         let (tx1, _r1) = mpsc::channel(1);
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx1);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx1);
         assert_eq!(
             r.rx_endpoints(),
             vec![Endpoint { ip: "192.0.2.36".into(), port: 5004 }]
@@ -632,7 +667,7 @@ mod tests {
         r.mark_offline("id-opi");
         assert!(r.rx_endpoints().is_empty());
         let (tx2, _r2) = mpsc::channel(1);
-        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), None, None, "192.0.2.36".into(), tx2);
+        r.hello("id-opi", "opi", vec![Role::Rx], "0.1".into(), String::new(), None, None, "192.0.2.36".into(), tx2);
         assert_eq!(
             r.rx_endpoints(),
             vec![Endpoint { ip: "192.0.2.36".into(), port: 5004 }]
@@ -649,7 +684,7 @@ mod tests {
             let mut r = Registry::new();
             for (name, ip) in registrations {
                 let (tx, _rx) = mpsc::channel(1);
-                r.hello(&format!("id-{name}"), name, vec![Role::Rx], "0.1".into(), None, None, (*ip).into(), tx);
+                r.hello(&format!("id-{name}"), name, vec![Role::Rx], "0.1".into(), String::new(), None, None, (*ip).into(), tx);
             }
             r.rx_endpoints()
         };
@@ -669,9 +704,9 @@ mod tests {
         let (tx1, mut rx1) = mpsc::channel(8);
         let (tx2, _rx2) = mpsc::channel(8);
         let (tx3, mut rx3) = mpsc::channel(8);
-        r.hello("id-t1", "t1", vec![Role::Tx], "0.1".into(), None, None, "10.0.0.1".into(), tx1);
-        r.hello("id-t2", "t2", vec![Role::Tx], "0.1".into(), None, None, "10.0.0.2".into(), tx2);
-        r.hello("id-r1", "r1", vec![Role::Rx], "0.1".into(), None, None, "10.0.0.3".into(), tx3);
+        r.hello("id-t1", "t1", vec![Role::Tx], "0.1".into(), String::new(), None, None, "10.0.0.1".into(), tx1);
+        r.hello("id-t2", "t2", vec![Role::Tx], "0.1".into(), String::new(), None, None, "10.0.0.2".into(), tx2);
+        r.hello("id-r1", "r1", vec![Role::Rx], "0.1".into(), String::new(), None, None, "10.0.0.3".into(), tx3);
         r.mark_offline("id-t2");
         let sent = r.send_to_role(Role::Tx, CtlMsg::Start);
         assert_eq!(sent, vec!["t1".to_string()]);
@@ -683,7 +718,7 @@ mod tests {
     fn send_to_role_ignores_closed_channel() {
         let mut r = Registry::new();
         let (tx1, rx1) = mpsc::channel(1);
-        r.hello("id-t1", "t1", vec![Role::Tx], "0.1".into(), None, None, "10.0.0.1".into(), tx1);
+        r.hello("id-t1", "t1", vec![Role::Tx], "0.1".into(), String::new(), None, None, "10.0.0.1".into(), tx1);
         drop(rx1);
         // Закрытый канал — узел пропускается, паники/ошибки нет, имена не вернулись.
         assert!(r.send_to_role(Role::Tx, CtlMsg::Start).is_empty());
@@ -694,7 +729,7 @@ mod tests {
     fn mixed_node_is_endpoint_and_push_target() {
         let mut r = Registry::new();
         let (tx, mut rx) = mpsc::channel(8);
-        r.hello("id-pc", "pc", vec![Role::Tx, Role::Rx], "0.1".into(), None, None, "10.0.0.7".into(), tx);
+        r.hello("id-pc", "pc", vec![Role::Tx, Role::Rx], "0.1".into(), String::new(), None, None, "10.0.0.7".into(), tx);
         assert_eq!(
             r.rx_endpoints(),
             vec![Endpoint { ip: "10.0.0.7".into(), port: 5004 }],
@@ -711,11 +746,11 @@ mod tests {
     fn rehello_updates_roles() {
         let mut r = Registry::new();
         let (tx1, _r1) = mpsc::channel(1);
-        r.hello("id-pc", "pc", vec![Role::Rx], "0.1".into(), None, None, "10.0.0.7".into(), tx1);
+        r.hello("id-pc", "pc", vec![Role::Rx], "0.1".into(), String::new(), None, None, "10.0.0.7".into(), tx1);
         assert_eq!(r.rx_endpoints().len(), 1);
         assert!(r.send_to_role(Role::Tx, CtlMsg::Start).is_empty(), "пока нет tx — пуш некому");
         let (tx2, mut rx2) = mpsc::channel(8);
-        r.hello("id-pc", "pc", vec![Role::Tx, Role::Rx], "0.2".into(), Some("cap".into()), Some("play".into()), "10.0.0.7".into(), tx2);
+        r.hello("id-pc", "pc", vec![Role::Tx, Role::Rx], "0.2".into(), String::new(), Some("cap".into()), Some("play".into()), "10.0.0.7".into(), tx2);
         assert_eq!(r.list()[0].roles, vec![Role::Tx, Role::Rx]);
         assert_eq!(r.list()[0].capture_device.as_deref(), Some("cap"));
         assert_eq!(r.send_to_role(Role::Tx, CtlMsg::Start), vec!["pc".to_string()]);
@@ -753,9 +788,9 @@ mod tests {
     fn rehello_same_node_id_keeps_single_entry() {
         let mut r = Registry::new();
         let (tx1, _rx1) = mpsc::channel(1);
-        r.hello("id-1", "old-name", vec![Role::Rx], "v1".into(), None, None, "1.1.1.1".into(), tx1);
+        r.hello("id-1", "old-name", vec![Role::Rx], "v1".into(), String::new(), None, None, "1.1.1.1".into(), tx1);
         let (tx2, _rx2) = mpsc::channel(1);
-        r.hello("id-1", "new-name", vec![Role::Rx], "v1".into(), None, None, "2.2.2.2".into(), tx2);
+        r.hello("id-1", "new-name", vec![Role::Rx], "v1".into(), String::new(), None, None, "2.2.2.2".into(), tx2);
         assert_eq!(r.list().len(), 1);
         assert_eq!(r.list()[0].name, "new-name");
         assert_eq!(r.list()[0].ip, "2.2.2.2");
@@ -765,7 +800,7 @@ mod tests {
     fn meta_is_exposed_in_view() {
         let mut r = Registry::new();
         let (tx, _rx) = mpsc::channel(1);
-        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), None, None, "1.1.1.1".into(), tx);
+        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), String::new(), None, None, "1.1.1.1".into(), tx);
         r.set_meta("id-1", Some("Кухня".into()),
                    Some(ChannelMap { out_l: Some(ChanSel::L), out_r: None }));
         let v = &r.list()[0];
@@ -777,9 +812,9 @@ mod tests {
     fn duplicate_node_id_is_flagged() {
         let mut r = Registry::new();
         let (tx1, _rx1) = mpsc::channel(1);
-        r.hello("id-1", "a", vec![Role::Rx], "v".into(), None, None, "1.1.1.1".into(), tx1);
+        r.hello("id-1", "a", vec![Role::Rx], "v".into(), String::new(), None, None, "1.1.1.1".into(), tx1);
         let (tx2, _rx2) = mpsc::channel(1);
-        r.hello("id-1", "b", vec![Role::Rx], "v".into(), None, None, "2.2.2.2".into(), tx2);
+        r.hello("id-1", "b", vec![Role::Rx], "v".into(), String::new(), None, None, "2.2.2.2".into(), tx2);
         assert!(r.list()[0].dup, "второй online-узел с тем же id и другим ip — дубликат");
     }
 
@@ -790,7 +825,7 @@ mod tests {
         let mut r = Registry::new();
         r.set_meta("id-1", Some("Кухня".into()), None);
         let (tx, _rx) = mpsc::channel(1);
-        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), None, None, "1.1.1.1".into(), tx);
+        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), String::new(), None, None, "1.1.1.1".into(), tx);
         let v = &r.list()[0];
         assert_eq!(v.display_name.as_deref(), Some("Кухня"));
         assert!(v.channel_map.is_none());
@@ -802,10 +837,10 @@ mod tests {
     fn rehello_preserves_meta() {
         let mut r = Registry::new();
         let (tx1, _rx1) = mpsc::channel(1);
-        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), None, None, "1.1.1.1".into(), tx1);
+        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), String::new(), None, None, "1.1.1.1".into(), tx1);
         r.set_meta("id-1", Some("Кухня".into()), None);
         let (tx2, _rx2) = mpsc::channel(1);
-        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), None, None, "1.1.1.1".into(), tx2);
+        r.hello("id-1", "opi", vec![Role::Rx], "v1".into(), String::new(), None, None, "1.1.1.1".into(), tx2);
         assert_eq!(r.list()[0].display_name.as_deref(), Some("Кухня"));
     }
 
@@ -814,12 +849,12 @@ mod tests {
     fn same_ip_rehello_clears_dup() {
         let mut r = Registry::new();
         let (tx1, _rx1) = mpsc::channel(1);
-        r.hello("id-1", "a", vec![Role::Rx], "v".into(), None, None, "1.1.1.1".into(), tx1);
+        r.hello("id-1", "a", vec![Role::Rx], "v".into(), String::new(), None, None, "1.1.1.1".into(), tx1);
         let (tx2, _rx2) = mpsc::channel(1);
-        r.hello("id-1", "b", vec![Role::Rx], "v".into(), None, None, "2.2.2.2".into(), tx2);
+        r.hello("id-1", "b", vec![Role::Rx], "v".into(), String::new(), None, None, "2.2.2.2".into(), tx2);
         assert!(r.list()[0].dup);
         let (tx3, _rx3) = mpsc::channel(1);
-        r.hello("id-1", "b", vec![Role::Rx], "v".into(), None, None, "2.2.2.2".into(), tx3);
+        r.hello("id-1", "b", vec![Role::Rx], "v".into(), String::new(), None, None, "2.2.2.2".into(), tx3);
         assert!(!r.list()[0].dup, "re-hello с совпадающим ip — обычное переподключение");
     }
 
@@ -828,7 +863,7 @@ mod tests {
     fn resolve_by_node_id_then_name() {
         let mut r = Registry::new();
         let (tx, _rx) = mpsc::channel(1);
-        r.hello("id-x", "pretty", vec![Role::Rx], "v".into(), None, None, "1.1.1.1".into(), tx);
+        r.hello("id-x", "pretty", vec![Role::Rx], "v".into(), String::new(), None, None, "1.1.1.1".into(), tx);
         assert_eq!(r.resolve("id-x").as_deref(), Some("id-x"), "node_id резолвится сразу");
         assert_eq!(r.resolve("pretty").as_deref(), Some("id-x"), "имя — алиас к node_id");
         assert!(r.resolve("ghost").is_none());
@@ -839,7 +874,7 @@ mod tests {
     fn roles_of_known_including_offline() {
         let mut r = Registry::new();
         let (tx, _rx) = mpsc::channel(1);
-        r.hello("id-t", "t", vec![Role::Tx], "v".into(), None, None, "1.1.1.1".into(), tx);
+        r.hello("id-t", "t", vec![Role::Tx], "v".into(), String::new(), None, None, "1.1.1.1".into(), tx);
         assert_eq!(r.roles_of("id-t"), Some(vec![Role::Tx]));
         r.mark_offline("id-t");
         assert_eq!(r.roles_of("id-t"), Some(vec![Role::Tx]), "offline не стирает роли");
@@ -852,7 +887,7 @@ mod tests {
         let mut r = Registry::new();
         let mk = |r: &mut Registry, id: &str, roles: Vec<Role>, ip: &str| {
             let (tx, _rx) = mpsc::channel(1);
-            r.hello(id, id, roles, "v".into(), None, None, ip.into(), tx);
+            r.hello(id, id, roles, "v".into(), String::new(), None, None, ip.into(), tx);
         };
         mk(&mut r, "id-tx-on", vec![Role::Tx], "10.0.0.1");
         mk(&mut r, "id-tx-off", vec![Role::Tx], "10.0.0.2");
@@ -883,10 +918,10 @@ mod tests {
     fn hello_seq_increments_per_hello() {
         let mut r = Registry::new();
         let (t1, _r1) = mpsc::channel(1);
-        r.hello("id-1", "a", vec![Role::Tx], "v".into(), None, None, "1.1.1.1".into(), t1);
+        r.hello("id-1", "a", vec![Role::Tx], "v".into(), String::new(), None, None, "1.1.1.1".into(), t1);
         assert_eq!(r.hello_seqs()["id-1"], 1);
         let (t2, _r2) = mpsc::channel(1);
-        r.hello("id-1", "a", vec![Role::Tx], "v".into(), None, None, "1.1.1.1".into(), t2);
+        r.hello("id-1", "a", vec![Role::Tx], "v".into(), String::new(), None, None, "1.1.1.1".into(), t2);
         assert_eq!(r.hello_seqs()["id-1"], 2, "re-hello инкрементит счётчик");
         assert_eq!(r.hello_seqs().len(), 1);
     }
