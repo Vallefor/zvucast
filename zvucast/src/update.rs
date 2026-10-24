@@ -202,6 +202,70 @@ fn github_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+pub async fn download_asset(url: &str, target: &str, sha256: &str) -> Result<Vec<u8>, String> {
+    if !asset_url_ok(url, target) {
+        return Err("адрес".into());
+    }
+    let client = github_client()?;
+    let body = client
+        .get(url)
+        .header("User-Agent", "zvucast")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !sum_matches(&body, sha256) {
+        return Err("сумма".into());
+    }
+    Ok(body.to_vec())
+}
+
+pub fn write_script(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let path = dir.join("apply-update.sh");
+    std::fs::write(&path, include_str!("../../deploy/apply-update.sh"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms)?;
+    }
+    Ok(path)
+}
+
+/// Скрипт сам берёт `/var/lock/zvucast-update`. Второй `flock` до `systemd-run`
+/// гонялся бы с ним, поэтому блокировку здесь не открываем. Код 2 — отказ
+/// «уже обновляется»; иначе `systemd-run` возвращается сразу после старта юнита.
+pub fn spawn_apply(
+    script: &std::path::Path,
+    file: &std::path::Path,
+    sha256: &str,
+    from: &str,
+    to: &str,
+) -> std::io::Result<()> {
+    let status = std::process::Command::new("systemd-run")
+        .arg("--collect")
+        .arg("--unit=zvucast-apply-update")
+        .arg(script)
+        .arg(file)
+        .arg(sha256)
+        .arg(from)
+        .arg(to)
+        .status()?;
+    if status.code() == Some(2) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "уже обновляется"));
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, format!("systemd-run: {status}")))
+    }
+}
+
 pub fn parse_release(latest_json: &str, sums: &str) -> Result<Release, String> {
     let v: serde_json::Value = serde_json::from_str(latest_json).map_err(|e| e.to_string())?;
     if v.get("prerelease").and_then(|p| p.as_bool()).unwrap_or(false) {
@@ -350,5 +414,13 @@ mod tests {
         } else {
             assert!(TARGETS.contains(&t));
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_foreign_url_without_a_connection() {
+        let err = download_asset("https://example.com/zvucast-aarch64", "aarch64", "abc")
+            .await
+            .unwrap_err();
+        assert!(err.contains("адрес"));
     }
 }

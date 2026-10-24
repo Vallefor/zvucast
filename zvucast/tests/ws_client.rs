@@ -115,6 +115,7 @@ async fn hello_telemetry_command_reconnect() {
         cmds_tx,
         events_rx,
         lo_link(),
+        None,
     ));
 
     // 1. после подключения сервер получает Hello с name/roles/version/устройствами
@@ -208,6 +209,7 @@ async fn event_forwarded_to_server() {
         cmds_tx,
         events_rx,
         lo_link(),
+        None,
     ));
 
     // первым всегда идёт Hello — значит, соединение установлено
@@ -273,6 +275,7 @@ async fn fatal_exit_when_events_channel_closes() {
         cmds_tx,
         events_rx,
         lo_link(),
+        None,
     ));
 
     connected_rx.await.unwrap(); // соединение установлено, Hello ушёл
@@ -327,6 +330,7 @@ async fn fatal_exit_when_cmds_channel_closes() {
         cmds_tx,
         events_rx,
         lo_link(),
+        None,
     ));
 
     connected_rx.await.unwrap();
@@ -389,6 +393,7 @@ async fn controller_moved_switches_reconnect_target() {
         cmds_tx,
         events_rx,
         lo_link(),
+        None,
     ));
 
     // второй Hello пришёл на сервер 2 — реконнект ушёл на новый адрес

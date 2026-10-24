@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use zproto::{AgentMsg, CtlMsg, LinkKind, Role, Telemetry};
+use zproto::{AgentMsg, CtlMsg, EventKind, LinkKind, Role, Telemetry};
 
 use crate::config::AgentConfig;
 use crate::discovery::{query_bound, DISCOVERY_PORT};
@@ -49,6 +49,9 @@ impl Default for Discovery {
 ///
 /// `uplink` — тот же приёмник, что у часов и звука. Нет активного интерфейса —
 /// discovery и набор не вызываются, цикл ждёт публикацию. Смена имени рвёт сессию.
+///
+/// `pending_finished` — detail `UpdateFinished` из файла apply-скрипта. Агент
+/// уже удалил файл. Событие уходит один раз, первым после Hello.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: AgentConfig,
@@ -65,8 +68,13 @@ pub async fn run(
     cmds: mpsc::Sender<CtlMsg>,
     mut events: mpsc::Receiver<AgentMsg>,
     mut uplink: watch::Receiver<Option<ActiveLink>>,
+    mut pending_finished: Option<String>,
 ) -> Result<()> {
     let mut backoff = BACKOFF_INITIAL;
+    // Окно между ApplyUpdate и systemd-run. Второй команде в этом окне
+    // отвечаем отказом, не начиная второе скачивание.
+    let updating = Arc::new(AtomicBool::new(false));
+    let (update_tx, mut update_rx) = mpsc::channel::<AgentMsg>(8);
     // Адрес текущей сессии: стартуем с cfg.controller, discovery может
     // переключить на найденного мастера.
     let mut current_addr = cfg.controller.clone();
@@ -111,6 +119,10 @@ pub async fn run(
             &cmds,
             &mut events,
             &mut uplink,
+            &updating,
+            &update_tx,
+            &mut update_rx,
+            &mut pending_finished,
         )
         .await
         {
@@ -182,6 +194,10 @@ async fn connect_once(
     cmds: &mpsc::Sender<CtlMsg>,
     events: &mut mpsc::Receiver<AgentMsg>,
     uplink: &mut watch::Receiver<Option<ActiveLink>>,
+    updating: &Arc<AtomicBool>,
+    update_tx: &mpsc::Sender<AgentMsg>,
+    update_rx: &mut mpsc::Receiver<AgentMsg>,
+    pending_finished: &mut Option<String>,
 ) -> Result<()> {
     // Discovery и набор только с активного интерфейса. Нет линка — наружу,
     // внешний цикл подождёт публикацию и не вызовет query_bound.
@@ -255,12 +271,21 @@ async fn connect_once(
     ws.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
     tracing::info!("ws: подключено к {} как {}", current_addr, cfg.name);
+    if let Some(detail) = pending_finished.clone() {
+        let msg = AgentMsg::Event {
+            kind: EventKind::UpdateFinished,
+            detail,
+        };
+        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+        pending_finished.take();
+    }
 
     let mut ticker = tokio::time::interval(TELEM_PERIOD);
     ticker.tick().await; // мгновенный первый тик — пропускаем
                          // Отправитель наблюдателя живёт весь процесс. Если он всё же закрылся,
                          // ветку снимаем: иначе changed() сразу Err и select крутится без паузы.
     let mut watch_uplink = true;
+    let mut watch_updates = true;
 
     loop {
         tokio::select! {
@@ -300,7 +325,34 @@ async fn connect_once(
                                     *moved_by_controller = true;
                                     return Ok(());
                                 }
-                                if cmds.send(ctl).await.is_err() {
+                                if let CtlMsg::ApplyUpdate { version: to, url, sha256 } = &ctl {
+                                    let to = to.clone();
+                                    let url = url.clone();
+                                    let sha256 = sha256.clone();
+                                    if updating.swap(true, Ordering::AcqRel) {
+                                        let msg = AgentMsg::Event {
+                                            kind: EventKind::UpdateFailed,
+                                            detail: "уже обновляется".into(),
+                                        };
+                                        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                                    } else {
+                                        let updating = Arc::clone(updating);
+                                        let tx = update_tx.clone();
+                                        let from = version.to_string();
+                                        tokio::spawn(async move {
+                                            let outcome = run_apply(url, sha256, from, to).await;
+                                            updating.store(false, Ordering::Release);
+                                            if let Err(detail) = outcome {
+                                                tracing::warn!("обновление: {detail}");
+                                                let msg = AgentMsg::Event {
+                                                    kind: EventKind::UpdateFailed,
+                                                    detail,
+                                                };
+                                                let _ = tx.send(msg).await;
+                                            }
+                                        });
+                                    }
+                                } else if cmds.send(ctl).await.is_err() {
                                     anyhow::bail!("канал команд закрыт");
                                 }
                             }
@@ -324,6 +376,14 @@ async fn connect_once(
                         ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
                     }
                     None => anyhow::bail!("канал событий закрыт (gst-домен завершился)"),
+                }
+            }
+            update = update_rx.recv(), if watch_updates => {
+                match update {
+                    Some(msg) => {
+                        ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                    }
+                    None => watch_updates = false,
                 }
             }
         }
@@ -362,6 +422,30 @@ async fn dial_bound(
         .await
         .with_context(|| format!("рукопожатие websocket с {url}"))?;
     Ok(ws)
+}
+
+async fn run_apply(url: String, sha256: String, from: String, to: String) -> Result<(), String> {
+    let bytes = crate::update::download_asset(&url, crate::update::baked_target(), &sha256).await?;
+    tokio::task::spawn_blocking(move || stage_apply(bytes, sha256, from, to))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Result<(), String> {
+    let dir = std::path::Path::new("/run");
+    let file = dir.join(format!(
+        "zvucast-update-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
+    let script = crate::update::write_script(dir).map_err(|e| e.to_string())?;
+    crate::update::spawn_apply(&script, &file, &sha256, &from, &to).map_err(|e| e.to_string())?;
+    tracing::info!("обновление: служба zvucast-apply-update запущена");
+    Ok(())
 }
 
 /// Неблокирующий `connect` ещё не завершился. `EINPROGRESS` на Linux — 115;

@@ -58,6 +58,24 @@ pub const STATE_PATH: &str = "/etc/zvucast/state.json";
 const STUB_LISTEN: &str = "0.0.0.0:8081";
 /// Таймаут discovery-предпроверки claim: живой мастер должен ответить ~1 с.
 const CLAIM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+/// Итог apply-скрипта. Агент читает его до сокета и удаляет до отправки.
+const APPLY_STATUS_PATH: &str = "/run/zvucast-apply-update.json";
+
+/// `{result, from, to}` с result `ok` или `rolled_back`. Файл удаляется здесь,
+/// до события, чтобы следующий старт не отправил его снова.
+fn take_apply_result(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let result = v.get("result").and_then(|x| x.as_str())?;
+    let shaped = v.get("from").and_then(|x| x.as_str()).is_some()
+        && v.get("to").and_then(|x| x.as_str()).is_some()
+        && (result == "ok" || result == "rolled_back");
+    if !shaped {
+        return None;
+    }
+    std::fs::remove_file(path).ok()?;
+    Some(result.to_string())
+}
 
 pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<()> {
     // Роли разрешаются ДО запуска gst-домена и ws_client: и Hello, и набор
@@ -192,6 +210,7 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
 
     let supports_virtual_output =
         roles.contains(&Role::Tx) && cfg.playback_backend == crate::config::Backend::PipeWire;
+    let pending_finished = take_apply_result(Path::new(APPLY_STATUS_PATH));
     ws_client::run(
         cfg,
         ws_client::Discovery::default(),
@@ -207,6 +226,7 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
         cmd_tx,
         events_rx,
         uplink,
+        pending_finished,
     )
     .await
 }
@@ -1358,6 +1378,7 @@ fn gst_domain(
                 }
             },
             Ok(CtlMsg::ApplyUpdate { .. }) => {
+                // Команду забирает ws-домен и запускает скрипт вне этого cgroup.
                 tracing::warn!("ApplyUpdate в gst-домене — игнорируем")
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
