@@ -18,7 +18,7 @@ build-pi4: build-web
     #!/usr/bin/env bash
     set -euo pipefail
     test -n "${PI4_SSH:-}" || { echo "нужна переменная PI4_SSH" >&2; exit 1; }
-    rsync -a --delete --exclude target --exclude node_modules --exclude dist ./ "$PI4_SSH:~/zvucast/"
+    rsync -a --delete --exclude target --exclude node_modules --exclude /dist ./ "$PI4_SSH:~/zvucast/"
     ssh "$PI4_SSH" 'export PATH="$HOME/.cargo/bin:$PATH" ZVUCAST_TARGET=aarch64 && cd ~/zvucast && cargo build --release'
     mkdir -p dist
     scp "$PI4_SSH:~/zvucast/target/release/zvucast" dist/zvucast-aarch64
