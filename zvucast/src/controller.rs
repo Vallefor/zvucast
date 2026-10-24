@@ -583,7 +583,7 @@ async fn node_update(
     if !update_body_ok(&body) {
         return Err((StatusCode::BAD_REQUEST, "тело непустое".into()));
     }
-    let (node_id, online, target, node_version) = {
+    let (node_id, online, target) = {
         let reg = st.reg.lock().await;
         let Some(node_id) = reg.resolve(&id) else {
             return Err((StatusCode::NOT_FOUND, format!("узел {id} не найден")));
@@ -592,7 +592,7 @@ async fn node_update(
         let Some(view) = view else {
             return Err((StatusCode::NOT_FOUND, format!("узел {id} не найден")));
         };
-        (view.node_id, view.online, view.target, view.version)
+        (view.node_id, view.online, view.target)
     };
     if !online || target.is_empty() || target == "unknown" {
         return Err((StatusCode::BAD_REQUEST, "узел offline или без target".into()));
@@ -603,21 +603,8 @@ async fn node_update(
     let release = fresh_release(&st.releases)
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "релиз недоступен".to_string()))?;
-    start_update(&st, &node_id, &target, &node_version, &release).await?;
+    apply_update(&st, &node_id, &target, &release).await?;
     Ok(Json(json!({ "sent": node_id })))
-}
-
-async fn start_update(
-    st: &AppState,
-    node_id: &str,
-    target: &str,
-    node_version: &str,
-    release: &Release,
-) -> Result<(), (StatusCode, String)> {
-    if node_version == release.version {
-        return Err((StatusCode::BAD_REQUEST, "уже эта версия".into()));
-    }
-    apply_update(st, node_id, target, release).await
 }
 
 async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -647,7 +634,7 @@ async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCo
         let Some(asset) = release.assets.get(&view.target) else {
             return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
         };
-        if !asset_url_ok(&asset.url, &view.target) {
+        if !asset_url_ok(&asset.url, &view.target) || asset.sha256.is_empty() {
             return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
         }
     }
@@ -669,7 +656,7 @@ async fn apply_update(
     let Some(asset) = release.assets.get(target) else {
         return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
     };
-    if !asset_url_ok(&asset.url, target) {
+    if !asset_url_ok(&asset.url, target) || asset.sha256.is_empty() {
         return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
     }
     {
@@ -783,15 +770,20 @@ mod updating_set {
     }
 
     #[tokio::test]
-    async fn same_version_does_not_insert_an_id() {
+    async fn empty_sha256_is_unavailable_and_does_not_insert() {
         let st = AppState::new();
         let mut rx = register(&st, "0.1.0").await;
-        let release = release_010();
-        let err = start_update(&st, "n1", "aarch64", "0.1.0", &release)
-            .await
-            .unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "уже эта версия");
+        let release = crate::update::parse_release(
+            r#"{"tag_name":"v0.1.0","prerelease":false,"assets":[
+                {"name":"zvucast-aarch64","browser_download_url":"https://github.com/Vallefor/zvucast/releases/download/v0.1.0/zvucast-aarch64"}
+            ]}"#,
+            "",
+        )
+        .unwrap();
+        assert!(release.assets["aarch64"].sha256.is_empty());
+        let err = apply_update(&st, "n1", "aarch64", &release).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.1, "релиз недоступен");
         assert!(!st.updating.lock().await.contains_key("n1"));
         assert!(rx.try_recv().is_err());
     }
