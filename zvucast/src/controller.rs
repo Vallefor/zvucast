@@ -83,9 +83,9 @@ pub struct AppState {
     silence_holds: Arc<Mutex<HashSet<String>>>,
     /// Последний релиз GitHub. `page` отдаёт запись моложе 5 минут.
     releases: Arc<ReleaseCache>,
-    /// Узлы, которым ушла ApplyUpdate. Снимается hello с версией релиза
-    /// или заметкой `rolled_back`.
-    updating: Arc<Mutex<HashSet<String>>>,
+    /// Узлы, которым ушла ApplyUpdate: id → версия в команде.
+    /// Снимается hello с этой версией или заметкой `rolled_back`.
+    updating: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// Счётчик для уникальных путей эфемерного state в `AppState::new`.
@@ -120,7 +120,7 @@ impl AppState {
             transfer_wait: TRANSFER_WAIT_TIMEOUT,
             silence_holds: Arc::new(Mutex::new(HashSet::new())),
             releases: Arc::new(ReleaseCache::new()),
-            updating: Arc::new(Mutex::new(HashSet::new())),
+            updating: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -597,7 +597,7 @@ async fn node_update(
     if !online || target.is_empty() || target == "unknown" {
         return Err((StatusCode::BAD_REQUEST, "узел offline или без target".into()));
     }
-    if st.updating.lock().await.contains(&node_id) {
+    if st.updating.lock().await.contains_key(&node_id) {
         return Err((StatusCode::CONFLICT, "уже обновляется".into()));
     }
     let release = fresh_release(&st.releases)
@@ -625,7 +625,7 @@ async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCo
     let ordered: Vec<String> = update_order(&refs, master.as_deref()).into_iter().map(str::to_string).collect();
     {
         let updating = st.updating.lock().await;
-        if ordered.iter().any(|id| updating.contains(id)) {
+        if ordered.iter().any(|id| updating.contains_key(id)) {
             return Err((StatusCode::CONFLICT, "уже обновляется".into()));
         }
     }
@@ -661,9 +661,10 @@ async fn apply_update(
     }
     {
         let mut updating = st.updating.lock().await;
-        if !updating.insert(node_id.to_string()) {
+        if updating.contains_key(node_id) {
             return Err((StatusCode::CONFLICT, "уже обновляется".into()));
         }
+        updating.insert(node_id.to_string(), release.version.clone());
     }
     let cmd = CtlMsg::ApplyUpdate {
         version: release.version.clone(),
@@ -688,11 +689,38 @@ async fn apply_update(
 }
 
 async fn clear_updating_if_release(st: &AppState, node_id: &str, version: &str) {
-    let Ok(rel) = st.releases.page(|| Err("нет кэша".into())) else {
-        return;
-    };
-    if rel.version == version {
-        st.updating.lock().await.remove(node_id);
+    let mut updating = st.updating.lock().await;
+    if updating.get(node_id).is_some_and(|sent| sent == version) {
+        updating.remove(node_id);
+    }
+}
+
+#[cfg(test)]
+mod updating_set {
+    use super::*;
+
+    #[tokio::test]
+    async fn hello_with_sent_version_clears_when_cache_is_empty_or_other() {
+        let st = AppState::new();
+        st.updating.lock().await.insert("n1".into(), "0.1.0".into());
+        clear_updating_if_release(&st, "n1", "0.1.0").await;
+        assert!(!st.updating.lock().await.contains_key("n1"), "пустой кэш");
+
+        st.updating.lock().await.insert("n1".into(), "0.1.0".into());
+        st.releases
+            .fresh(|| {
+                Ok((
+                    r#"{"tag_name":"v9.9.9","prerelease":false,"assets":[]}"#.to_string(),
+                    String::new(),
+                ))
+            })
+            .unwrap();
+        clear_updating_if_release(&st, "n1", "0.1.0").await;
+        assert!(!st.updating.lock().await.contains_key("n1"), "в кэше другая версия");
+
+        st.updating.lock().await.insert("n1".into(), "0.1.0".into());
+        clear_updating_if_release(&st, "n1", "0.0.1").await;
+        assert!(st.updating.lock().await.contains_key("n1"));
     }
 }
 
