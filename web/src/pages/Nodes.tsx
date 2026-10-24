@@ -289,7 +289,7 @@ function facts(n: NodeView) {
     ['TX', tx?.state ?? '—'],
     ['RMS L/R', tx ? `${rmsText(tx.rms_l)} / ${rmsText(tx.rms_r)}` : '—'],
     ['RX', rx?.state ?? '—'],
-    ['Dropped', rx ? String(rx.dropped) : '—'],
+    ['Заикания', rx ? String(rx.dropped) : '—'],
     ['Rendered', rx ? String(rx.rendered) : '—'],
     ['Очередь, мс', queue],
     ['PTP, мкс', ptp],
@@ -525,7 +525,7 @@ export default function Nodes() {
               <th>TX</th>
               <th>RMS L/R, дБ</th>
               <th>RX</th>
-              <th>Dropped</th>
+              <th>Заикания</th>
               <th>Rendered</th>
               <th>Очередь</th>
               <th>PTP, мкс</th>

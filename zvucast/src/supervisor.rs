@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -46,6 +46,9 @@ pub struct Runner {
     alsa_card: Option<String>,
     /// момент последнего успешного start(); None до первого старта
     started_at: Mutex<Option<Instant>>,
+    /// Underrun’ы шины. Вместе с num-late и num-lost у jb* это dropped:
+    /// stats.dropped у sink при skew остаётся 0.
+    underruns: Arc<AtomicU64>,
     rms: Arc<Mutex<RmsBook>>,
     stop_flag: Arc<AtomicBool>,
     /// pw-record общего line-in.
@@ -435,6 +438,7 @@ impl Runner {
             pipeline,
             alsa_card,
             started_at: Mutex::new(None),
+            underruns: Arc::new(AtomicU64::new(0)),
             rms: Arc::new(Mutex::new(RmsBook::default())),
             stop_flag: Arc::new(AtomicBool::new(false)),
             captures: Vec::new(),
@@ -488,10 +492,21 @@ impl Runner {
         if let Some(sink) = &self.sink {
             if sink.has_property("stats", None) {
                 let st = sink.property::<gst::Structure>("stats");
-                s.dropped = st.get::<u64>("dropped").unwrap_or_default();
                 s.rendered = st.get::<u64>("rendered").unwrap_or_default();
             }
         }
+        // dropped — заикания, не stats.dropped sink’а: при skew тот счётчик стоит на нуле.
+        let mut late = 0u64;
+        let mut lost = 0u64;
+        for child in self.pipeline.children() {
+            if !child.name().starts_with("jb") || !child.has_property("stats", None) {
+                continue;
+            }
+            let st = child.property::<gst::Structure>("stats");
+            late = late.saturating_add(st.get::<u64>("num-late").unwrap_or(0));
+            lost = lost.saturating_add(st.get::<u64>("num-lost").unwrap_or(0));
+        }
+        s.dropped = stutter_count(self.underruns.load(Ordering::Relaxed), late, lost);
         s.queue_ms = self.alsa_card.as_deref().map_or(-1, read_alsa_queue_ms);
         if let Ok(rms) = self.rms.lock() {
             let (l, r) = rms.loudest();
@@ -508,6 +523,7 @@ impl Runner {
             .expect("у gst::Pipeline всегда есть шина");
         let rms = self.rms.clone();
         let stop = self.stop_flag.clone();
+        let underruns = self.underruns.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let Some(msg) = bus.timed_pop_filtered(
@@ -521,6 +537,9 @@ impl Runner {
                     continue;
                 };
                 if let Some(ev) = handle_message(&msg, &rms) {
+                    if matches!(ev, SupEvent::Underrun) {
+                        underruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     let failed = matches!(ev, SupEvent::Failed(_));
                     if let Err(e) = tx.send(ev) {
                         tracing::debug!("SupEvent {:?} не доставлен: {e}", e.0);
@@ -572,6 +591,12 @@ fn read_alsa_queue_ms(card: &str) -> i64 {
         Some(samples) => samples * 1000 / RATE_HZ,
         None => -1,
     }
+}
+
+/// Заикания: underrun’ы шины плюс опоздавшие и потерянные пакеты jitterbuffer.
+/// Насыщение, чтобы переполнение не обнулило счётчик.
+fn stutter_count(underruns: u64, late: u64, lost: u64) -> u64 {
+    underruns.saturating_add(late).saturating_add(lost)
 }
 
 /// Парсинг status-файла ALSA: delay (сэмплы) только при state: RUNNING.
@@ -882,7 +907,41 @@ appl_ptr    : 313632\n";
             .recv_timeout(Duration::from_secs(5))
             .expect("ждём Underrun");
         assert_eq!(ev, SupEvent::Underrun);
+        // underrun шины должен попасть в dropped: stats.dropped у sink при skew стоит на нуле
+        assert!(
+            r.stats().dropped >= 1,
+            "после Underrun dropped={}, ждали хотя бы 1",
+            r.stats().dropped
+        );
         r.stop();
+    }
+
+    #[test]
+    fn stutter_count_adds_underruns_and_late_packets() {
+        assert_eq!(stutter_count(0, 0, 0), 0);
+        assert_eq!(stutter_count(1, 2, 4), 7);
+        assert_eq!(stutter_count(u64::MAX, 1, 0), u64::MAX);
+    }
+
+    #[test]
+    fn stats_dropped_reads_jitterbuffer_counters() {
+        gstreamer::init().unwrap();
+        let rx = Runner::new_rx(
+            &crate::config::PipelineCfg::default_rx(),
+            "plughw:CARD=Whatever",
+            &ChannelMap::default(),
+            &[5004],
+            &[],
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let jb = rx.pipeline().by_name("jb5004").expect("jb5004");
+        let st = jb.property::<gst::Structure>("stats");
+        // Тип поля должен совпасть с тем, что читает stats(): иначе unwrap_or(0)
+        // тихо обнулит опоздания и потери.
+        let late = st.get::<u64>("num-late").expect("num-late это u64");
+        let lost = st.get::<u64>("num-lost").expect("num-lost это u64");
+        assert_eq!(rx.stats().dropped, stutter_count(0, late, lost));
     }
 
     #[test]
