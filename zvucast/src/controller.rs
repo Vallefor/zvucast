@@ -31,6 +31,9 @@ use crate::agent::successor_marker_path;
 use crate::discovery::{self, CONTROLLER_PORT, DISCOVERY_PORT};
 use crate::uplink::ActiveLink;
 use crate::registry::{NodeView, Registry, RegistryError};
+use crate::update::{
+    asset_url_ok, fetch_latest, update_body_ok, update_offer, update_order, Offer, Release, ReleaseCache,
+};
 use crate::silence::{classify, fold_samples, Sample, SilenceBook, ZoneTick};
 use crate::state::{
     assignment, default_jb_ms, owner_ids, owner_maps, source_channel_maps, zone_groups,
@@ -78,6 +81,11 @@ pub struct AppState {
     /// Id зон в холде тишины. Пишет тикер, читают пушер и zone_views.
     /// Замок не брать вместе со `store` или `reg`: сначала клон, потом следующий.
     silence_holds: Arc<Mutex<HashSet<String>>>,
+    /// Последний релиз GitHub. `page` отдаёт запись моложе 5 минут.
+    releases: Arc<ReleaseCache>,
+    /// Узлы, которым ушла ApplyUpdate. Снимается hello с версией релиза
+    /// или заметкой `rolled_back`.
+    updating: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Счётчик для уникальных путей эфемерного state в `AppState::new`.
@@ -111,6 +119,8 @@ impl AppState {
             post_transfer_stop: default_post_transfer_stop(),
             transfer_wait: TRANSFER_WAIT_TIMEOUT,
             silence_holds: Arc::new(Mutex::new(HashSet::new())),
+            releases: Arc::new(ReleaseCache::new()),
+            updating: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -181,8 +191,11 @@ pub fn app(state: AppState) -> Router {
         .route("/api/nodes/{node_id}", patch(patch_node))
         .route("/api/nodes/{name}/start", post(node_start))
         .route("/api/nodes/{name}/stop", post(node_stop))
+        .route("/api/nodes/{node_id}/update", post(node_update))
         .route("/api/start-all", post(start_all))
         .route("/api/stop-all", post(stop_all))
+        .route("/api/release", get(get_release))
+        .route("/api/update-all", post(update_all))
         .route("/api/dscp", get(get_dscp).post(set_dscp))
         .route("/api/zones", get(list_zones).post(create_zone))
         .route("/api/zones/{id}", patch(patch_zone).delete(delete_zone))
@@ -530,6 +543,157 @@ async fn start_all(State(st): State<AppState>) -> Json<Value> {
 
 async fn stop_all(State(st): State<AppState>) -> Json<Value> {
     Json(json!({ "stopped": broadcast(&st, CtlMsg::Stop).await }))
+}
+
+/// `page`/`fresh` синхронные, а `fetch_latest` — нет. Попадание в кэш
+/// не ходит в сеть: пустой fetch только если записи моложе 5 минут нет.
+async fn page_release(cache: &ReleaseCache) -> Result<Release, String> {
+    if let Ok(rel) = cache.page(|| Err("нет кэша".into())) {
+        return Ok(rel);
+    }
+    let pair = fetch_latest().await?;
+    cache.fresh(move || Ok(pair.clone()))
+}
+
+async fn fresh_release(cache: &ReleaseCache) -> Result<Release, String> {
+    let pair = fetch_latest().await?;
+    cache.fresh(move || Ok(pair.clone()))
+}
+
+fn release_json(rel: &Release) -> Value {
+    let mut assets = serde_json::Map::new();
+    for (target, asset) in &rel.assets {
+        assets.insert(target.clone(), json!({ "url": asset.url, "sha256": asset.sha256 }));
+    }
+    json!({ "version": rel.version, "assets": Value::Object(assets) })
+}
+
+async fn get_release(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+    match page_release(&st.releases).await {
+        Ok(rel) => Ok(Json(release_json(&rel))),
+        Err(_) => Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into())),
+    }
+}
+
+async fn node_update(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    body: String,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !update_body_ok(&body) {
+        return Err((StatusCode::BAD_REQUEST, "тело непустое".into()));
+    }
+    let (node_id, online, target) = {
+        let reg = st.reg.lock().await;
+        let Some(node_id) = reg.resolve(&id) else {
+            return Err((StatusCode::NOT_FOUND, format!("узел {id} не найден")));
+        };
+        let view = reg.list().into_iter().find(|v| v.node_id == node_id);
+        let Some(view) = view else {
+            return Err((StatusCode::NOT_FOUND, format!("узел {id} не найден")));
+        };
+        (view.node_id, view.online, view.target)
+    };
+    if !online || target.is_empty() || target == "unknown" {
+        return Err((StatusCode::BAD_REQUEST, "узел offline или без target".into()));
+    }
+    if st.updating.lock().await.contains(&node_id) {
+        return Err((StatusCode::CONFLICT, "уже обновляется".into()));
+    }
+    let release = fresh_release(&st.releases)
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "релиз недоступен".to_string()))?;
+    apply_update(&st, &node_id, &target, &release).await?;
+    Ok(Json(json!({ "sent": node_id })))
+}
+
+async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+    let release = fresh_release(&st.releases)
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "релиз недоступен".to_string()))?;
+    let master = st.store.lock().await.state().master_node_id.clone();
+    let views = st.reg.lock().await.list();
+    let ready: Vec<String> = views
+        .iter()
+        .filter(|n| {
+            let present = release.assets.contains_key(&n.target);
+            update_offer(n.online, &n.target, &n.version, &release.version, present) == Offer::Ready
+        })
+        .map(|n| n.node_id.clone())
+        .collect();
+    let refs: Vec<&str> = ready.iter().map(String::as_str).collect();
+    let ordered: Vec<String> = update_order(&refs, master.as_deref()).into_iter().map(str::to_string).collect();
+    {
+        let updating = st.updating.lock().await;
+        if ordered.iter().any(|id| updating.contains(id)) {
+            return Err((StatusCode::CONFLICT, "уже обновляется".into()));
+        }
+    }
+    for id in &ordered {
+        let view = views.iter().find(|n| &n.node_id == id).expect("id из list");
+        let Some(asset) = release.assets.get(&view.target) else {
+            return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
+        };
+        if !asset_url_ok(&asset.url, &view.target) {
+            return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
+        }
+    }
+    for id in &ordered {
+        let view = views.iter().find(|n| &n.node_id == id).expect("id из list");
+        apply_update(&st, id, &view.target, &release).await?;
+    }
+    Ok(Json(json!(ordered)))
+}
+
+/// ApplyUpdate только после `asset_url_ok`. Id в множестве — пока команда
+/// ушла и узел не вернулся версией релиза и не прислал `rolled_back`.
+async fn apply_update(
+    st: &AppState,
+    node_id: &str,
+    target: &str,
+    release: &Release,
+) -> Result<(), (StatusCode, String)> {
+    let Some(asset) = release.assets.get(target) else {
+        return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
+    };
+    if !asset_url_ok(&asset.url, target) {
+        return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
+    }
+    {
+        let mut updating = st.updating.lock().await;
+        if !updating.insert(node_id.to_string()) {
+            return Err((StatusCode::CONFLICT, "уже обновляется".into()));
+        }
+    }
+    let cmd = CtlMsg::ApplyUpdate {
+        version: release.version.clone(),
+        url: asset.url.clone(),
+        sha256: asset.sha256.clone(),
+    };
+    let mut reg = st.reg.lock().await;
+    if let Err(e) = reg.send_cmd(node_id, cmd) {
+        if matches!(e, RegistryError::Closed) {
+            reg.mark_offline(node_id);
+        }
+        drop(reg);
+        st.updating.lock().await.remove(node_id);
+        let code = match e {
+            RegistryError::UnknownNode => StatusCode::NOT_FOUND,
+            RegistryError::Offline => StatusCode::CONFLICT,
+            RegistryError::Closed | RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        return Err((code, e.to_string()));
+    }
+    Ok(())
+}
+
+async fn clear_updating_if_release(st: &AppState, node_id: &str, version: &str) {
+    let Ok(rel) = st.releases.page(|| Err("нет кэша".into())) else {
+        return;
+    };
+    if rel.version == version {
+        st.updating.lock().await.remove(node_id);
+    }
 }
 
 /// Команда всем узлам: Offline-ошибки игнорируются (по спеке), Closed —
@@ -1829,7 +1993,8 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     st.reg
         .lock()
         .await
-        .hello(&node_id, &name, roles.clone(), version, target, capture_device.clone(), playback_device.clone(), ip, cmd_tx);
+        .hello(&node_id, &name, roles.clone(), version.clone(), target, capture_device.clone(), playback_device.clone(), ip, cmd_tx);
+    clear_updating_if_release(&st, &node_id, &version).await;
     let reported = if inputs.is_empty() && roles.contains(&Role::Tx) {
         crate::inputs::fallback_inputs(capture_device.as_deref())
     } else {
@@ -1898,7 +2063,17 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<AgentMsg>(&text) {
                     Ok(AgentMsg::Telemetry(t)) => st.reg.lock().await.telemetry(&node_id, t),
                     Ok(AgentMsg::Event { kind, detail }) => {
-                        st.reg.lock().await.event(&node_id, kind, detail)
+                        let rolled_back = kind == zproto::EventKind::UpdateFinished && detail == "rolled_back";
+                        {
+                            let mut reg = st.reg.lock().await;
+                            if rolled_back {
+                                reg.set_update_note(&node_id, Some("rolled_back".into()));
+                            }
+                            reg.event(&node_id, kind, detail);
+                        }
+                        if rolled_back {
+                            st.updating.lock().await.remove(&node_id);
+                        }
                     }
                     Ok(AgentMsg::Hello { .. }) => {
                         tracing::warn!(node = name, %node_id, "повторный Hello по живому сокету — игнорируем")

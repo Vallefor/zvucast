@@ -33,6 +33,7 @@ mdns-sd = "0.20"
 # arm (Orange Pi): в sysroot нет заголовков PipeWire, libspa-sys не собирается.
 cpal = "0.18"
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 cpal = { version = "0.18", features = ["pipewire"] }

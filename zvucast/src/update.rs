@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub const TARGETS: [&str; 4] = ["x86_64", "aarch64", "armv7-rpi", "armv7-opi"];
 
@@ -111,6 +113,93 @@ pub fn update_body_ok(body: &str) -> bool {
     body.trim().is_empty()
 }
 
+pub struct ReleaseCache {
+    inner: Mutex<Option<(Instant, Release)>>,
+}
+
+impl ReleaseCache {
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(None) }
+    }
+
+    pub fn page(&self, fetch: impl Fn() -> Result<(String, String), String>) -> Result<Release, String> {
+        if let Some((at, rel)) = self.inner.lock().map_err(|e| e.to_string())?.as_ref() {
+            if at.elapsed() < Duration::from_secs(300) {
+                return Ok(rel.clone());
+            }
+        }
+        self.fresh(fetch)
+    }
+
+    pub fn fresh(&self, fetch: impl Fn() -> Result<(String, String), String>) -> Result<Release, String> {
+        let (latest, sums) = fetch()?;
+        let release = parse_release(&latest, &sums)?;
+        *self.inner.lock().map_err(|e| e.to_string())? = Some((Instant::now(), release.clone()));
+        Ok(release)
+    }
+}
+
+pub fn sums_url_ok(url: &str) -> bool {
+    asset_url_ok(&url.replacen("SHA256SUMS", "zvucast-x86_64", 1), "x86_64") && url.ends_with("/SHA256SUMS")
+}
+
+pub async fn fetch_latest() -> Result<(String, String), String> {
+    let client = github_client()?;
+    let latest = client
+        .get("https://api.github.com/repos/Vallefor/zvucast/releases/latest")
+        .header("User-Agent", "zvucast")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&latest).map_err(|e| e.to_string())?;
+    let mut sums_url = None;
+    if let Some(list) = parsed.get("assets").and_then(|a| a.as_array()) {
+        for asset in list {
+            if asset.get("name").and_then(|n| n.as_str()) == Some("SHA256SUMS") {
+                sums_url = asset
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .map(str::to_string);
+            }
+        }
+    }
+    let sums_url = sums_url.ok_or("нет SHA256SUMS")?;
+    if !sums_url_ok(&sums_url) {
+        return Err("чужой SHA256SUMS".into());
+    }
+    let sums = client
+        .get(&sums_url)
+        .header("User-Agent", "zvucast")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((latest, sums))
+}
+
+fn github_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|try_| {
+            let host = try_.url().host_str().unwrap_or("");
+            if redirect_host_ok(host) {
+                try_.follow()
+            } else {
+                try_.error("чужой редирект")
+            }
+        }))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 pub fn parse_release(latest_json: &str, sums: &str) -> Result<Release, String> {
     let v: serde_json::Value = serde_json::from_str(latest_json).map_err(|e| e.to_string())?;
     if v.get("prerelease").and_then(|p| p.as_bool()).unwrap_or(false) {
@@ -166,6 +255,10 @@ mod tests {
             "https://github.com/Vallefor/zvucast/releases/download/v0.1.0-rc.1/zvucast-aarch64",
             "aarch64"
         ));
+        assert!(sums_url_ok(
+            "https://github.com/Vallefor/zvucast/releases/download/v0.1.0/SHA256SUMS"
+        ));
+        assert!(!sums_url_ok("https://example.com/SHA256SUMS"));
     }
 
     #[test]
@@ -226,6 +319,25 @@ mod tests {
             Some("1") => assert_eq!(v, base),
             _ => assert_eq!(v, format!("{base}+dev")),
         }
+    }
+
+    #[test]
+    fn page_cache_is_five_minutes_fresh_bypasses_it() {
+        use std::cell::Cell;
+        let cache = ReleaseCache::new();
+        let calls = Cell::new(0u32);
+        let fetch = || {
+            calls.set(calls.get() + 1);
+            Ok((
+                r#"{"tag_name":"v0.1.0","prerelease":false,"assets":[]}"#.to_string(),
+                String::new(),
+            ))
+        };
+        assert_eq!(cache.page(&fetch).unwrap().version, "0.1.0");
+        assert_eq!(cache.page(&fetch).unwrap().version, "0.1.0");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.fresh(&fetch).unwrap().version, "0.1.0");
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]
