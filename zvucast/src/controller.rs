@@ -583,7 +583,7 @@ async fn node_update(
     if !update_body_ok(&body) {
         return Err((StatusCode::BAD_REQUEST, "тело непустое".into()));
     }
-    let (node_id, online, target) = {
+    let (node_id, online, target, node_version) = {
         let reg = st.reg.lock().await;
         let Some(node_id) = reg.resolve(&id) else {
             return Err((StatusCode::NOT_FOUND, format!("узел {id} не найден")));
@@ -592,7 +592,7 @@ async fn node_update(
         let Some(view) = view else {
             return Err((StatusCode::NOT_FOUND, format!("узел {id} не найден")));
         };
-        (view.node_id, view.online, view.target)
+        (view.node_id, view.online, view.target, view.version)
     };
     if !online || target.is_empty() || target == "unknown" {
         return Err((StatusCode::BAD_REQUEST, "узел offline или без target".into()));
@@ -603,8 +603,21 @@ async fn node_update(
     let release = fresh_release(&st.releases)
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "релиз недоступен".to_string()))?;
-    apply_update(&st, &node_id, &target, &release).await?;
+    start_update(&st, &node_id, &target, &node_version, &release).await?;
     Ok(Json(json!({ "sent": node_id })))
+}
+
+async fn start_update(
+    st: &AppState,
+    node_id: &str,
+    target: &str,
+    node_version: &str,
+    release: &Release,
+) -> Result<(), (StatusCode, String)> {
+    if node_version == release.version {
+        return Err((StatusCode::BAD_REQUEST, "уже эта версия".into()));
+    }
+    apply_update(st, node_id, target, release).await
 }
 
 async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -680,8 +693,8 @@ async fn apply_update(
         st.updating.lock().await.remove(node_id);
         let code = match e {
             RegistryError::UnknownNode => StatusCode::NOT_FOUND,
-            RegistryError::Offline => StatusCode::CONFLICT,
-            RegistryError::Closed | RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
+            RegistryError::Offline | RegistryError::Closed => StatusCode::BAD_REQUEST,
+            RegistryError::Full => StatusCode::SERVICE_UNAVAILABLE,
         };
         return Err((code, e.to_string()));
     }
@@ -721,6 +734,66 @@ mod updating_set {
         st.updating.lock().await.insert("n1".into(), "0.1.0".into());
         clear_updating_if_release(&st, "n1", "0.0.1").await;
         assert!(st.updating.lock().await.contains_key("n1"));
+    }
+
+    fn release_010() -> Release {
+        crate::update::parse_release(
+            r#"{"tag_name":"v0.1.0","prerelease":false,"assets":[
+                {"name":"zvucast-aarch64","browser_download_url":"https://github.com/Vallefor/zvucast/releases/download/v0.1.0/zvucast-aarch64"}
+            ]}"#,
+            "abc  zvucast-aarch64\n",
+        )
+        .unwrap()
+    }
+
+    async fn register(st: &AppState, version: &str) -> mpsc::Receiver<CtlMsg> {
+        let (tx, rx) = mpsc::channel(1);
+        st.reg.lock().await.hello(
+            "n1",
+            "n1",
+            vec![Role::Rx],
+            version.to_string(),
+            "aarch64".to_string(),
+            None,
+            None,
+            "192.0.2.10".into(),
+            tx,
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn offline_and_closed_are_bad_request_and_drop_the_id() {
+        let release = release_010();
+
+        let st = AppState::new();
+        let rx = register(&st, "0.1.0+dev").await;
+        st.reg.lock().await.mark_offline("n1");
+        let err = apply_update(&st, "n1", "aarch64", &release).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(!st.updating.lock().await.contains_key("n1"));
+        drop(rx);
+
+        let st = AppState::new();
+        let rx = register(&st, "0.1.0+dev").await;
+        drop(rx);
+        let err = apply_update(&st, "n1", "aarch64", &release).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(!st.updating.lock().await.contains_key("n1"));
+    }
+
+    #[tokio::test]
+    async fn same_version_does_not_insert_an_id() {
+        let st = AppState::new();
+        let mut rx = register(&st, "0.1.0").await;
+        let release = release_010();
+        let err = start_update(&st, "n1", "aarch64", "0.1.0", &release)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "уже эта версия");
+        assert!(!st.updating.lock().await.contains_key("n1"));
+        assert!(rx.try_recv().is_err());
     }
 }
 
