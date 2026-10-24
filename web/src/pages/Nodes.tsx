@@ -395,11 +395,22 @@ export default function Nodes() {
     })
   }
 
+  /// POST уже записал свежий релиз. Ждём hello именно с этой версией.
+  /// Сбой GET — тот же путь, что у полла: не подставляем старую версию и не
+  /// считаем установку успешной.
+  const pinInstalled = async (ids: string[]) => {
+    try {
+      const rel = await api.release()
+      setRelease(rel)
+      beginWait(ids, rel.version)
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
   const updateOne = (n: NodeView) => {
-    const version = release?.version
-    if (!version) return
     void run(api.updateNode(n.node_id), 'обновление').then((ok) => {
-      if (ok) beginWait([n.node_id], version)
+      if (ok) void pinInstalled([n.node_id])
     })
   }
 
@@ -423,7 +434,7 @@ export default function Nodes() {
     } catch (e) {
       console.error(e)
     }
-    if (release?.version) beginWait(ids, release.version)
+    await pinInstalled(ids)
   }
 
   const versionCell = (n: NodeView, compact = false) => {
