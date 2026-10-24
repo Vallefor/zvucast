@@ -15,3 +15,22 @@ export function offer(
   if (assetPresent) return 'ready'
   return 'missing'
 }
+
+/// «не вернулся» — 90 с прошли и узел offline. Пока он online, это
+/// «обновляется», пока версия не совпадёт или заметка не станет `rolled_back`.
+/// `rolledBack` не гасится: страница показывает «откат», пока заметка такая.
+export function updateWait(
+  online: boolean,
+  nodeVersion: string,
+  updateNote: string | null,
+  wait: { version: string; note: string | null } | null,
+  elapsedMs: number,
+  limitMs: number,
+): { updating: boolean; silent: boolean; rolledBack: boolean } {
+  const rolledBack = updateNote === 'rolled_back'
+  const waiting = wait != null && nodeVersion !== wait.version
+  const becameRolledBack = rolledBack && wait?.note !== 'rolled_back'
+  const silent = waiting && !becameRolledBack && !online && elapsedMs >= limitMs
+  const updating = waiting && !becameRolledBack && !silent
+  return { updating, silent, rolledBack }
+}

@@ -59,7 +59,7 @@ const STUB_LISTEN: &str = "0.0.0.0:8081";
 /// Таймаут discovery-предпроверки claim: живой мастер должен ответить ~1 с.
 const CLAIM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Итог apply-скрипта. Агент читает его до сокета и удаляет до отправки.
-const APPLY_STATUS_PATH: &str = "/run/zvucast-apply-update.json";
+const APPLY_STATUS_PATH: &str = crate::update::APPLY_STATUS_PATH;
 
 /// `{result, from, to}` с result `ok` или `rolled_back`. Файл удаляется здесь,
 /// до события, чтобы следующий старт не отправил его снова.

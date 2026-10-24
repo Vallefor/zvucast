@@ -15,6 +15,9 @@ stable=${ZVUCAST_STABLE_SECONDS:-20}
 observe=${ZVUCAST_OBSERVE_SECONDS:-45}
 poll=${ZVUCAST_POLL_SECONDS:-1}
 
+# Только скачанный бинарник. Скрипт bash ещё читает, пока пишет откат.
+trap 'rm -f -- "$file"' EXIT
+
 exec 9>"$lock"
 if ! flock -n 9; then
   echo "уже обновляется" >&2
@@ -37,8 +40,24 @@ write_status() {
 }
 
 restart_controller=0
+rollback() {
+  write_status rolled_back
+  if [[ -e "$bin_dir/zvucast.prev" ]]; then
+    mv -f "$bin_dir/zvucast.prev" "$bin_dir/zvucast"
+  fi
+  "$systemctl" restart zvucast-agent || true
+  if [[ "$restart_controller" == 1 ]]; then
+    "$systemctl" restart zvucast-controller || true
+  fi
+}
+
 write_status ok
-"$systemctl" restart zvucast-agent || true
+# Ненулевой restart не отпускаем в окно stable: прежний процесс всё ещё
+# active и иначе сошёл бы за новый бинарник.
+if ! "$systemctl" restart zvucast-agent; then
+  rollback
+  exit 1
+fi
 if "$systemctl" is-active --quiet zvucast-controller; then
   restart_controller=1
   "$systemctl" restart zvucast-controller || true
@@ -60,12 +79,5 @@ while (( SECONDS < deadline )); do
   sleep "$poll"
 done
 
-write_status rolled_back
-if [[ -e "$bin_dir/zvucast.prev" ]]; then
-  mv -f "$bin_dir/zvucast.prev" "$bin_dir/zvucast"
-fi
-"$systemctl" restart zvucast-agent || true
-if [[ "$restart_controller" == 1 ]]; then
-  "$systemctl" restart zvucast-controller || true
-fi
+rollback
 exit 1

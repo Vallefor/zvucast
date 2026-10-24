@@ -448,7 +448,11 @@ fn stage_apply(bytes: Vec<u8>, sha256: String, from: String, to: String) -> Resu
     let script = crate::update::write_script(&dir).map_err(|e| e.to_string())?;
     crate::update::spawn_apply(&script, &file, &sha256, &from, &to).map_err(|e| e.to_string())?;
     tracing::info!("обновление: служба zvucast-apply-update запущена");
-    Ok(())
+    // Рестарт из скрипта убивает этот процесс на успехе и на откате. Ожидание
+    // без `--wait`: если нас убьют, событие не уходит, новый процесс читает
+    // файл. Если юнит кончился, а мы живы и файла `ok`/`rolled_back` нет —
+    // UpdateFailed, id на контроллере не зависает.
+    crate::update::wait_apply_unit()
 }
 
 /// Неблокирующий `connect` ещё не завершился. `EINPROGRESS` на Linux — 115;

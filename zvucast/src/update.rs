@@ -224,6 +224,9 @@ pub async fn download_asset(url: &str, target: &str, sha256: &str) -> Result<Vec
     Ok(body.to_vec())
 }
 
+pub const APPLY_STATUS_PATH: &str = "/run/zvucast-apply-update.json";
+const APPLY_UNIT: &str = "zvucast-apply-update";
+
 pub fn write_script(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let path = dir.join("apply-update.sh");
     std::fs::write(&path, include_str!("../../deploy/apply-update.sh"))?;
@@ -240,7 +243,9 @@ pub fn write_script(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf
 /// Скрипт сам берёт `/var/lock/zvucast-update`. Второй `flock` до `systemd-run`
 /// гонялся бы с ним, поэтому блокировку здесь не открываем. `--wait` нет:
 /// `systemd-run` возвращается, когда юнит стартовал. Любой ненулевой статус
-/// этого запуска — «уже обновляется». Ноль — служба стартовала.
+/// этого запуска — «уже обновляется». Ноль — служба стартовала, дальше
+/// [`wait_apply_unit`]. `--wait` на этом пути убил бы рестарт агента и вместе
+/// с ним отказ скрипта, который вышел до записи статуса.
 pub fn spawn_apply(
     script: &std::path::Path,
     file: &std::path::Path,
@@ -266,6 +271,53 @@ fn map_systemd_run_status(status: std::process::ExitStatus) -> std::io::Result<(
     } else {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "уже обновляется"))
     }
+}
+
+/// Юнит ещё не кончился. `deactivating` тоже: скрипт ещё дописывает статус.
+fn unit_state_running(state: &str) -> bool {
+    matches!(state, "active" | "activating" | "reloading" | "deactivating")
+}
+
+fn apply_unit_state(unit: &str) -> String {
+    let Ok(output) = std::process::Command::new("systemctl")
+        .args(["show", "-p", "ActiveState", "--value", unit])
+        .output()
+    else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// `ok` и `rolled_back` забирает новый процесс агента. Иной текст или пустой
+/// файл — этот процесс ещё жив, юнит кончился без итога.
+pub fn apply_outcome(text: Option<&str>) -> Result<(), String> {
+    if status_settled(text) {
+        Ok(())
+    } else {
+        Err("служба завершилась".into())
+    }
+}
+
+fn status_settled(text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    matches!(v.get("result").and_then(|r| r.as_str()), Some("ok" | "rolled_back"))
+}
+
+/// После нуля от `systemd-run`. Рестарт агента (успех и откат) может убить
+/// этот цикл: новый процесс читает файл статуса. Смерть ожидания сама по себе
+/// `UpdateFailed` не шлёт — ошибка только если юнит уже кончился, а в файле
+/// нет `ok` и нет `rolled_back`.
+pub fn wait_apply_unit() -> Result<(), String> {
+    while unit_state_running(&apply_unit_state(APPLY_UNIT)) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let text = std::fs::read_to_string(APPLY_STATUS_PATH).ok();
+    apply_outcome(text.as_deref())
 }
 
 pub fn parse_release(latest_json: &str, sums: &str) -> Result<Release, String> {
@@ -424,6 +476,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("адрес"));
+    }
+
+    #[test]
+    fn unit_end_without_ok_status_is_a_failure() {
+        assert!(unit_state_running("active"));
+        assert!(unit_state_running("activating"));
+        assert!(unit_state_running("deactivating"));
+        assert!(!unit_state_running("inactive"));
+        assert!(!unit_state_running("failed"));
+        assert!(!unit_state_running(""));
+
+        assert!(apply_outcome(None).is_err());
+        assert!(apply_outcome(Some("не json")).is_err());
+        assert!(apply_outcome(Some(r#"{"result":"failed","from":"a","to":"b"}"#)).is_err());
+        assert!(apply_outcome(Some(r#"{"result":"ok","from":"0.1.0+dev","to":"0.1.0"}"#)).is_ok());
+        assert!(apply_outcome(Some(r#"{"result":"rolled_back","from":"0.1.0+dev","to":"0.1.0"}"#)).is_ok());
     }
 
     #[test]

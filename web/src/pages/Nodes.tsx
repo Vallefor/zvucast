@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
-import { offer } from '../update'
+import { offer, updateWait } from '../update'
 import { Badge, Button, Popup, useRun, useUi } from '../ui'
 
 const POLL_MS = 2000
-/// Свой POST: столько ждём hello с версией релиза, потом «не вернулся».
+/// Свой POST: «не вернулся», если за это время узел так и остался offline.
 const UPDATE_WAIT_MS = 90_000
 
 type ReleaseView = Awaited<ReturnType<typeof api.release>>
@@ -443,16 +443,22 @@ export default function Nodes() {
       ? offer(n.online, n.target, n.version, release.version, assetPresent)
       : 'hidden'
     const wait = pending[n.node_id]
-    const updating = wait != null && n.version !== wait.version && now - wait.at < UPDATE_WAIT_MS
-    const late = wait != null && n.version !== wait.version && now - wait.at >= UPDATE_WAIT_MS
+    const phase = updateWait(
+      n.online,
+      n.version,
+      n.update_note,
+      wait ? { version: wait.version, note: wait.note } : null,
+      wait ? now - wait.at : 0,
+      UPDATE_WAIT_MS,
+    )
     return (
       <div className="row">
         <span className="num">{n.version || '—'}</span>
-        {updating && <span>обновляется</span>}
-        {late && <span>не вернулся</span>}
-        {n.update_note === 'rolled_back' && <span>откат</span>}
+        {phase.updating && <span>обновляется</span>}
+        {phase.silent && <span>не вернулся</span>}
+        {phase.rolledBack && <span>откат</span>}
         {kind === 'missing' && <span>нет файла в релизе</span>}
-        {kind === 'ready' && !updating && (
+        {kind === 'ready' && !phase.updating && (
           <Button className={compact ? 'btn-compact' : undefined} onClick={() => updateOne(n)}>Обновить</Button>
         )}
       </div>

@@ -84,7 +84,7 @@ pub struct AppState {
     /// Последний релиз GitHub. `page` отдаёт запись моложе 5 минут.
     releases: Arc<ReleaseCache>,
     /// Узлы, которым ушла ApplyUpdate: id → версия в команде.
-    /// Снимается hello с этой версией или заметкой `rolled_back`.
+    /// Снимается hello с этой версией, заметкой `rolled_back` или `UpdateFailed`.
     updating: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -611,6 +611,17 @@ async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCo
     let release = fresh_release(&st.releases)
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "релиз недоступен".to_string()))?;
+    dispatch_updates(&st, &release).await
+}
+
+/// Рассылка ApplyUpdate. Проверка ассетов — до первой отправки. Ошибка
+/// `send_cmd`, пока ни один id не ушёл, возвращается как есть и дальше
+/// ничего не шлётся. Если хотя бы один ушёл, ответ 200 и массив этих id:
+/// страница ставит ожидание только на 2xx. Сбойный id снимает `apply_update`.
+async fn dispatch_updates(
+    st: &AppState,
+    release: &Release,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let master = st.store.lock().await.state().master_node_id.clone();
     let views = st.reg.lock().await.list();
     let ready: Vec<String> = views
@@ -638,15 +649,21 @@ async fn update_all(State(st): State<AppState>) -> Result<Json<Value>, (StatusCo
             return Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into()));
         }
     }
+    let mut sent = Vec::new();
     for id in &ordered {
         let view = views.iter().find(|n| &n.node_id == id).expect("id из list");
-        apply_update(&st, id, &view.target, &release).await?;
+        match apply_update(st, id, &view.target, release).await {
+            Ok(()) => sent.push(id.clone()),
+            Err(e) if sent.is_empty() => return Err(e),
+            Err(_) => return Ok(Json(json!(sent))),
+        }
     }
-    Ok(Json(json!(ordered)))
+    Ok(Json(json!(sent)))
 }
 
 /// ApplyUpdate только после `asset_url_ok`. Id в множестве — пока команда
-/// ушла и узел не вернулся версией релиза и не прислал `rolled_back`.
+/// ушла и узел не вернулся версией релиза, не прислал `rolled_back` и не
+/// прислал `UpdateFailed`.
 async fn apply_update(
     st: &AppState,
     node_id: &str,
@@ -695,9 +712,25 @@ async fn clear_updating_if_release(st: &AppState, node_id: &str, version: &str) 
     }
 }
 
+async fn record_node_event(st: &AppState, node_id: &str, kind: zproto::EventKind, detail: String) {
+    let rolled_back = kind == zproto::EventKind::UpdateFinished && detail == "rolled_back";
+    let failed = kind == zproto::EventKind::UpdateFailed;
+    {
+        let mut reg = st.reg.lock().await;
+        if rolled_back {
+            reg.set_update_note(node_id, Some("rolled_back".into()));
+        }
+        reg.event(node_id, kind, detail);
+    }
+    if rolled_back || failed {
+        st.updating.lock().await.remove(node_id);
+    }
+}
+
 #[cfg(test)]
 mod updating_set {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn hello_with_sent_version_clears_when_cache_is_empty_or_other() {
@@ -786,6 +819,70 @@ mod updating_set {
         assert_eq!(err.1, "релиз недоступен");
         assert!(!st.updating.lock().await.contains_key("n1"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn update_failed_clears_the_id_and_a_second_update_is_not_blocked() {
+        let st = AppState::new();
+        let mut rx = register(&st, "0.1.0+dev").await;
+        st.updating.lock().await.insert("n1".into(), "0.1.0".into());
+        let blocked = apply_update(&st, "n1", "aarch64", &release_010()).await.unwrap_err();
+        assert_eq!(blocked.0, StatusCode::CONFLICT);
+        assert!(rx.try_recv().is_err(), "отказ не шлёт команду");
+
+        record_node_event(&st, "n1", zproto::EventKind::UpdateFailed, "служба завершилась".into()).await;
+        assert!(!st.updating.lock().await.contains_key("n1"));
+        assert_eq!(
+            st.reg.lock().await.last_event("n1").map(|(k, _)| *k),
+            Some(zproto::EventKind::UpdateFailed)
+        );
+
+        apply_update(&st, "n1", "aarch64", &release_010()).await.unwrap();
+        assert!(st.updating.lock().await.contains_key("n1"));
+        assert!(matches!(rx.try_recv().unwrap(), CtlMsg::ApplyUpdate { .. }));
+    }
+
+    async fn hello_node(st: &AppState, id: &str, ip: &str) -> mpsc::Receiver<CtlMsg> {
+        let (tx, rx) = mpsc::channel(1);
+        st.reg.lock().await.hello(
+            id,
+            id,
+            vec![Role::Rx],
+            "0.1.0+dev".into(),
+            "aarch64".into(),
+            None,
+            None,
+            ip.into(),
+            tx,
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn update_all_returns_ids_already_sent_when_a_later_send_fails() {
+        let st = AppState::new();
+        let mut rx_a = hello_node(&st, "a", "192.0.2.10").await;
+        let rx_b = hello_node(&st, "b", "192.0.2.11").await;
+        drop(rx_b);
+        let body = dispatch_updates(&st, &release_010()).await.unwrap();
+        assert_eq!(body.0, json!(["a"]));
+        assert!(st.updating.lock().await.contains_key("a"));
+        assert!(!st.updating.lock().await.contains_key("b"));
+        assert!(matches!(rx_a.try_recv().unwrap(), CtlMsg::ApplyUpdate { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_all_errors_and_sends_nothing_when_the_first_send_fails() {
+        let st = AppState::new();
+        let rx_a = hello_node(&st, "a", "192.0.2.10").await;
+        let mut rx_b = hello_node(&st, "b", "192.0.2.11").await;
+        drop(rx_a);
+        let err = dispatch_updates(&st, &release_010()).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(rx_b.try_recv().is_err(), "после первого сбоя рассылка останавливается");
+        let updating = st.updating.lock().await;
+        assert!(!updating.contains_key("a"));
+        assert!(!updating.contains_key("b"));
     }
 }
 
@@ -2156,17 +2253,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<AgentMsg>(&text) {
                     Ok(AgentMsg::Telemetry(t)) => st.reg.lock().await.telemetry(&node_id, t),
                     Ok(AgentMsg::Event { kind, detail }) => {
-                        let rolled_back = kind == zproto::EventKind::UpdateFinished && detail == "rolled_back";
-                        {
-                            let mut reg = st.reg.lock().await;
-                            if rolled_back {
-                                reg.set_update_note(&node_id, Some("rolled_back".into()));
-                            }
-                            reg.event(&node_id, kind, detail);
-                        }
-                        if rolled_back {
-                            st.updating.lock().await.remove(&node_id);
-                        }
+                        record_node_event(&st, &node_id, kind, detail).await;
                     }
                     Ok(AgentMsg::Hello { .. }) => {
                         tracing::warn!(node = name, %node_id, "повторный Hello по живому сокету — игнорируем")
