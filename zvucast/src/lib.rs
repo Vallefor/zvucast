@@ -16,4 +16,5 @@ pub mod soloist;
 pub mod state;
 pub mod supervisor;
 pub mod uplink;
+pub mod update;
 pub mod ws_client;
