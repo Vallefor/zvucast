@@ -244,6 +244,7 @@ async fn connect_once(
         name: cfg.name.clone(),
         roles: roles.to_vec(),
         version: version.to_string(),
+        target: crate::update::baked_target().to_string(),
         capture_device: cfg.capture_device.clone(),
         playback_device: cfg.playback_device.clone(),
         inputs: inputs.to_vec(),

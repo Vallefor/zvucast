@@ -2,6 +2,21 @@ use std::collections::BTreeMap;
 
 pub const TARGETS: [&str; 4] = ["x86_64", "aarch64", "armv7-rpi", "armv7-opi"];
 
+pub fn reported_version() -> String {
+    let base = env!("CARGO_PKG_VERSION");
+    match option_env!("ZVUCAST_RELEASE") {
+        Some("1") => base.to_string(),
+        _ => format!("{base}+dev"),
+    }
+}
+
+pub fn baked_target() -> &'static str {
+    match option_env!("ZVUCAST_TARGET") {
+        Some(t) if TARGETS.contains(&t) => t,
+        _ => "unknown",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offer {
     Hidden,
@@ -201,5 +216,25 @@ mod tests {
         assert_eq!(rel.version, "0.1.0");
         assert_eq!(rel.assets["aarch64"].sha256, "abc123");
         assert!(parse_release(r#"{"tag_name":"v0.1.0","prerelease":true,"assets":[]}"#, "").is_err());
+    }
+
+    #[test]
+    fn dev_build_has_dev_suffix_unless_release_flag() {
+        let v = reported_version();
+        let base = env!("CARGO_PKG_VERSION");
+        match option_env!("ZVUCAST_RELEASE") {
+            Some("1") => assert_eq!(v, base),
+            _ => assert_eq!(v, format!("{base}+dev")),
+        }
+    }
+
+    #[test]
+    fn unknown_target_without_env() {
+        let t = baked_target();
+        if option_env!("ZVUCAST_TARGET").is_none() {
+            assert_eq!(t, "unknown");
+        } else {
+            assert!(TARGETS.contains(&t));
+        }
     }
 }

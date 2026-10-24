@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Agent { config } => {
             let (cfg, node_id) = zvucast::config::load_or_init_id(&config)?;
-            zvucast::agent::run(cfg, node_id, env!("CARGO_PKG_VERSION").to_string()).await?;
+            zvucast::agent::run(cfg, node_id, zvucast::update::reported_version()).await?;
         }
     }
     Ok(())

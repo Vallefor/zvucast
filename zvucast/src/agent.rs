@@ -1357,6 +1357,9 @@ fn gst_domain(
                     }
                 }
             },
+            Ok(CtlMsg::ApplyUpdate { .. }) => {
+                tracing::warn!("ApplyUpdate в gst-домене — игнорируем")
+            }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }

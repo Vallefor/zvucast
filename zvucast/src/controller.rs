@@ -1799,6 +1799,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                     name,
                     roles,
                     version,
+                    target: _,
                     capture_device,
                     playback_device,
                     inputs,

@@ -77,6 +77,8 @@ pub mod proto {
         PipelineError,
         Underrun,
         Restarted,
+        UpdateFailed,
+        UpdateFinished,
     }
 
     /// Канал, которым узел держит сессию с контроллером.
@@ -95,6 +97,8 @@ pub mod proto {
             name: String,
             roles: Vec<Role>,
             version: String,
+            #[serde(default)]
+            target: String,
             capture_device: Option<String>,
             playback_device: Option<String>,
             /// Каналы захвата, которые агент видит на узле. Пусто у старых
@@ -206,6 +210,11 @@ pub mod proto {
         SetVirtualOutput { enabled: bool },
         /// Куда смотрит pipewiresrc. None — источник по умолчанию.
         SetCaptureTarget { device_key: Option<String> },
+        ApplyUpdate {
+            version: String,
+            url: String,
+            sha256: String,
+        },
     }
 }
 
@@ -222,6 +231,7 @@ mod tests {
             name: "pc".into(),
             roles: vec![Role::Tx, Role::Rx],
             version: "0.1.0".into(),
+            target: String::new(),
             capture_device: Some("plughw:CARD=Generic_1".into()),
             playback_device: Some("plughw:CARD=Generic_1".into()),
             inputs: vec![],
@@ -274,6 +284,7 @@ mod tests {
             name: "opi-rx2".into(),
             roles: vec![Role::Rx],
             version: "0.1.0".into(),
+            target: String::new(),
             capture_device: None,
             playback_device: Some("plughw:CARD=Codec".into()),
             inputs: vec![],
@@ -354,6 +365,7 @@ mod tests {
             name: "opi".into(),
             roles: vec![Role::Rx],
             version: "0.1".into(),
+            target: String::new(),
             capture_device: None,
             playback_device: None,
             inputs: vec![],
@@ -375,7 +387,7 @@ mod tests {
     fn hello_carries_node_id() {
         let m = AgentMsg::Hello {
             node_id: "u-1".into(), name: "opi".into(), roles: vec![Role::Rx],
-            version: "0.1".into(), capture_device: None,
+            version: "0.1".into(), target: String::new(), capture_device: None,
             playback_device: Some("plughw:CARD=Codec".into()),
             inputs: vec![],
             outputs: vec![],
@@ -473,5 +485,25 @@ mod tests {
             serde_json::from_str::<CtlMsg>(r#"{"type":"SetChannelMap","map":{"out_l":"l","out_r":"r"}}"#).unwrap(),
             CtlMsg::SetChannelMap { map: ChannelMap::default(), branches: vec![] },
         );
+    }
+
+    #[test]
+    fn hello_without_target_defaults_empty() {
+        let raw = r#"{"type":"Hello","node_id":"n","name":"pc","roles":["tx"],"version":"0.1.0","capture_device":null,"playback_device":null,"inputs":[],"outputs":[]}"#;
+        let AgentMsg::Hello { target, .. } = serde_json::from_str(raw).unwrap() else {
+            panic!("hello");
+        };
+        assert_eq!(target, "");
+    }
+
+    #[test]
+    fn apply_update_roundtrip() {
+        let m = CtlMsg::ApplyUpdate {
+            version: "0.1.0".into(),
+            url: "https://github.com/Vallefor/zvucast/releases/download/v0.1.0/zvucast-aarch64".into(),
+            sha256: "abc".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<CtlMsg>(&s).unwrap(), m);
     }
 }
