@@ -944,27 +944,26 @@ pub(crate) fn resolve_roles(
     }
 }
 
-/// Проба устройства вывода/захвата через gst. rx с
-/// playback_backend=PipeWire пробуется pipewiresink'ом (устройство не
-/// задаётся — выход выбирает WirePlumber); иначе ALSA-проба: alsasrc (tx) /
-/// alsasink (rx) переводится в Ready — устройство существует и не занято.
+/// Проба устройства вывода/захвата через gst. playback_backend=PipeWire
+/// пробует обе роли pipewiresink'ом и имя устройства не задаёт (выход
+/// выбирает WirePlumber). pipewiresrc здесь не собирается: из Ready его
+/// dispose роняет процесс в libgstpipewire (см. Drop у Runner). Иначе
+/// ALSA-проба: alsasrc (tx) / alsasink (rx) с property device переводится
+/// в Ready — устройство существует и не занято.
 /// Ошибка probe'а выключает роль (спека §8); явный список roles в конфиге —
 /// способ отключить ошибочно детектируемую роль.
 pub(crate) fn device_probe(cfg: &AgentConfig, device: &str, role: Role) -> bool {
     use gstreamer::prelude::*;
     let _ = gstreamer::init();
-    if role == Role::Rx && cfg.playback_backend == crate::config::Backend::PipeWire {
-        let Ok(el) = gstreamer::ElementFactory::make("pipewiresink").build() else {
+    let factory = probe_factory(cfg, role);
+    if cfg.playback_backend == crate::config::Backend::PipeWire {
+        let Ok(el) = gstreamer::ElementFactory::make(factory).build() else {
             return false;
         };
         let ok = el.set_state(gstreamer::State::Ready).is_ok();
         let _ = el.set_state(gstreamer::State::Null);
         return ok;
     }
-    let factory = match role {
-        Role::Tx => "alsasrc",
-        Role::Rx => "alsasink",
-    };
     let Ok(el) = gstreamer::ElementFactory::make(factory)
         .property("device", device)
         .build()
@@ -974,6 +973,16 @@ pub(crate) fn device_probe(cfg: &AgentConfig, device: &str, role: Role) -> bool 
     let ok = el.set_state(gstreamer::State::Ready).is_ok();
     let _ = el.set_state(gstreamer::State::Null);
     ok
+}
+
+/// Фабрика элемента пробы без открытия устройства.
+/// PipeWire (любая роль) — pipewiresink; Alsa tx — alsasrc; Alsa rx — alsasink.
+fn probe_factory(cfg: &AgentConfig, role: Role) -> &'static str {
+    match (cfg.playback_backend, role) {
+        (crate::config::Backend::PipeWire, _) => "pipewiresink",
+        (crate::config::Backend::Alsa, Role::Tx) => "alsasrc",
+        (crate::config::Backend::Alsa, Role::Rx) => "alsasink",
+    }
 }
 
 /// gst-домен: poll-цикл (команды ← recv_timeout(TICK), sup-события try_recv,
@@ -1864,6 +1873,18 @@ mod tests {
             seen.iter().all(|(dev, _)| !dev.contains("CARD")),
             "плейсхолдер, устройство не читается: {seen:?}"
         );
+    }
+
+    #[test]
+    fn probe_factory_follows_backend_and_role() {
+        let mut cfg = cfg_for_mixed();
+        cfg.playback_backend = crate::config::Backend::PipeWire;
+        assert_eq!(probe_factory(&cfg, Role::Tx), "pipewiresink");
+        assert_eq!(probe_factory(&cfg, Role::Rx), "pipewiresink");
+
+        cfg.playback_backend = crate::config::Backend::Alsa;
+        assert_eq!(probe_factory(&cfg, Role::Tx), "alsasrc");
+        assert_eq!(probe_factory(&cfg, Role::Rx), "alsasink");
     }
 
     #[test]
