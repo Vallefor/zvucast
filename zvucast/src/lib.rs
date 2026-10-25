@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod registry;
 pub mod silence;
 pub mod sendspin;
+pub mod setup;
 pub mod soloist;
 pub mod state;
 pub mod supervisor;
