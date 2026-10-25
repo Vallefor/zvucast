@@ -246,11 +246,11 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
 
     let family = family_of(&os_release);
     let uid = audio_uid(&unit_text);
-    let user = user_name(host, uid);
     let mut ifaces = host.wireless_ifaces();
     ifaces.sort();
 
     let probed = std::thread::scope(|scope| {
+        let passwd = scope.spawn(|| host.run(2, "getent", &owned(&["passwd", &uid.to_string()])));
         let pipewire = scope.spawn(|| user_service(host, "pipewire"));
         let wireplumber = scope.spawn(|| user_service(host, "wireplumber"));
         let pulse = scope.spawn(|| user_service(host, "pipewire-pulse"));
@@ -296,6 +296,7 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
         });
 
         Probes {
+            passwd: passwd.join().expect("getent"),
             pipewire: pipewire.join().expect("pipewire"),
             wireplumber: wireplumber.join().expect("wireplumber"),
             pulse: pulse.join().expect("pipewire-pulse"),
@@ -314,6 +315,7 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
         }
     });
 
+    let user = user_name(&probed.passwd, uid);
     let mut setup = Vec::new();
     let packages = pipewire_command(family, &user, uid);
     if !is_running(&probed.pipewire) {
@@ -371,6 +373,7 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
 }
 
 struct Probes {
+    passwd: Cmd,
     pipewire: Cmd,
     wireplumber: Cmd,
     pulse: Cmd,
@@ -393,8 +396,7 @@ fn user_service(host: &impl Host, service: &str) -> Cmd {
     host.run(2, "systemctl", &owned(&["--user", "is-active", service]))
 }
 
-fn user_name(host: &impl Host, uid: u32) -> String {
-    let listed = host.run(2, "getent", &owned(&["passwd", &uid.to_string()]));
+fn user_name(listed: &Cmd, uid: u32) -> String {
     let line = listed.stdout.lines().next().map(str::trim).unwrap_or("");
     if line.is_empty() {
         return uid.to_string();
@@ -418,6 +420,8 @@ fn issue(id: &str, command: String) -> SetupIssue {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use std::time::Instant;
     use zproto::SoloistState;
 
     struct Fake {
@@ -428,6 +432,7 @@ mod tests {
         uname: String,
         wireless: Vec<String>,
         answers: HashMap<(String, Vec<String>), Cmd>,
+        starts: Mutex<Vec<(String, Vec<String>, Instant)>>,
     }
 
     impl Fake {
@@ -476,6 +481,11 @@ mod tests {
         }
 
         fn run(&self, _secs: u64, program: &str, args: &[String]) -> Cmd {
+            self.starts.lock().expect("starts").push((
+                program.to_string(),
+                args.to_vec(),
+                Instant::now(),
+            ));
             std::thread::sleep(std::time::Duration::from_millis(150));
             self.answers
                 .get(&(program.to_string(), args.to_vec()))
@@ -504,6 +514,7 @@ mod tests {
             uname: "x86_64".into(),
             wireless: Vec::new(),
             answers: HashMap::new(),
+            starts: Mutex::new(Vec::new()),
         };
         host.files.insert(
             "/etc/security/limits.conf".into(),
@@ -773,6 +784,30 @@ mod tests {
             },
         );
         assert!(!inspect(&host).setup.iter().any(|i| i.id == "controller"));
+    }
+
+    #[test]
+    fn getent_starts_with_the_pipewire_probe() {
+        let host = healthy_debian();
+        let _ = inspect(&host);
+        let starts = host.starts.lock().expect("starts");
+        let stamp = |program: &str, args: &[&str]| {
+            starts
+                .iter()
+                .find(|(name, got, _)| {
+                    name == program && got.iter().map(String::as_str).eq(args.iter().copied())
+                })
+                .map(|(_, _, at)| *at)
+                .unwrap_or_else(|| panic!("no start for {program} {args:?}"))
+        };
+        let getent = stamp("getent", &["passwd", "1000"]);
+        let pipewire = stamp("systemctl", &["--user", "is-active", "pipewire"]);
+        let gap =
+            getent.saturating_duration_since(pipewire) + pipewire.saturating_duration_since(getent);
+        assert!(
+            gap < std::time::Duration::from_millis(80),
+            "getent and pipewire started {gap:?} apart"
+        );
     }
 
     #[test]
