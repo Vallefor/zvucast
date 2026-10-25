@@ -66,8 +66,13 @@ pub fn capture_target(views: &[InputView]) -> Option<String> {
 
 /// Ключ слота выхода. Правило то же, что у захвата, но виртуальный sink
 /// в слот не входит и целью воспроизведения не бывает.
+/// Заглушки `capture` и `playback` устройством не являются.
 pub fn playback_target(views: &[InputView]) -> Option<String> {
-    stereo_slot_key(views, false).filter(|key| !is_virtual_device_key(key))
+    let key = stereo_slot_key(views, false)?;
+    if key == "capture" || key == "playback" || is_virtual_device_key(&key) {
+        return None;
+    }
+    Some(key)
 }
 
 /// Зона кабеля `zvucast-{id}`, у которого все каналы index <= 1 выключены.
@@ -531,6 +536,26 @@ mod tests {
             ch("mic:1", "alsa_input.usb-BY-V20.analog-stereo", 1),
         ], &[]);
         assert_eq!(capture_target(&views).as_deref(), Some("alsa_input.usb-BY-V20.analog-stereo"));
+    }
+
+    #[test]
+    fn playback_target_ignores_the_placeholder_device() {
+        let placeholder = merge_inputs(&[
+            ch("playback:0", "playback", 0),
+            ch("playback:1", "playback", 1),
+        ], &[]);
+        assert!(placeholder.iter().all(|v| v.enabled));
+        assert_eq!(playback_target(&placeholder), None);
+
+        let real = merge_inputs(&[
+            ch("out:0", "alsa_output.pci.analog-stereo", 0),
+            ch("out:1", "alsa_output.pci.analog-stereo", 1),
+        ], &[]);
+        assert!(real.iter().all(|v| v.enabled));
+        assert_eq!(
+            playback_target(&real).as_deref(),
+            Some("alsa_output.pci.analog-stereo"),
+        );
     }
 
     #[test]
