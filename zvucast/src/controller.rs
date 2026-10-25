@@ -551,13 +551,32 @@ async fn page_release(cache: &ReleaseCache) -> Result<Release, String> {
     if let Ok(rel) = cache.page(|| Err("нет кэша".into())) {
         return Ok(rel);
     }
-    let pair = fetch_latest().await?;
-    cache.fresh(move || Ok(pair.clone()))
+    if cache.failure_is_recent() {
+        return Err("релиз недоступен".into());
+    }
+    match fetch_latest().await {
+        Ok(pair) => {
+            cache.note_success();
+            cache.fresh(move || Ok(pair.clone()))
+        }
+        Err(err) => {
+            cache.note_failure();
+            Err(err)
+        }
+    }
 }
 
 async fn fresh_release(cache: &ReleaseCache) -> Result<Release, String> {
-    let pair = fetch_latest().await?;
-    cache.fresh(move || Ok(pair.clone()))
+    match fetch_latest().await {
+        Ok(pair) => {
+            cache.note_success();
+            cache.fresh(move || Ok(pair.clone()))
+        }
+        Err(err) => {
+            cache.note_failure();
+            Err(err)
+        }
+    }
 }
 
 fn release_json(rel: &Release) -> Value {

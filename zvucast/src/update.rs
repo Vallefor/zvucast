@@ -115,11 +115,32 @@ pub fn update_body_ok(body: &str) -> bool {
 
 pub struct ReleaseCache {
     inner: Mutex<Option<(Instant, Release)>>,
+    failed_at: Mutex<Option<Instant>>,
 }
 
 impl ReleaseCache {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(None) }
+        Self { inner: Mutex::new(None), failed_at: Mutex::new(None) }
+    }
+
+    pub fn note_failure(&self) {
+        if let Ok(mut slot) = self.failed_at.lock() {
+            *slot = Some(Instant::now());
+        }
+    }
+
+    pub fn note_success(&self) {
+        if let Ok(mut slot) = self.failed_at.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Страница узлов спрашивает релиз каждые 2 с. Удачный ответ кэшируется
+    /// на 5 минут, а ошибка раньше не запоминалась, и каждый пол снова шёл
+    /// в GitHub. Минута держит лимит, пока кнопка обновления всё равно
+    /// запрашивает релиз заново.
+    pub fn failure_is_recent(&self) -> bool {
+        self.failed_at.lock().ok().and_then(|slot| *slot).is_some_and(|at| at.elapsed() < Duration::from_secs(60))
     }
 
     pub fn page(&self, fetch: impl Fn() -> Result<(String, String), String>) -> Result<Release, String> {
@@ -143,36 +164,81 @@ pub fn sums_url_ok(url: &str) -> bool {
     asset_url_ok(&url.replacen("SHA256SUMS", "zvucast-x86_64", 1), "x86_64") && url.ends_with("/SHA256SUMS")
 }
 
+/// `Location` с `https://github.com/Vallefor/zvucast/releases/latest`.
+/// За редиректом не идём: страница тега нам не нужна, а `github.com` в
+/// список хостов ассетов не входит.
+pub fn tag_from_latest_location(location: &str) -> Result<String, String> {
+    const PREFIX: &str = "https://github.com/Vallefor/zvucast/releases/tag/v";
+    let version = location.strip_prefix(PREFIX).ok_or("чужой редирект")?;
+    if version.is_empty() || version.contains(['/', '?', '#']) {
+        return Err("чужой редирект".into());
+    }
+    let probe = format!("https://github.com/Vallefor/zvucast/releases/download/v{version}/zvucast-x86_64");
+    if !asset_url_ok(&probe, "x86_64") {
+        return Err("тег".into());
+    }
+    Ok(version.to_string())
+}
+
+pub fn sums_download_url(version: &str) -> String {
+    format!("https://github.com/Vallefor/zvucast/releases/download/v{version}/SHA256SUMS")
+}
+
+/// Тот же вход, что раньше отдавал `releases/latest` API: JSON с тегом и
+/// каноническими адресами плюс текст `SHA256SUMS`. Адрес файла берётся из
+/// имени в суммах, не из чужого JSON.
+pub fn release_documents(version: &str, sums: &str) -> Result<(String, String), String> {
+    let probe = format!("https://github.com/Vallefor/zvucast/releases/download/v{version}/zvucast-x86_64");
+    if !asset_url_ok(&probe, "x86_64") {
+        return Err("тег".into());
+    }
+    let mut assets = Vec::new();
+    for line in sums.lines() {
+        let mut it = line.split_whitespace();
+        let Some(_sum) = it.next() else { continue };
+        let Some(name) = it.next() else { continue };
+        let Some(target) = name.strip_prefix("zvucast-") else { continue };
+        if !TARGETS.contains(&target) {
+            continue;
+        }
+        let url = format!("https://github.com/Vallefor/zvucast/releases/download/v{version}/{name}");
+        if !asset_url_ok(&url, target) {
+            return Err("чужой адрес".into());
+        }
+        assets.push(serde_json::json!({ "name": name, "browser_download_url": url }));
+    }
+    let latest = serde_json::json!({
+        "tag_name": format!("v{version}"),
+        "prerelease": false,
+        "assets": assets,
+    })
+    .to_string();
+    Ok((latest, sums.to_string()))
+}
+
 pub async fn fetch_latest() -> Result<(String, String), String> {
-    let client = github_client()?;
-    let latest = client
-        .get("https://api.github.com/repos/Vallefor/zvucast/releases/latest")
+    let lookup = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = lookup
+        .get("https://github.com/Vallefor/zvucast/releases/latest")
         .header("User-Agent", "zvucast")
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .text()
-        .await
         .map_err(|e| e.to_string())?;
-    let parsed: serde_json::Value = serde_json::from_str(&latest).map_err(|e| e.to_string())?;
-    let mut sums_url = None;
-    if let Some(list) = parsed.get("assets").and_then(|a| a.as_array()) {
-        for asset in list {
-            if asset.get("name").and_then(|n| n.as_str()) == Some("SHA256SUMS") {
-                sums_url = asset
-                    .get("browser_download_url")
-                    .and_then(|u| u.as_str())
-                    .map(str::to_string);
-            }
-        }
+    if !response.status().is_redirection() {
+        return Err(format!("нет редиректа: {}", response.status()));
     }
-    let sums_url = sums_url.ok_or("нет SHA256SUMS")?;
+    let location = response.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).ok_or("нет тега")?;
+    let version = tag_from_latest_location(location)?;
+    let sums_url = sums_download_url(&version);
     if !sums_url_ok(&sums_url) {
         return Err("чужой SHA256SUMS".into());
     }
-    let sums = client
+    let sums = github_client()?
         .get(&sums_url)
         .header("User-Agent", "zvucast")
         .send()
@@ -183,7 +249,7 @@ pub async fn fetch_latest() -> Result<(String, String), String> {
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    Ok((latest, sums))
+    release_documents(&version, &sums)
 }
 
 fn github_client() -> Result<reqwest::Client, String> {
@@ -422,6 +488,40 @@ mod tests {
         assert!(update_body_ok(""));
         assert!(update_body_ok(" \n"));
         assert!(!update_body_ok(r#"{"url":"https://example"}"#));
+    }
+
+    #[test]
+    fn latest_redirect_becomes_the_release_without_the_api() {
+        assert_eq!(
+            tag_from_latest_location("https://github.com/Vallefor/zvucast/releases/tag/v0.1.2").unwrap(),
+            "0.1.2"
+        );
+        for location in [
+            "https://github.com/other/zvucast/releases/tag/v0.1.2",
+            "https://github.com/Vallefor/zvucast/releases/tag/v0.1.2-rc.1",
+            "https://evil.example/github.com/Vallefor/zvucast/releases/tag/v0.1.2",
+            "https://github.com/Vallefor/zvucast/releases/tag/v0.1.2/extra",
+        ] {
+            assert!(tag_from_latest_location(location).is_err(), "{location}");
+        }
+        let sums = "abc123  zvucast-aarch64\n";
+        let (json, sums_out) = release_documents("0.1.2", sums).unwrap();
+        let rel = parse_release(&json, &sums_out).unwrap();
+        assert_eq!(rel.version, "0.1.2");
+        assert_eq!(rel.assets["aarch64"].url, "https://github.com/Vallefor/zvucast/releases/download/v0.1.2/zvucast-aarch64");
+        assert_eq!(rel.assets["aarch64"].sha256, "abc123");
+        assert!(sums_url_ok(&sums_download_url("0.1.2")));
+        assert!(release_documents("0.1.2-rc.1", sums).is_err());
+    }
+
+    #[test]
+    fn a_failed_lookup_holds_the_page_for_a_minute() {
+        let cache = ReleaseCache::new();
+        assert!(!cache.failure_is_recent());
+        cache.note_failure();
+        assert!(cache.failure_is_recent());
+        cache.note_success();
+        assert!(!cache.failure_is_recent());
     }
 
     #[test]
