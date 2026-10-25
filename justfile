@@ -1,5 +1,9 @@
 export PATH := env_var('HOME') + '/.cargo/bin:' + env_var('PATH')
 
+# Агент Cursor задаёт CARGO_TARGET_DIR вне ./target. Копировать надо
+# оттуда, куда cargo реально записал бинарник.
+cargo_target := env_var_or_default("CARGO_TARGET_DIR", "target")
+
 check-all:
     cargo check --workspace
 
@@ -12,7 +16,7 @@ build-web:
 build-pc: build-web
     ZVUCAST_TARGET=x86_64 cargo build --release --workspace --target x86_64-unknown-linux-gnu
     mkdir -p dist
-    cp target/x86_64-unknown-linux-gnu/release/zvucast dist/zvucast-x86_64
+    cp "{{cargo_target}}/x86_64-unknown-linux-gnu/release/zvucast" dist/zvucast-x86_64
 
 build-pi4: build-web
     #!/usr/bin/env bash
@@ -31,7 +35,7 @@ build-rpi2: build-web
     PKG_CONFIG_PATH=$HOME/sysroots/rpi2/usr/lib/pkgconfig:$HOME/sysroots/rpi2/usr/lib/arm-linux-gnueabihf/pkgconfig:$HOME/sysroots/rpi2/usr/share/pkgconfig \
     cargo build --release --workspace --target armv7-unknown-linux-gnueabihf
     mkdir -p dist
-    cp target/armv7-unknown-linux-gnueabihf/release/zvucast dist/zvucast-armv7-rpi
+    cp "{{cargo_target}}/armv7-unknown-linux-gnueabihf/release/zvucast" dist/zvucast-armv7-rpi
 
 build-opi: build-web
     ZVUCAST_TARGET=armv7-opi \
@@ -41,7 +45,7 @@ build-opi: build-web
     PKG_CONFIG_PATH=$HOME/sysroots/opi/usr/lib/pkgconfig:$HOME/sysroots/opi/usr/lib/arm-linux-gnueabihf/pkgconfig:$HOME/sysroots/opi/usr/share/pkgconfig \
     cargo build --release --workspace --target armv7-unknown-linux-gnueabihf
     mkdir -p dist
-    cp target/armv7-unknown-linux-gnueabihf/release/zvucast dist/zvucast-armv7-opi
+    cp "{{cargo_target}}/armv7-unknown-linux-gnueabihf/release/zvucast" dist/zvucast-armv7-opi
 
 release:
     #!/usr/bin/env bash
@@ -50,12 +54,13 @@ release:
     gh release view "v$ver" >/dev/null 2>&1 && { echo "тег v$ver уже есть" >&2; exit 1; }
     test -n "${PI4_SSH:-}"
     test -d "$HOME/sysroots/rpi2" && test -d "$HOME/sysroots/opi" || exit 1
+    out="{{cargo_target}}"
 
     ( cd web && npm ci && npm run build )
 
     ZVUCAST_RELEASE=1 ZVUCAST_TARGET=x86_64 cargo build --release --workspace --target x86_64-unknown-linux-gnu
     mkdir -p dist
-    cp target/x86_64-unknown-linux-gnu/release/zvucast dist/zvucast-x86_64
+    cp "$out/x86_64-unknown-linux-gnu/release/zvucast" dist/zvucast-x86_64
 
     rsync -a --delete --exclude target --exclude node_modules --exclude /dist ./ "$PI4_SSH:~/zvucast/"
     ssh "$PI4_SSH" 'export PATH="$HOME/.cargo/bin:$PATH" ZVUCAST_RELEASE=1 ZVUCAST_TARGET=aarch64 && cd ~/zvucast && cargo build --release'
@@ -68,7 +73,7 @@ release:
     PKG_CONFIG_SYSROOT_DIR=$HOME/sysroots/rpi2 \
     PKG_CONFIG_PATH=$HOME/sysroots/rpi2/usr/lib/pkgconfig:$HOME/sysroots/rpi2/usr/lib/arm-linux-gnueabihf/pkgconfig:$HOME/sysroots/rpi2/usr/share/pkgconfig \
     cargo build --release --workspace --target armv7-unknown-linux-gnueabihf
-    cp target/armv7-unknown-linux-gnueabihf/release/zvucast dist/zvucast-armv7-rpi
+    cp "$out/armv7-unknown-linux-gnueabihf/release/zvucast" dist/zvucast-armv7-rpi
 
     ZVUCAST_RELEASE=1 \
     ZVUCAST_TARGET=armv7-opi \
@@ -77,7 +82,19 @@ release:
     PKG_CONFIG_SYSROOT_DIR=$HOME/sysroots/opi \
     PKG_CONFIG_PATH=$HOME/sysroots/opi/usr/lib/pkgconfig:$HOME/sysroots/opi/usr/lib/arm-linux-gnueabihf/pkgconfig:$HOME/sysroots/opi/usr/share/pkgconfig \
     cargo build --release --workspace --target armv7-unknown-linux-gnueabihf
-    cp target/armv7-unknown-linux-gnueabihf/release/zvucast dist/zvucast-armv7-opi
+    cp "$out/armv7-unknown-linux-gnueabihf/release/zvucast" dist/zvucast-armv7-opi
+
+    got=$(dist/zvucast-x86_64 --version)
+    if [ "$got" != "zvucast $ver" ]; then
+      echo "x86_64 сообщает «$got», в манифесте $ver" >&2
+      exit 1
+    fi
+    for bin in dist/zvucast-x86_64 dist/zvucast-aarch64 dist/zvucast-armv7-rpi dist/zvucast-armv7-opi; do
+      if grep -a -F -q '+dev' "$bin"; then
+        echo "$bin собран без ZVUCAST_RELEASE=1" >&2
+        exit 1
+      fi
+    done
 
     (
       cd dist
