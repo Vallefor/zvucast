@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
-use zproto::{CaptureChan, ChannelMap, CtlMsg, Endpoint, EventKind, PipelineState, Role, Telemetry};
+use zproto::{
+    CaptureChan, ChannelMap, CtlMsg, Endpoint, EventKind, PipelineState, Role, SetupIssue,
+    SoloistState, Telemetry,
+};
 
 /// Узел реестра, как его видит контроллер (в API/дашборде).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -61,6 +64,12 @@ struct NodeRec {
     version: String,
     target: String,
     update_note: Option<String>,
+    /// Агент прислал сырой отчёт о системе. Повторный hello не сбрасывает —
+    /// перезаписывает только `set_setup`.
+    reported: bool,
+    issues: Vec<SetupIssue>,
+    soloist: SoloistState,
+    command: String,
     dup: bool,
     last_telem: Option<(Instant, Telemetry)>,
     last_event: Option<(EventKind, String)>,
@@ -136,6 +145,8 @@ impl Registry {
     /// Мета (display_name, channel_map) не трогается — она живёт отдельно
     /// (`set_meta`). `update_note` тоже не сбрасывается: итог отката приходит
     /// отдельно (`set_update_note`) и не должен затираться следующим hello.
+    /// Сырой отчёт (`reported`, issues, soloist, command) переживает повторный
+    /// hello: его пишет только `set_setup`.
     /// `ip` — адрес peer'а WS-соединения (подставляет controller).
     /// `dup` выставляется, если узел с этим node_id уже online с другого ip
     /// (два агента с одним id одновременно); совпадение ip — обычный re-hello.
@@ -181,6 +192,10 @@ impl Registry {
                         version,
                         target,
                         update_note: None,
+                        reported: false,
+                        issues: Vec::new(),
+                        soloist: SoloistState::Unknown,
+                        command: String::new(),
                         dup,
                         last_telem: None,
                         last_event: None,
@@ -201,6 +216,31 @@ impl Registry {
     pub fn set_update_note(&mut self, node_id: &str, note: Option<String>) {
         if let Some(rec) = self.nodes.get_mut(node_id) {
             rec.update_note = note;
+        }
+    }
+
+    /// Сырой отчёт о системе узла. Неизвестный узел — no-op.
+    pub fn set_setup(
+        &mut self,
+        node_id: &str,
+        reported: bool,
+        issues: Vec<SetupIssue>,
+        soloist: SoloistState,
+        command: String,
+    ) {
+        if let Some(rec) = self.nodes.get_mut(node_id) {
+            rec.reported = reported;
+            rec.issues = issues;
+            rec.soloist = soloist;
+            rec.command = command;
+        }
+    }
+
+    /// Сырой отчёт узла. Неизвестный узел: не сообщён, пустые issues, Unknown, пустая команда.
+    pub fn setup_of(&self, node_id: &str) -> (bool, Vec<SetupIssue>, SoloistState, String) {
+        match self.nodes.get(node_id) {
+            Some(rec) => (rec.reported, rec.issues.clone(), rec.soloist, rec.command.clone()),
+            None => (false, vec![], SoloistState::Unknown, String::new()),
         }
     }
 
@@ -493,7 +533,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zproto::{ChanSel, PipelineState, RoleRx};
+    use zproto::{ChanSel, PipelineState, RoleRx, SetupIssue, SoloistState};
 
     fn telem() -> Telemetry {
         Telemetry {
@@ -924,5 +964,27 @@ mod tests {
         r.hello("id-1", "a", vec![Role::Tx], "v".into(), String::new(), None, None, "1.1.1.1".into(), t2);
         assert_eq!(r.hello_seqs()["id-1"], 2, "re-hello инкрементит счётчик");
         assert_eq!(r.hello_seqs().len(), 1);
+    }
+
+    #[test]
+    fn setup_survives_offline_and_unknown_node_is_empty() {
+        let mut r = Registry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        r.hello("id", "pc", vec![], "0.1.0".into(), String::new(), None, None, "192.0.2.10".into(), tx);
+        r.set_setup(
+            "id",
+            true,
+            vec![SetupIssue { id: "linger".into(), command: "sudo true".into(), detail: String::new() }],
+            SoloistState::Missing,
+            "curl soloist".into(),
+        );
+        r.mark_offline("id");
+        let (reported, issues, soloist, command) = r.setup_of("id");
+        assert!(reported);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(soloist, SoloistState::Missing);
+        assert_eq!(command, "curl soloist");
+        assert!(!r.list()[0].online);
+        assert_eq!(r.setup_of("missing"), (false, vec![], SoloistState::Unknown, String::new()));
     }
 }
