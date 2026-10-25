@@ -80,7 +80,7 @@ fn take_apply_result(path: &Path) -> Option<String> {
 pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<()> {
     // Роли разрешаются ДО запуска gst-домена и ws_client: и Hello, и набор
     // пайплайнов строятся по итоговому списку. Явный roles в конфиге
-    // отключает авто-детект (но устройства валидируются).
+    // отключает авто-детект и не требует устройств.
     let roles = resolve_roles(&cfg, &|dev, role| device_probe(&cfg, dev, role))?;
     tracing::info!(?roles, "роли узла");
 
@@ -873,11 +873,11 @@ fn handle_sup_event(
 }
 
 /// Разрешение ролей узла. Явный список из конфига: дедуп, канонический
-/// порядок [Tx, Rx], валидация устройств (tx требует capture_device, rx —
-/// playback_device, кроме playback_backend=pipewire). None — авто-детект
-/// probe'ом: устройство открывается в нужном режиме → роль поднимается
-/// (rx с pipewire пробуется без устройства). Пустой итог — Err (агенту
-/// нечего делать).
+/// порядок [Tx, Rx]; устройства не требуются. None — авто-детект probe'ом.
+/// playback_backend=pipewire пробует tx и rx без имени устройства (в probe
+/// уходит плейсхолдер, поле устройства не читается). alsa открывает заданные
+/// устройства, а если открывать нечего — ошибка: roles надо задать явно.
+/// Пустой итог — Err (агенту нечего делать).
 pub(crate) fn resolve_roles(
     cfg: &AgentConfig,
     probe: &dyn Fn(&str, Role) -> bool,
@@ -897,38 +897,39 @@ pub(crate) fn resolve_roles(
                 !roles.is_empty(),
                 "roles задан, но пуст — укажи хотя бы одну роль или убери поле для авто-детекта"
             );
-            for r in &roles {
-                match r {
-                    Role::Tx => anyhow::ensure!(
-                        cfg.capture_device.is_some(),
-                        "roles содержит tx, но capture_device не задан"
-                    ),
-                    Role::Rx => anyhow::ensure!(
-                        cfg.playback_backend != crate::config::Backend::Alsa
-                            || cfg.playback_device.is_some(),
-                        "roles содержит rx, но playback_device не задан"
-                    ),
-                }
-            }
             Ok(roles)
         }
         None => {
             let mut roles = Vec::new();
-            if let Some(dev) = &cfg.capture_device {
-                if probe(dev, Role::Tx) {
-                    roles.push(Role::Tx);
-                } else {
-                    tracing::warn!("авто-детект: capture {dev} недоступен — роль tx пропущена");
+            if cfg.playback_backend == crate::config::Backend::PipeWire {
+                // Плейсхолдер любой: имя устройства из конфига не читаем.
+                for role in [Role::Tx, Role::Rx] {
+                    if probe("pipewire", role) {
+                        roles.push(role);
+                    } else {
+                        tracing::warn!(
+                            "авто-детект: pipewire {role:?} недоступен — роль пропущена"
+                        );
+                    }
                 }
-            }
-            if cfg.playback_device.is_some()
-                || cfg.playback_backend == crate::config::Backend::PipeWire
-            {
-                let dev = cfg.playback_device.as_deref().unwrap_or("pipewire");
-                if probe(dev, Role::Rx) {
-                    roles.push(Role::Rx);
-                } else {
-                    tracing::warn!("авто-детект: playback {dev} недоступен — роль rx пропущена");
+            } else if cfg.capture_device.is_none() && cfg.playback_device.is_none() {
+                anyhow::bail!("нечего открывать для авто-детекта — задай roles явно");
+            } else {
+                if let Some(dev) = &cfg.capture_device {
+                    if probe(dev, Role::Tx) {
+                        roles.push(Role::Tx);
+                    } else {
+                        tracing::warn!("авто-детект: capture {dev} недоступен — роль tx пропущена");
+                    }
+                }
+                if let Some(dev) = &cfg.playback_device {
+                    if probe(dev, Role::Rx) {
+                        roles.push(Role::Rx);
+                    } else {
+                        tracing::warn!(
+                            "авто-детект: playback {dev} недоступен — роль rx пропущена"
+                        );
+                    }
                 }
             }
             let roles = canonical(roles);
@@ -1775,15 +1776,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_roles_explicit_validates_devices() {
+    fn resolve_roles_explicit_does_not_need_devices() {
         let mut cfg = cfg_for_mixed();
         cfg.roles = Some(vec![Role::Tx]);
         cfg.capture_device = None;
-        let e = resolve_roles(&cfg, &|_, _| true).unwrap_err();
-        assert!(
-            e.to_string().contains("capture_device"),
-            "tx без capture_device — ошибка: {e}"
-        );
+        let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
+        assert_eq!(roles, vec![Role::Tx]);
+
+        let mut cfg = cfg_for_mixed();
+        cfg.roles = Some(vec![Role::Rx]);
+        cfg.playback_backend = crate::config::Backend::Alsa;
+        cfg.playback_device = None;
+        let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
+        assert_eq!(roles, vec![Role::Rx]);
 
         let mut cfg = cfg_for_mixed();
         cfg.roles = Some(vec![Role::Rx, Role::Rx, Role::Tx]);
@@ -1799,6 +1804,20 @@ mod tests {
         assert!(
             resolve_roles(&cfg, &|_, _| true).is_err(),
             "пустой список — ошибка"
+        );
+    }
+
+    #[test]
+    fn resolve_roles_alsa_without_devices_asks_for_roles() {
+        let mut cfg = cfg_for_mixed();
+        cfg.roles = None;
+        cfg.capture_device = None;
+        cfg.playback_device = None;
+        cfg.playback_backend = crate::config::Backend::Alsa;
+        let e = resolve_roles(&cfg, &|_, _| true).unwrap_err();
+        assert!(
+            e.to_string().contains("roles"),
+            "без устройств роли надо задать явно: {e}"
         );
     }
 
@@ -1821,6 +1840,30 @@ mod tests {
         cfg.playback_backend = crate::config::Backend::PipeWire;
         let roles = resolve_roles(&cfg, &|_, role| role == Role::Rx).unwrap();
         assert_eq!(roles, vec![Role::Rx]);
+
+        // probe подтверждает обе роли; имя устройства из конфига не читается.
+        let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
+        assert_eq!(roles, vec![Role::Tx, Role::Rx]);
+
+        cfg.capture_device = Some("plughw:CARD=Cap".into());
+        cfg.playback_device = Some("plughw:CARD=Play".into());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let roles = resolve_roles(&cfg, &|dev, role| {
+            seen.borrow_mut().push((dev.to_string(), role));
+            true
+        })
+        .unwrap();
+        let seen = seen.into_inner();
+        assert_eq!(roles, vec![Role::Tx, Role::Rx]);
+        assert!(
+            seen.iter().any(|(_, role)| *role == Role::Tx)
+                && seen.iter().any(|(_, role)| *role == Role::Rx),
+            "pipewire пробует tx и rx: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(dev, _)| !dev.contains("CARD")),
+            "плейсхолдер, устройство не читается: {seen:?}"
+        );
     }
 
     #[test]

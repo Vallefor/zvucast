@@ -69,19 +69,20 @@ pub struct AgentConfig {
     /// и дописывается в этот же конфиг (см. load_or_init_id).
     #[serde(default)]
     pub id: Option<String>,
-    /// Явные роли узла; None (поле отсутствует) — авто-детект пробой ALSA
-    /// (capture_device открывается → tx, playback_device открывается → rx);
-    /// при playback_backend="pipewire" роль rx пробуется pipewiresink'ом.
+    /// Явные роли узла; None (поле отсутствует) — авто-детект.
+    /// pipewire пробует tx и rx без имени устройства; alsa без устройств
+    /// открывать нечего — roles надо задать явно.
     #[serde(default)]
     pub roles: Option<Vec<Role>>,
     pub controller: String,
-    /// Вход (alsasrc) для роли tx.
+    /// Вход (alsasrc) для роли tx. load выкидывает ключ до разбора;
+    /// поле остаётся, пока агент ещё может его открыть.
     #[serde(default)]
     pub capture_device: Option<String>,
-    /// Выход (alsasink) для роли rx.
+    /// Выход (alsasink) для роли rx. load выкидывает ключ до разбора.
     #[serde(default)]
     pub playback_device: Option<String>,
-    /// Бэкенд вывода rx (см. Backend). При pipewire playback_device не нужен.
+    /// Бэкенд вывода rx (см. Backend). При pipewire устройство не нужно.
     #[serde(default = "default_backend")]
     pub playback_backend: Backend,
     /// Сетевой интерфейс для PTP (zsync). GM выбирается BMCA по ptp_priority.
@@ -107,7 +108,37 @@ pub fn load(path: &Path) -> anyhow::Result<AgentConfig> {
             );
         }
     }
+    // capture_device и playback_device больше не выбирают устройство.
+    // Ключи выкидываем до разбора; комментарии и playback_backend остаются.
+    // Файл на диске не переписываем.
+    let text = strip_retired_device_keys(&text);
     Ok(toml::from_str(&text)?)
+}
+
+/// Убирает присваивания capture_device и playback_device. Строка-комментарий
+/// и playback_backend не трогаются.
+fn strip_retired_device_keys(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let trimmed = body.trim_start();
+        if !trimmed.starts_with('#') && retired_device_assignment(trimmed) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn retired_device_assignment(trimmed: &str) -> bool {
+    for key in ["capture_device", "playback_device"] {
+        if let Some(rest) = trimmed.strip_prefix(key) {
+            if rest.trim_start().starts_with('=') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Загружает конфиг; если id отсутствует — генерирует uuid и дописывает в файл.
@@ -197,7 +228,7 @@ port = 5004
         let c = load(&write_tmp(SAMPLE_FULL, "full")).unwrap();
         assert_eq!(c.name, "opi-rx2");
         assert_eq!(c.roles, Some(vec![zproto::Role::Rx]));
-        assert_eq!(c.playback_device.as_deref(), Some("plughw:CARD=Codec"));
+        assert!(c.playback_device.is_none(), "playback_device выкинут до разбора");
         assert!(c.capture_device.is_none());
         assert_eq!(c.ptp_priority, 128);
         assert_eq!(c.pipeline.jb_ms, 2);
@@ -208,8 +239,40 @@ port = 5004
         let c = load(&write_tmp(SAMPLE_AUTO, "auto")).unwrap();
         assert_eq!(c.roles, None, "roles отсутствует — авто-детект");
         assert_eq!(c.ptp_priority, 128, "дефолт priority1");
-        assert_eq!(c.capture_device.as_deref(), Some("plughw:CARD=Generic_1"));
-        assert_eq!(c.playback_device.as_deref(), Some("plughw:CARD=Generic_1"));
+        assert!(c.capture_device.is_none(), "capture_device выкинут до разбора");
+        assert!(c.playback_device.is_none(), "playback_device выкинут до разбора");
+    }
+
+    #[test]
+    fn load_strips_device_keys_keeps_backend_and_comments() {
+        let text = r#"
+name = "pc"
+controller = "ws://192.0.2.204:8080/ws"
+# capture_device = "from-comment"
+playback_backend = "pipewire"
+capture_device = "from-key"
+playback_device = "plughw:CARD=Generic_1"
+sync_interface = "eth0"
+
+[pipeline]
+jb_ms = 2
+rx_buffer_us = 5000
+rx_latency_us = 1000
+tx_buffer_us = 10000
+tx_latency_us = 2500
+mcast_group = "239.0.0.1"
+port = 5004
+"#;
+        let path = write_tmp(text, "strip");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let c = load(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "файл на диске не переписывается");
+        assert!(after.contains("# capture_device = \"from-comment\""));
+        assert!(after.contains("capture_device = \"from-key\""));
+        assert!(c.capture_device.is_none(), "ключ и комментарий не становятся значением");
+        assert!(c.playback_device.is_none());
+        assert_eq!(c.playback_backend, Backend::PipeWire);
     }
 
     #[test]
