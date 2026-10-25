@@ -686,9 +686,10 @@ fn handle_set_playback_target(
     handle_set_capture_target(current, playback_device_key(device_key), half)
 }
 
-/// Mute меняет только `zone.source`. Живой tx микширует это на месте, RTP
-/// остаётся. Тот же набор — no-op. Нет runner или монитор не встал — дроп
-/// и вооружение гейта, как при смене устройства.
+/// Mute меняет только `zone.source`. Тот же набор — no-op.
+/// PipeWire: живой tx микширует на месте, RTP остаётся. Нет runner
+/// или монитор не встал — дроп и вооружение гейта.
+/// ALSA: микшера зоны нет, набор пишется, runner не рвём, RTP на месте.
 fn handle_set_muted_zones(
     current: &RefCell<BTreeSet<String>>,
     zones: Vec<String>,
@@ -706,6 +707,17 @@ fn handle_set_muted_zones(
     }
     *current.borrow_mut() = next;
     let head = capture_head_name(backend, capture_key);
+    if backend == crate::config::Backend::Alsa {
+        *previous_sources = zone_sources(
+            &transport.zones,
+            linked,
+            table,
+            &current.borrow(),
+            head.as_deref(),
+        );
+        tracing::info!("tx: у графа ALSA нет микшера зоны, RTP на месте");
+        return SetCaptureTargetOutcome::Changed;
+    }
     let mixed = match half.runner.as_mut() {
         Some(runner) => {
             let muted_now = current.borrow();
@@ -3060,6 +3072,125 @@ mod tests {
         );
         assert!(half.runner.is_some());
         assert!(half.gate.restart_at.is_none());
+    }
+
+    #[test]
+    fn muted_zone_change_on_alsa_keeps_the_runner() {
+        gstreamer::init().unwrap();
+        let muted = RefCell::new(BTreeSet::new());
+        let mut half = RoleHalf::new();
+        half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
+        let transport = Transport {
+            zones: vec![zproto::ZoneEndpoints {
+                zone_id: "hall".into(),
+                endpoints: vec![],
+                source: None,
+            }],
+            dscp: 0,
+        };
+        let linked = BTreeSet::new();
+        let table = crate::sendspin::ZoneTable::new();
+        let mut previous_sources = BTreeMap::new();
+        assert_eq!(
+            handle_set_muted_zones(
+                &muted,
+                vec!["hall".into()],
+                &mut half,
+                &transport,
+                &linked,
+                &table,
+                crate::config::Backend::Alsa,
+                None,
+                &mut previous_sources,
+            ),
+            SetCaptureTargetOutcome::Changed
+        );
+        assert!(half.runner.is_some());
+        assert!(half.gate.restart_at.is_none());
+        assert_eq!(*muted.borrow(), BTreeSet::from(["hall".to_string()]));
+        let head = capture_head_name(crate::config::Backend::Alsa, None);
+        assert_eq!(
+            previous_sources,
+            zone_sources(
+                &transport.zones,
+                &linked,
+                &table,
+                &muted.borrow(),
+                head.as_deref()
+            )
+        );
+
+        let stored = previous_sources.clone();
+        assert_eq!(
+            handle_set_muted_zones(
+                &muted,
+                vec!["hall".into()],
+                &mut half,
+                &transport,
+                &linked,
+                &table,
+                crate::config::Backend::Alsa,
+                None,
+                &mut previous_sources,
+            ),
+            SetCaptureTargetOutcome::Unchanged
+        );
+        assert!(half.runner.is_some());
+        assert!(half.gate.restart_at.is_none());
+        assert_eq!(previous_sources, stored);
+    }
+
+    #[test]
+    fn muted_zone_change_keeps_the_runner_when_the_zone_mixer_matches() {
+        gstreamer::init().unwrap();
+        let pipe = gstreamer::Pipeline::new();
+        let mix = gstreamer::ElementFactory::make("identity")
+            .property("name", "zmix-hall")
+            .build()
+            .unwrap();
+        pipe.add(&mix).unwrap();
+        let muted = RefCell::new(BTreeSet::new());
+        let mut half = RoleHalf::new();
+        half.runner = Some(Runner::from_pipeline_for_test(pipe));
+        let transport = Transport {
+            zones: vec![zproto::ZoneEndpoints {
+                zone_id: "hall".into(),
+                endpoints: vec![],
+                source: None,
+            }],
+            dscp: 0,
+        };
+        let linked = BTreeSet::new();
+        let table = crate::sendspin::ZoneTable::new();
+        let mut previous_sources = BTreeMap::new();
+        assert_eq!(
+            handle_set_muted_zones(
+                &muted,
+                vec!["hall".into()],
+                &mut half,
+                &transport,
+                &linked,
+                &table,
+                crate::config::Backend::PipeWire,
+                None,
+                &mut previous_sources,
+            ),
+            SetCaptureTargetOutcome::Changed
+        );
+        assert!(half.runner.is_some(), "живой runner остаётся");
+        assert!(half.gate.restart_at.is_none());
+        assert_eq!(*muted.borrow(), BTreeSet::from(["hall".to_string()]));
+        let head = capture_head_name(crate::config::Backend::PipeWire, None);
+        assert_eq!(
+            previous_sources,
+            zone_sources(
+                &transport.zones,
+                &linked,
+                &table,
+                &muted.borrow(),
+                head.as_deref()
+            )
+        );
     }
 
     #[test]
