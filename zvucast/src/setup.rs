@@ -39,6 +39,17 @@ pub struct SetupSnapshot {
     pub ready: bool,
 }
 
+impl SetupSnapshot {
+    pub fn pending() -> Self {
+        Self {
+            setup: Vec::new(),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
+            ready: false,
+        }
+    }
+}
+
 pub struct SystemHost;
 
 impl Host for SystemHost {
@@ -62,6 +73,15 @@ impl Host for SystemHost {
         let argv = timeout_argv(secs, program, &refs);
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
+        if program == "systemctl" && args.first().map(String::as_str) == Some("--user") {
+            let uid = audio_uid(&self.read_to_string(AGENT_UNIT).unwrap_or_default());
+            let runtime = format!("/run/user/{uid}");
+            command.env("XDG_RUNTIME_DIR", &runtime);
+            command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={runtime}/bus"),
+            );
+        }
         match command.output() {
             Ok(output) => cmd_from_output(output),
             Err(_) => Cmd {

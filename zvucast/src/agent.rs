@@ -211,6 +211,18 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
     let supports_virtual_output =
         roles.contains(&Role::Tx) && cfg.playback_backend == crate::config::Backend::PipeWire;
     let pending_finished = take_apply_result(Path::new(APPLY_STATUS_PATH));
+    let (setup_tx, setup_rx) = watch::channel(crate::setup::SetupSnapshot::pending());
+    tokio::spawn(async move {
+        loop {
+            let snap =
+                tokio::task::spawn_blocking(|| crate::setup::inspect(&crate::setup::SystemHost))
+                    .await;
+            if let Ok(snap) = snap {
+                let _ = setup_tx.send(snap);
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
     ws_client::run(
         cfg,
         ws_client::Discovery::default(),
@@ -226,6 +238,7 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
         cmd_tx,
         events_rx,
         uplink,
+        setup_rx,
         pending_finished,
     )
     .await

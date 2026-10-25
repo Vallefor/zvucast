@@ -6,8 +6,11 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use zproto::{AgentMsg, CtlMsg, EventKind, PipelineState, Role, RoleRx, Telemetry};
+use zproto::{
+    AgentMsg, CtlMsg, EventKind, PipelineState, Role, RoleRx, SetupIssue, SoloistState, Telemetry,
+};
 use zvucast::config::{AgentConfig, PipelineCfg};
+use zvucast::setup::SetupSnapshot;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -46,6 +49,19 @@ fn test_discovery() -> zvucast::ws_client::Discovery {
         dest: "127.0.0.1:15099".into(),
         timeout: Duration::from_millis(100),
     }
+}
+
+fn ready_empty_setup() -> SetupSnapshot {
+    SetupSnapshot {
+        setup: Vec::new(),
+        soloist: SoloistState::Unknown,
+        soloist_command: String::new(),
+        ready: true,
+    }
+}
+
+fn ready_setup_rx() -> watch::Receiver<SetupSnapshot> {
+    watch::channel(ready_empty_setup()).1
 }
 
 fn lo_link() -> watch::Receiver<Option<zvucast::uplink::ActiveLink>> {
@@ -113,6 +129,7 @@ async fn hello_telemetry_command_reconnect() {
         cmds_tx,
         events_rx,
         lo_link(),
+        ready_setup_rx(),
         None,
     ));
 
@@ -207,6 +224,7 @@ async fn event_forwarded_to_server() {
         cmds_tx,
         events_rx,
         lo_link(),
+        ready_setup_rx(),
         None,
     ));
 
@@ -273,6 +291,7 @@ async fn fatal_exit_when_events_channel_closes() {
         cmds_tx,
         events_rx,
         lo_link(),
+        ready_setup_rx(),
         None,
     ));
 
@@ -328,6 +347,7 @@ async fn fatal_exit_when_cmds_channel_closes() {
         cmds_tx,
         events_rx,
         lo_link(),
+        ready_setup_rx(),
         None,
     ));
 
@@ -391,6 +411,7 @@ async fn controller_moved_switches_reconnect_target() {
         cmds_tx,
         events_rx,
         lo_link(),
+        ready_setup_rx(),
         None,
     ));
 
@@ -406,6 +427,97 @@ async fn controller_moved_switches_reconnect_target() {
     assert!(
         cmds_rx.try_recv().is_err(),
         "ControllerMoved не должен уходить в cmds-канал"
+    );
+
+    client.abort();
+    server.abort();
+}
+
+/// Смена снимка после Hello уходит кадром Setup. Повтор того же снимка молчит:
+/// телеметрия в паузе допустима, второй Setup — нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_snapshot_is_a_setup_message() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+
+    let (tx, mut rx) = mpsc::channel::<serde_json::Value>(64);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            tx.send(serde_json::from_str(&text).unwrap()).await.unwrap();
+        }
+    });
+
+    let (_telem_tx, telem_rx) = watch::channel(stopped_telemetry());
+    let (_ptp_tx, ptp_rx) = watch::channel(0_i64);
+    let (cmds_tx, _cmds_rx) = mpsc::channel::<CtlMsg>(16);
+    let (_events_tx, events_rx) = mpsc::channel::<AgentMsg>(16);
+    let (setup_tx, setup_rx) = watch::channel(ready_empty_setup());
+
+    let client = tokio::spawn(zvucast::ws_client::run(
+        cfg_for(url),
+        test_discovery(),
+        "node-test-1",
+        "0.1.0-test".into(),
+        vec![Role::Rx],
+        Vec::new(),
+        Vec::new(),
+        false,
+        telem_rx,
+        ptp_rx,
+        Arc::new(AtomicBool::new(false)),
+        cmds_tx,
+        events_rx,
+        lo_link(),
+        setup_rx,
+        None,
+    ));
+
+    let hello = tokio::time::timeout(STEP_TIMEOUT, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hello["type"], "Hello");
+    assert_eq!(hello["setup"], serde_json::json!([]));
+
+    let linger = SetupSnapshot {
+        setup: vec![SetupIssue {
+            id: "linger".into(),
+            command: String::new(),
+            detail: String::new(),
+        }],
+        soloist: SoloistState::Unknown,
+        soloist_command: String::new(),
+        ready: true,
+    };
+    setup_tx.send(linger.clone()).unwrap();
+
+    let setup = tokio::time::timeout(STEP_TIMEOUT, async {
+        loop {
+            let v = rx.recv().await.unwrap();
+            if v["type"] == "Setup" {
+                break v;
+            }
+        }
+    })
+    .await
+    .expect("Setup не пришёл");
+    assert_eq!(setup["setup"][0]["id"], "linger");
+
+    setup_tx.send(linger).unwrap();
+    let quiet = tokio::time::timeout(STEP_TIMEOUT / 4, async {
+        loop {
+            let v = rx.recv().await.unwrap();
+            if v["type"] == "Setup" {
+                return v;
+            }
+        }
+    })
+    .await;
+    assert!(
+        quiet.is_err(),
+        "повтор того же снимка не должен слать Setup"
     );
 
     client.abort();

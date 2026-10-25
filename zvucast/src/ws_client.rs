@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use zproto::{AgentMsg, CtlMsg, EventKind, LinkKind, Role, SoloistState, Telemetry};
+use zproto::{AgentMsg, CtlMsg, EventKind, LinkKind, Role, Telemetry};
 
 use crate::config::AgentConfig;
 use crate::discovery::{query_bound, DISCOVERY_PORT};
+use crate::setup::SetupSnapshot;
 use crate::uplink::ActiveLink;
 
 const TELEM_PERIOD: Duration = Duration::from_secs(2);
@@ -68,6 +69,7 @@ pub async fn run(
     cmds: mpsc::Sender<CtlMsg>,
     mut events: mpsc::Receiver<AgentMsg>,
     mut uplink: watch::Receiver<Option<ActiveLink>>,
+    mut setup: watch::Receiver<SetupSnapshot>,
     mut pending_finished: Option<String>,
 ) -> Result<()> {
     let mut backoff = BACKOFF_INITIAL;
@@ -122,6 +124,7 @@ pub async fn run(
             &updating,
             &update_tx,
             &mut update_rx,
+            &mut setup,
             &mut pending_finished,
         )
         .await
@@ -197,6 +200,7 @@ async fn connect_once(
     updating: &Arc<AtomicBool>,
     update_tx: &mpsc::Sender<AgentMsg>,
     update_rx: &mut mpsc::Receiver<AgentMsg>,
+    setup: &mut watch::Receiver<SetupSnapshot>,
     pending_finished: &mut Option<String>,
 ) -> Result<()> {
     // Discovery и набор только с активного интерфейса. Нет линка — наружу,
@@ -255,6 +259,8 @@ async fn connect_once(
     ws_connected.store(true, Ordering::Relaxed);
     let session_iface = dial_link.name;
 
+    let _ = tokio::time::timeout(Duration::from_secs(5), setup.wait_for(|s| s.ready)).await;
+    let snap = setup.borrow().clone();
     let hello = AgentMsg::Hello {
         node_id: node_id.to_string(),
         name: cfg.name.clone(),
@@ -269,12 +275,13 @@ async fn connect_once(
         outputs: outputs.to_vec(),
         supports_virtual_output,
         link: Some(if dial_link.wireless { LinkKind::Wifi } else { LinkKind::Wired }),
-        setup: Some(vec![]),
-        soloist: SoloistState::Unknown,
-        soloist_command: String::new(),
+        setup: Some(snap.setup.clone()),
+        soloist: snap.soloist,
+        soloist_command: snap.soloist_command.clone(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
+    let mut published = snap;
     tracing::info!("ws: подключено к {} как {}", current_addr, cfg.name);
     if let Some(detail) = pending_finished.clone() {
         let msg = AgentMsg::Event {
@@ -291,6 +298,7 @@ async fn connect_once(
                          // ветку снимаем: иначе changed() сразу Err и select крутится без паузы.
     let mut watch_uplink = true;
     let mut watch_updates = true;
+    let mut watch_setup = true;
 
     loop {
         tokio::select! {
@@ -314,6 +322,28 @@ async fn connect_once(
                 t.ptp_offset_ns = *ptp_offset.borrow();
                 let msg = AgentMsg::Telemetry(t);
                 ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+            }
+            // watch::send будит и без смены значения. Setup — только если
+            // изменились проблемы, soloist или команда. Неготовый снимок молчит.
+            changed = setup.changed(), if watch_setup => {
+                match changed {
+                    Err(_) => watch_setup = false,
+                    Ok(()) => {
+                        let next = setup.borrow().clone();
+                        let differs = next.setup != published.setup
+                            || next.soloist != published.soloist
+                            || next.soloist_command != published.soloist_command;
+                        if next.ready && differs {
+                            let msg = AgentMsg::Setup {
+                                setup: next.setup.clone(),
+                                soloist: next.soloist,
+                                soloist_command: next.soloist_command.clone(),
+                            };
+                            ws.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                            published = next;
+                        }
+                    }
+                }
             }
             frame = ws.next() => {
                 match frame {
