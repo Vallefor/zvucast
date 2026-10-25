@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Mutex};
-use zproto::{AgentMsg, BranchChannelMap, ChannelMap, CtlMsg, Endpoint, Role, SecretString, VirtualZone, ZoneEndpoints};
+use zproto::{
+    AgentMsg, BranchChannelMap, ChannelMap, CtlMsg, Endpoint, Role, SecretString, SetupIssue, SoloistState,
+    VirtualZone, ZoneEndpoints,
+};
 
 use crate::agent::successor_marker_path;
 use crate::discovery::{self, CONTROLLER_PORT, DISCOVERY_PORT};
@@ -398,6 +401,38 @@ struct NodeApi {
     spotify: bool,
     /// Галочка «Включить Sendspin».
     sendspin: bool,
+    /// Сводка установки. `null` — агент отчёт не присылал.
+    setup: Option<Vec<SetupIssue>>,
+}
+
+/// Сводка для `GET /api/nodes`. Без отчёта агента — `None`, даже если Spotify включён.
+/// Строка Soloist дописывается только при включённом Spotify и сбое бинарника.
+pub(crate) fn merge_setup(
+    reported: bool,
+    mut issues: Vec<SetupIssue>,
+    soloist: SoloistState,
+    soloist_command: &str,
+    spotify: bool,
+) -> Option<Vec<SetupIssue>> {
+    if !reported {
+        return None;
+    }
+    if spotify {
+        let detail = match soloist {
+            SoloistState::Missing => Some("бинарника нет"),
+            SoloistState::Expired => Some("soloist --version завершился с кодом 10"),
+            SoloistState::Failed => Some("soloist --version не ответил"),
+            SoloistState::Ok | SoloistState::Unknown => None,
+        };
+        if let Some(detail) = detail {
+            issues.push(SetupIssue {
+                id: "soloist".into(),
+                command: soloist_command.to_string(),
+                detail: detail.into(),
+            });
+        }
+    }
+    Some(issues)
 }
 
 async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
@@ -420,6 +455,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 reg.playback_device_of(&v.node_id),
                 v.roles.contains(&Role::Rx),
                 reg.supports_virtual_output(&v.node_id),
+                reg.setup_of(&v.node_id),
             )
         })
         .collect();
@@ -430,7 +466,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
     let apis = views
         .into_iter()
         .zip(discovered)
-        .map(|(node, (_, found, cap, is_tx, outs, play, is_rx, supports))| {
+        .map(|(node, (_, found, cap, is_tx, outs, play, is_rx, supports, (reported, issues, soloist, command)))| {
             let meta = state.nodes.get(&node.node_id);
             let dscp = meta.and_then(|m| m.dscp).unwrap_or(global);
             let prefs = meta.map(|m| m.inputs.as_slice()).unwrap_or(&[]);
@@ -459,6 +495,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
             let soloist_key = meta.and_then(|m| node_soloist_key_raw(m.soloist_key.as_deref()));
             let spotify = meta.is_some_and(|m| m.spotify);
             let sendspin = meta.is_some_and(|m| m.sendspin);
+            let setup = merge_setup(reported, issues, soloist, &command, spotify);
             NodeApi {
                 node,
                 dscp,
@@ -469,6 +506,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 soloist_key,
                 spotify,
                 sendspin,
+                setup,
             }
         })
         .collect();
@@ -2237,16 +2275,17 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
             }
         }
     };
-    let _ = (setup, soloist, soloist_command);
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<CtlMsg>(16);
     // Проба для финального mark_offline: после re-hello канал в реестре
     // заменён, и stale-хендлер не должен гасить уже живой узел.
     let my_tx = cmd_tx.clone();
-    st.reg
-        .lock()
-        .await
-        .hello(&node_id, &name, roles.clone(), version.clone(), target, capture_device.clone(), playback_device.clone(), ip, cmd_tx);
+    {
+        let mut reg = st.reg.lock().await;
+        reg.hello(&node_id, &name, roles.clone(), version.clone(), target, capture_device.clone(), playback_device.clone(), ip, cmd_tx);
+        let reported = setup.is_some();
+        reg.set_setup(&node_id, reported, setup.unwrap_or_default(), soloist, soloist_command);
+    }
     clear_updating_if_release(&st, &node_id, &version).await;
     let reported = if inputs.is_empty() && roles.contains(&Role::Tx) {
         crate::inputs::fallback_inputs(capture_device.as_deref())
@@ -2331,7 +2370,9 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<AgentMsg>(&text) {
                     Ok(AgentMsg::Telemetry(t)) => st.reg.lock().await.telemetry(&node_id, t),
-                    Ok(AgentMsg::Setup { .. }) => {}
+                    Ok(AgentMsg::Setup { setup, soloist, soloist_command }) => {
+                        st.reg.lock().await.set_setup(&node_id, true, setup, soloist, soloist_command);
+                    }
                     Ok(AgentMsg::Event { kind, detail }) => {
                         record_node_event(&st, &node_id, kind, detail).await;
                     }
@@ -2378,6 +2419,28 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zproto::{SetupIssue, SoloistState};
+
+    #[test]
+    fn spotify_appends_soloist_only_when_the_agent_reported() {
+        let local = vec![SetupIssue { id: "pipewire".into(), command: "apt".into(), detail: String::new() }];
+        let merged = merge_setup(true, local.clone(), SoloistState::Missing, "curl soloist", true).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].id, "soloist");
+        assert_eq!(merged[1].detail, "бинарника нет");
+        assert_eq!(merged[1].command, "curl soloist");
+
+        let expired = merge_setup(true, vec![], SoloistState::Expired, "curl soloist", true).unwrap();
+        assert_eq!(expired[0].detail, "soloist --version завершился с кодом 10");
+        let failed = merge_setup(true, vec![], SoloistState::Failed, "", true).unwrap();
+        assert_eq!(failed[0].detail, "soloist --version не ответил");
+        assert_eq!(failed[0].command, "");
+
+        assert!(merge_setup(true, local.clone(), SoloistState::Ok, "curl soloist", true).unwrap().iter().all(|i| i.id != "soloist"));
+        assert!(merge_setup(true, vec![], SoloistState::Unknown, "", true).unwrap().is_empty());
+        assert!(merge_setup(true, local.clone(), SoloistState::Missing, "curl soloist", false).unwrap().iter().all(|i| i.id != "soloist"));
+        assert!(merge_setup(false, local, SoloistState::Missing, "curl soloist", true).is_none());
+    }
 
     #[test]
     fn app_builds_router() {

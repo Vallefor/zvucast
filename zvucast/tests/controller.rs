@@ -184,6 +184,31 @@ impl MockAgent {
         Self { ws }
     }
 
+    /// Как `hello_on`, но Soloist не установлен: строка попадает в сводку,
+    /// только когда у узла включён Spotify.
+    async fn hello_soloist(mut ws: Ws, node_id: &str, name: &str, roles: Vec<Role>) -> Self {
+        let hello = AgentMsg::Hello {
+            node_id: node_id.into(),
+            name: name.into(),
+            roles: roles.clone(),
+            version: "0.1.0".into(),
+            target: String::new(),
+            capture_device: roles.contains(&Role::Tx).then(|| "test".to_string()),
+            playback_device: roles.contains(&Role::Rx).then(|| "test".to_string()),
+            inputs: vec![],
+            outputs: vec![],
+            supports_virtual_output: false,
+            link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Missing,
+            soloist_command: "curl soloist".into(),
+        };
+        ws.send(Message::Text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+        Self { ws }
+    }
+
     async fn connect_virtual(port: u16) -> Self {
         Self::connect_virtual_named(port, "pc").await
     }
@@ -1959,6 +1984,69 @@ async fn spotify_checkbox_off_does_not_start_soloist_even_with_a_key() {
     let pc_json = nodes.as_array().unwrap().iter().find(|n| n["name"] == "pc").unwrap();
     assert_eq!(pc_json["soloist_key"], "spot-key");
     assert_eq!(pc_json["spotify"], false);
+}
+
+/// Hello без ключей setup, soloist и soloist_command: в сводке узла setup — JSON null.
+#[tokio::test]
+async fn old_hello_has_null_setup() {
+    let path = temp_state_path("old-hello-setup");
+    let port = serve(AppState::with_state(&path)).await;
+    let hello = AgentMsg::Hello {
+        node_id: "pc".into(),
+        name: "pc".into(),
+        roles: vec![Role::Rx],
+        version: "0.1.0".into(),
+        target: String::new(),
+        capture_device: None,
+        playback_device: Some("test".into()),
+        inputs: vec![],
+        outputs: vec![],
+        supports_virtual_output: false,
+        link: None,
+        setup: Some(vec![]),
+        soloist: SoloistState::Unknown,
+        soloist_command: String::new(),
+    };
+    let mut raw = serde_json::to_value(&hello).unwrap();
+    let obj = raw.as_object_mut().unwrap();
+    obj.remove("setup");
+    obj.remove("soloist");
+    obj.remove("soloist_command");
+    let mut ws = open_ws(port, "127.0.0.1").await;
+    ws.send(Message::Text(raw.to_string())).await.unwrap();
+    let mut pc = MockAgent { ws };
+    assert_eq!(
+        pc.recv_raw_within(2).await,
+        CtlMsg::SetPlaybackTarget { device_key: Some("test".into()) }
+    );
+
+    let (code, body) = http(port, "GET", "/api/nodes").await;
+    assert_eq!(code, 200, "{body}");
+    let nodes: Value = serde_json::from_str(&body).unwrap();
+    let pc_json = node(&nodes, "pc");
+    assert_eq!(pc_json.get("setup"), Some(&Value::Null), "{pc_json}");
+}
+
+#[tokio::test]
+async fn spotify_appends_soloist_issue_on_the_node_json() {
+    let path = temp_state_path("spotify-setup");
+    let port = serve(AppState::with_state(&path)).await;
+    let mut pc = MockAgent::hello_soloist(open_ws(port, "127.0.0.1").await, "pc", "pc", vec![Role::Rx]).await;
+    assert_eq!(
+        pc.recv_raw_within(2).await,
+        CtlMsg::SetPlaybackTarget { device_key: Some("test".into()) }
+    );
+
+    let (status, patch_body) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":true}"#).await;
+    assert_eq!(status, 200, "{patch_body}");
+
+    let (code, body) = http(port, "GET", "/api/nodes").await;
+    assert_eq!(code, 200, "{body}");
+    let nodes: Value = serde_json::from_str(&body).unwrap();
+    let setup = node(&nodes, "pc")["setup"].as_array().expect("setup — массив");
+    let soloist = setup.iter().find(|i| i["id"] == "soloist").expect("нет строки soloist");
+    assert_eq!(soloist["detail"], "бинарника нет");
+    assert_eq!(soloist["command"], "curl soloist");
 }
 
 #[tokio::test]
