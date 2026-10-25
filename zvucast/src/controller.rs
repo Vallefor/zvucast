@@ -1602,6 +1602,7 @@ async fn patch_node(
         changed = true;
     }
     let patched_inputs = b.inputs.is_some();
+    let patched_outputs = b.outputs.is_some();
     if let Some(patches) = b.inputs {
         apply_chan_patches(&mut meta.inputs, patches);
         changed = true;
@@ -1627,6 +1628,7 @@ async fn patch_node(
         changed = true;
     }
     let prefs = meta.inputs.clone();
+    let output_prefs = meta.outputs.clone();
     if changed {
         st.update_state(|s| {
             s.nodes.insert(node_id.clone(), meta);
@@ -1666,6 +1668,9 @@ async fn patch_node(
         }
         if patched_inputs {
             push_capture_target(&mut reg, &node_id, &prefs);
+        }
+        if patched_outputs {
+            push_playback_target(&mut reg, &node_id, &output_prefs);
         }
     }
     let reg = st.reg.lock().await;
@@ -2144,13 +2149,19 @@ async fn push_virtual_zones(st: &AppState, node_id: &str) {
 }
 
 fn push_capture_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref]) {
-    if !reg.supports_virtual_output(node_id) {
-        return;
-    }
     let found = reg.capture_inputs(node_id);
     let views = crate::inputs::merge_inputs(&found, prefs);
     let device_key = crate::inputs::capture_target(&views);
     let _ = reg.send_cmd(node_id, CtlMsg::SetCaptureTarget { device_key });
+    let zones: Vec<String> = crate::inputs::muted_zone_ids(&views).into_iter().collect();
+    let _ = reg.send_cmd(node_id, CtlMsg::SetMutedZones { zones });
+}
+
+fn push_playback_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref]) {
+    let found = reg.playback_outputs(node_id);
+    let views = crate::inputs::merge_inputs(&found, prefs);
+    let device_key = crate::inputs::playback_target(&views);
+    let _ = reg.send_cmd(node_id, CtlMsg::SetPlaybackTarget { device_key });
 }
 
 async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
@@ -2256,6 +2267,23 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
         let _ = reg.send_cmd(&node_id, zones_cmd);
         let _ = reg.send_cmd(&node_id, soloist);
         let _ = reg.send_cmd(&node_id, sendspin);
+    } else if roles.contains(&Role::Tx) {
+        let prefs = {
+            let store = st.store.lock().await;
+            store
+                .state()
+                .nodes
+                .get(&node_id)
+                .map(|n| n.inputs.clone())
+                .unwrap_or_default()
+        };
+        let mut reg = st.reg.lock().await;
+        push_capture_target(&mut reg, &node_id, &prefs);
+    }
+
+    if roles.contains(&Role::Rx) {
+        let mut reg = st.reg.lock().await;
+        push_playback_target(&mut reg, &node_id, &owned.1);
     }
 
     loop {

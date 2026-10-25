@@ -227,13 +227,32 @@ impl MockAgent {
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }
 
-    /// Следующий текстовый кадр, распарсенный как CtlMsg (ping/pong пропускаем).
-    async fn recv_ctl(&mut self) -> CtlMsg {
+    /// Следующий текстовый кадр, включая цели УИ.
+    async fn recv_text_ctl(&mut self) -> CtlMsg {
         loop {
             if let Message::Text(t) = self.ws.next().await.unwrap().unwrap() {
                 return serde_json::from_str(&t).unwrap();
             }
         }
+    }
+
+    /// Следующая команда сценария. Цели УИ уходят на hello сами и здесь
+    /// пропускаются: их порядок проверяет `ui_targets_follow_hello_and_prefs`.
+    async fn recv_ctl(&mut self) -> CtlMsg {
+        loop {
+            match self.recv_text_ctl().await {
+                CtlMsg::SetPlaybackTarget { .. }
+                | CtlMsg::SetMutedZones { .. }
+                | CtlMsg::SetCaptureTarget { .. } => continue,
+                msg => return msg,
+            }
+        }
+    }
+
+    async fn recv_raw_within(&mut self, secs: u64) -> CtlMsg {
+        tokio::time::timeout(Duration::from_secs(secs), self.recv_text_ctl())
+            .await
+            .expect("не дождались CtlMsg")
     }
 
     /// recv_ctl с таймаутом: пушер должен успеть за ~2 с дебаунса; 5 с —
@@ -1740,7 +1759,7 @@ async fn virtual_output_is_stored_and_pushed_only_to_a_capable_node() {
 
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
     assert_eq!(
-        pc.recv_ctl_within(2).await,
+        pc.recv_raw_within(2).await,
         CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
@@ -1780,7 +1799,7 @@ async fn virtual_output_is_stored_and_pushed_only_to_a_capable_node() {
     let inputs = AgentMsg::Inputs { inputs: reported };
     pc.ws.send(Message::Text(serde_json::to_string(&inputs).unwrap())).await.unwrap();
     assert_eq!(
-        pc.recv_ctl_within(2).await,
+        pc.recv_raw_within(2).await,
         CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
     );
     let (code, nodes) = http(port, "GET", "/api/nodes").await;
@@ -1838,7 +1857,7 @@ async fn soloist_key_stays_on_the_transmitter_that_has_it() {
     let port = serve(AppState::with_state(&path)).await;
     let mut pc = MockAgent::connect_virtual(port).await;
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
+    assert_eq!(pc.recv_raw_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
@@ -1853,7 +1872,7 @@ async fn soloist_key_stays_on_the_transmitter_that_has_it() {
 
     let mut other = MockAgent::connect_virtual_named(port, "room").await;
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
-    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
+    assert_eq!(other.recv_raw_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
@@ -1892,7 +1911,7 @@ async fn spotify_checkbox_off_does_not_start_soloist_even_with_a_key() {
     let port = serve(AppState::with_state(&path)).await;
     let mut pc = MockAgent::connect_virtual(port).await;
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
+    assert_eq!(pc.recv_raw_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
@@ -1936,7 +1955,7 @@ async fn sendspin_checkbox_off_does_not_start_clients() {
     let port = serve(AppState::with_state(&path)).await;
     let mut pc = MockAgent::connect_virtual(port).await;
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
+    assert_eq!(pc.recv_raw_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
@@ -1976,7 +1995,7 @@ async fn sendspin_follows_zones_when_enabled() {
     let port = serve(AppState::with_state(&path)).await;
     let mut pc = MockAgent::connect_virtual(port).await;
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
+    assert_eq!(pc.recv_raw_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
@@ -2003,7 +2022,7 @@ async fn sendspin_follows_zones_when_enabled() {
 
     let mut other = MockAgent::connect_virtual_named(port, "room").await;
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
-    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
+    assert_eq!(other.recv_raw_within(2).await, CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
@@ -2046,4 +2065,114 @@ async fn a_node_without_pipewire_is_not_offered_sendspin() {
             Err(_) => break,
         }
     }
+}
+
+async fn recv_raw(agent: &mut MockAgent) -> CtlMsg {
+    tokio::time::timeout(Duration::from_secs(2), agent.recv_text_ctl())
+        .await
+        .expect("не дождались CtlMsg")
+}
+
+/// Hello и смена prefs шлют цель захвата, заглушённые зоны и цель выхода.
+#[tokio::test]
+async fn ui_targets_follow_hello_and_prefs() {
+    let path = temp_state_path("ui-targets");
+    let port = serve(AppState::with_state(&path)).await;
+
+    let mut spk = MockAgent::connect(port, "spk").await;
+    assert_eq!(
+        recv_raw(&mut spk).await,
+        CtlMsg::SetPlaybackTarget { device_key: Some("test".into()) }
+    );
+
+    let mut ws = open_ws(port, "127.0.0.1").await;
+    let outs = ["aaa", "bbb"].into_iter().flat_map(|key| {
+        (0..2u16).map(move |index| zproto::CaptureChan {
+            id: format!("{key}:{index}"),
+            device_key: key.into(),
+            device_name: key.into(),
+            index,
+        })
+    });
+    let hello = AgentMsg::Hello {
+        node_id: "col".into(),
+        name: "col".into(),
+        roles: vec![Role::Rx],
+        version: "0.1.0".into(),
+        target: String::new(),
+        capture_device: None,
+        playback_device: None,
+        inputs: vec![],
+        outputs: outs.collect(),
+        supports_virtual_output: false,
+        link: None,
+    };
+    ws.send(Message::Text(serde_json::to_string(&hello).unwrap())).await.unwrap();
+    let mut col = MockAgent { ws };
+    assert_eq!(
+        recv_raw(&mut col).await,
+        CtlMsg::SetPlaybackTarget { device_key: Some("aaa".into()) }
+    );
+    let (status, _) = http_body(
+        port,
+        "PATCH",
+        "/api/nodes/col",
+        r#"{"outputs":[{"id":"aaa:0","enabled":false},{"id":"aaa:1","enabled":false}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        recv_raw(&mut col).await,
+        CtlMsg::SetPlaybackTarget { device_key: Some("bbb".into()) }
+    );
+
+    let mut pc = MockAgent::connect_virtual(port).await;
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetVirtualOutput { enabled: false });
+    assert_eq!(
+        recv_raw(&mut pc).await,
+        CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
+    );
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetMutedZones { zones: vec![] });
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetSendspin { zones: vec![] });
+
+    let mut reported = vec![zproto::CaptureChan {
+        id: "hw:0".into(),
+        device_key: "plughw:CARD=Generic_1".into(),
+        device_name: "HD-Audio Generic".into(),
+        index: 0,
+    }];
+    for index in 0..2u16 {
+        reported.push(zproto::CaptureChan {
+            id: format!("zvucast-hall:{index}"),
+            device_key: "zvucast-hall".into(),
+            device_name: "Zvucast: Зал".into(),
+            index,
+        });
+    }
+    let inputs = AgentMsg::Inputs { inputs: reported };
+    pc.ws.send(Message::Text(serde_json::to_string(&inputs).unwrap())).await.unwrap();
+    assert_eq!(
+        recv_raw(&mut pc).await,
+        CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
+    );
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetMutedZones { zones: vec![] });
+
+    let (status, _) = http_body(
+        port,
+        "PATCH",
+        "/api/nodes/pc",
+        r#"{"inputs":[{"id":"zvucast-hall:0","enabled":false},{"id":"zvucast-hall:1","enabled":false}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        recv_raw(&mut pc).await,
+        CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
+    );
+    assert_eq!(
+        recv_raw(&mut pc).await,
+        CtlMsg::SetMutedZones { zones: vec!["hall".into()] }
+    );
 }

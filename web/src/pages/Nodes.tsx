@@ -252,7 +252,7 @@ function NodeSettings({ node, onClose }: { node: NodeView; onClose: () => void }
             )}
             <ChanEditor
               title="Входы"
-              hint="Отмеченные каналы можно выбрать в карте зоны. В стереопоток входят левый и правый каналы устройства захвата."
+              hint="Отмеченные каналы входят в стереопоток. Виртуальный выход — такой же вход: он подмешивается в зону и раскладывается по выходам колонки в карте зоны."
               empty="Агент ещё не прислал устройства захвата."
               rows={rows}
               onPatch={patchRow}
@@ -262,7 +262,7 @@ function NodeSettings({ node, onClose }: { node: NodeView; onClose: () => void }
         {isRx && (
           <ChanEditor
             title="Выходы"
-            hint="Отмеченные каналы появляются в карте зоны как выходы этой колонки. В стереопоток входят левый и правый каналы устройства воспроизведения."
+            hint="Отмеченные каналы — выходы колонки в карте зоны. Звук играет на устройство этих каналов."
             empty="Агент ещё не прислал устройства воспроизведения."
             rows={outRows}
             onPatch={patchOut}
@@ -294,7 +294,6 @@ function facts(n: NodeView) {
     ['Очередь, мс', queue],
     ['PTP, мкс', ptp],
     ['Uptime', tm ? fmtUptime(tm.uptime_s) : '—'],
-    ['Устройства', `${n.capture_device ?? '—'} → ${n.playback_device ?? '—'}`],
   ] as const
 }
 

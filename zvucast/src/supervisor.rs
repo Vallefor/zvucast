@@ -317,10 +317,8 @@ impl Runner {
         let mut runner = Runner::from_pipeline_with_card(pipeline, None);
         if let Some(target) = target {
             let src = runner.pipeline.by_name("cap").context("tx pw: нет appsrc cap")?;
-            runner.captures.push(MonitorCapture::start(
-                src,
-                crate::pipeline::capture_node_name(target),
-            )?);
+            let node = crate::pipeline::capture_node_name(target);
+            runner.captures.push(MonitorCapture::start(src, &node)?);
         }
         for zone in zones {
             let Some(node) = zone.source.as_deref() else { continue };

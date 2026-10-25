@@ -261,8 +261,10 @@ async fn connect_once(
         roles: roles.to_vec(),
         version: version.to_string(),
         target: crate::update::baked_target().to_string(),
-        capture_device: cfg.capture_device.clone(),
-        playback_device: cfg.playback_device.clone(),
+        // Пока команда не задала цель, Hello несёт null. Это открытое устройство,
+        // не ключ из конфига: capture_device и playback_device оттуда больше не читаются.
+        capture_device: None,
+        playback_device: None,
         inputs: inputs.to_vec(),
         outputs: outputs.to_vec(),
         supports_virtual_output,

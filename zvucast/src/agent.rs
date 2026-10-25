@@ -142,7 +142,7 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
         let found = crate::inputs::discover_capture_channels();
         tracing::info!(n = found.len(), "устройства захвата");
         if found.is_empty() {
-            crate::inputs::fallback_inputs(cfg.capture_device.as_deref())
+            crate::inputs::fallback_inputs(None)
         } else {
             found
         }
@@ -153,7 +153,7 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
         let found = crate::inputs::discover_playback_channels();
         tracing::info!(n = found.len(), "устройства воспроизведения");
         if found.is_empty() {
-            crate::inputs::fallback_outputs(cfg.playback_device.as_deref())
+            crate::inputs::fallback_outputs(None)
         } else {
             found
         }
@@ -505,16 +505,42 @@ struct Transport {
     dscp: u8,
 }
 
+/// Источник зоны после оверлея. Mute и монитор, который уже открыла голова,
+/// дают None: второй pw-record того же узла не нужен.
+fn effective_zone_source(
+    zone_id: &str,
+    linked: bool,
+    table: &crate::sendspin::ZoneTable,
+    muted: &BTreeSet<String>,
+    capture_head: Option<&str>,
+) -> Option<String> {
+    if muted.contains(zone_id) {
+        return None;
+    }
+    match table.source(zone_id, linked) {
+        Some(src) if capture_head == Some(src.as_str()) => None,
+        other => other,
+    }
+}
+
 fn overlay_sources(
     zones: &[ZoneEndpoints],
     linked: &BTreeSet<String>,
     table: &crate::sendspin::ZoneTable,
+    muted: &BTreeSet<String>,
+    capture_head: Option<&str>,
 ) -> Vec<ZoneEndpoints> {
     zones
         .iter()
         .cloned()
         .map(|mut zone| {
-            zone.source = table.source(&zone.zone_id, linked.contains(&zone.zone_id));
+            zone.source = effective_zone_source(
+                &zone.zone_id,
+                linked.contains(&zone.zone_id),
+                table,
+                muted,
+                capture_head,
+            );
             zone
         })
         .collect()
@@ -524,13 +550,21 @@ fn zone_sources(
     zones: &[ZoneEndpoints],
     linked: &BTreeSet<String>,
     table: &crate::sendspin::ZoneTable,
+    muted: &BTreeSet<String>,
+    capture_head: Option<&str>,
 ) -> BTreeMap<String, Option<String>> {
     zones
         .iter()
         .map(|zone| {
             (
                 zone.zone_id.clone(),
-                table.source(&zone.zone_id, linked.contains(&zone.zone_id)),
+                effective_zone_source(
+                    &zone.zone_id,
+                    linked.contains(&zone.zone_id),
+                    table,
+                    muted,
+                    capture_head,
+                ),
             )
         })
         .collect()
@@ -637,6 +671,94 @@ fn handle_set_capture_target(
     drop_runner(&mut half.runner);
     half.gate.arm(&mut half.policy);
     SetCaptureTargetOutcome::Changed
+}
+
+/// Виртуальный sink целью воспроизведения не бывает: команда считается None.
+fn playback_device_key(device_key: Option<String>) -> Option<String> {
+    device_key.filter(|key| !crate::inputs::is_virtual_sink_name(key))
+}
+
+fn handle_set_playback_target(
+    current: &RefCell<Option<String>>,
+    device_key: Option<String>,
+    half: &mut RoleHalf,
+) -> SetCaptureTargetOutcome {
+    handle_set_capture_target(current, playback_device_key(device_key), half)
+}
+
+fn handle_set_muted_zones(
+    current: &RefCell<BTreeSet<String>>,
+    zones: Vec<String>,
+    half: &mut RoleHalf,
+) -> SetCaptureTargetOutcome {
+    let next: BTreeSet<String> = zones.into_iter().collect();
+    if *current.borrow() == next {
+        return SetCaptureTargetOutcome::Unchanged;
+    }
+    *current.borrow_mut() = next;
+    drop_runner(&mut half.runner);
+    half.gate.arm(&mut half.policy);
+    SetCaptureTargetOutcome::Changed
+}
+
+/// Чем открыть голову захвата. Строка ALSA — только alsasrc.
+/// На PipeWire такая строка и пустая цель оставляют голову тишиной.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TxOpen {
+    Alsa(String),
+    PipeWire(String),
+    Silence,
+    Missing,
+}
+
+/// Чем открыть выход. `PipeWire(None)` — запасной sink рабочего стола.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RxOpen {
+    Alsa(String),
+    PipeWire(Option<String>),
+    Missing,
+}
+
+fn tx_open(backend: crate::config::Backend, key: Option<&str>) -> TxOpen {
+    match backend {
+        crate::config::Backend::Alsa => match key {
+            Some(key) if crate::pipeline::configured_pipewire_node(key).is_none() => {
+                TxOpen::Alsa(key.to_string())
+            }
+            _ => TxOpen::Missing,
+        },
+        crate::config::Backend::PipeWire => {
+            match key.and_then(crate::pipeline::configured_pipewire_node) {
+                Some(node) => TxOpen::PipeWire(crate::pipeline::capture_node_name(node)),
+                None => TxOpen::Silence,
+            }
+        }
+    }
+}
+
+fn rx_open(backend: crate::config::Backend, key: Option<&str>) -> RxOpen {
+    let key = key.filter(|key| !crate::inputs::is_virtual_sink_name(key));
+    match backend {
+        crate::config::Backend::Alsa => match key {
+            Some(key) if crate::pipeline::configured_pipewire_node(key).is_none() => {
+                RxOpen::Alsa(key.to_string())
+            }
+            _ => RxOpen::Missing,
+        },
+        crate::config::Backend::PipeWire => RxOpen::PipeWire(
+            key.and_then(crate::pipeline::configured_pipewire_node)
+                .map(str::to_string),
+        ),
+    }
+}
+
+/// Имя, которое голова уже открыла. Тишина и отсутствующая цель — None:
+/// монитор зоны с ним не совпадает и в оверлее остаётся.
+fn capture_head_name(backend: crate::config::Backend, key: Option<&str>) -> Option<String> {
+    match tx_open(backend, key) {
+        TxOpen::Alsa(name) | TxOpen::PipeWire(name) => Some(name),
+        TxOpen::Silence | TxOpen::Missing => None,
+    }
 }
 
 /// Результат обработки SetChannelMap.
@@ -875,8 +997,7 @@ fn handle_sup_event(
 /// Разрешение ролей узла. Явный список из конфига: дедуп, канонический
 /// порядок [Tx, Rx]; устройства не требуются. None — авто-детект probe'ом.
 /// playback_backend=pipewire пробует tx и rx без имени устройства (в probe
-/// уходит плейсхолдер, поле устройства не читается). alsa открывает заданные
-/// устройства, а если открывать нечего — ошибка: roles надо задать явно.
+/// уходит плейсхолдер). alsa открывать нечего — ошибка: roles надо задать явно.
 /// Пустой итог — Err (агенту нечего делать).
 pub(crate) fn resolve_roles(
     cfg: &AgentConfig,
@@ -912,25 +1033,8 @@ pub(crate) fn resolve_roles(
                         );
                     }
                 }
-            } else if cfg.capture_device.is_none() && cfg.playback_device.is_none() {
-                anyhow::bail!("нечего открывать для авто-детекта — задай roles явно");
             } else {
-                if let Some(dev) = &cfg.capture_device {
-                    if probe(dev, Role::Tx) {
-                        roles.push(Role::Tx);
-                    } else {
-                        tracing::warn!("авто-детект: capture {dev} недоступен — роль tx пропущена");
-                    }
-                }
-                if let Some(dev) = &cfg.playback_device {
-                    if probe(dev, Role::Rx) {
-                        roles.push(Role::Rx);
-                    } else {
-                        tracing::warn!(
-                            "авто-детект: playback {dev} недоступен — роль rx пропущена"
-                        );
-                    }
-                }
+                anyhow::bail!("нечего открывать для авто-детекта — задай roles явно");
             }
             let roles = canonical(roles);
             anyhow::ensure!(
@@ -1016,6 +1120,8 @@ fn gst_domain(
     // Транспортное состояние (unicast-эндпоинты + dscp) — только tx-половина.
     let transport = RefCell::new(Transport::default());
     let capture_target: RefCell<Option<String>> = RefCell::new(None);
+    let playback_target: RefCell<Option<String>> = RefCell::new(None);
+    let muted_zones: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
     let mut cables = crate::virtual_output::Cables::default();
     let virtual_zones: RefCell<Vec<VirtualZone>> = RefCell::new(Vec::new());
     let linked: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
@@ -1064,25 +1170,22 @@ fn gst_domain(
             let silent = link.is_none();
             match cfg.playback_backend {
                 crate::config::Backend::Alsa => {
-                    let device = cfg
-                        .capture_device
-                        .as_deref()
-                        .context("tx: capture_device не задан")?;
+                    let key = capture_target.borrow().clone();
+                    let TxOpen::Alsa(device) = tx_open(cfg.playback_backend, key.as_deref()) else {
+                        anyhow::bail!("tx: цель захвата не задана");
+                    };
                     let zones: &[ZoneEndpoints] = if silent { &[] } else { &t.zones };
                     let mut bind = pipeline_bind(&link);
-                    Runner::new_tx(&cfg.pipeline, device, zones, t.dscp, bind.as_mut())?
+                    Runner::new_tx(&cfg.pipeline, &device, zones, t.dscp, bind.as_mut())?
                 }
                 // Тот же бэкенд, что у rx: PipeWire не отдаёт ALSA захвату от root.
+                // Строка ALSA целью не открывается: голова остаётся тишиной.
                 crate::config::Backend::PipeWire => {
                     pipewire_socket_ready()?;
-                    let target = {
-                        let chosen = capture_target.borrow().clone();
-                        chosen.or_else(|| {
-                            cfg.capture_device
-                                .as_deref()
-                                .and_then(crate::pipeline::configured_pipewire_node)
-                                .map(str::to_string)
-                        })
+                    let key = capture_target.borrow().clone();
+                    let target = match tx_open(cfg.playback_backend, key.as_deref()) {
+                        TxOpen::PipeWire(node) => Some(node),
+                        _ => None,
                     };
                     let mut bind = pipeline_bind(&link);
                     if silent {
@@ -1097,8 +1200,21 @@ fn gst_domain(
                     } else {
                         let linked_now = linked.borrow();
                         let table_now = table.borrow();
-                        let zones = overlay_sources(&t.zones, &linked_now, &table_now);
-                        let sources = zone_sources(&t.zones, &linked_now, &table_now);
+                        let muted_now = muted_zones.borrow();
+                        let zones = overlay_sources(
+                            &t.zones,
+                            &linked_now,
+                            &table_now,
+                            &muted_now,
+                            target.as_deref(),
+                        );
+                        let sources = zone_sources(
+                            &t.zones,
+                            &linked_now,
+                            &table_now,
+                            &muted_now,
+                            target.as_deref(),
+                        );
                         let runner = Runner::new_tx_pw(
                             &cfg.pipeline,
                             &zones,
@@ -1131,13 +1247,13 @@ fn gst_domain(
         let mut bind = pipeline_bind(&link);
         let r = match cfg.playback_backend {
             crate::config::Backend::Alsa => {
-                let device = cfg
-                    .playback_device
-                    .as_deref()
-                    .context("rx: playback_device не задан")?;
+                let key = playback_target.borrow().clone();
+                let RxOpen::Alsa(device) = rx_open(cfg.playback_backend, key.as_deref()) else {
+                    anyhow::bail!("rx: цель воспроизведения не задана");
+                };
                 Runner::new_rx(
                     &pipeline,
-                    device,
+                    &device,
                     &chan_map.borrow(),
                     ports,
                     &branches,
@@ -1146,14 +1262,16 @@ fn gst_domain(
             }
             crate::config::Backend::PipeWire => {
                 pipewire_socket_ready()?;
-                let sink = cfg
-                    .playback_device
-                    .as_deref()
-                    .and_then(crate::pipeline::configured_pipewire_node);
+                let key = playback_target.borrow().clone();
+                // None — pw-play берёт запасной sink. Выбранный узел играем только в него.
+                let sink = match rx_open(cfg.playback_backend, key.as_deref()) {
+                    RxOpen::PipeWire(node) => node,
+                    _ => None,
+                };
                 Runner::new_rx_pw(
                     &pipeline,
                     &chan_map.borrow(),
-                    sink,
+                    sink.as_deref(),
                     ports,
                     &branches,
                     bind.as_mut(),
@@ -1387,6 +1505,26 @@ fn gst_domain(
                     }
                 }
             },
+            Ok(CtlMsg::SetPlaybackTarget { device_key }) => match rx_half.as_mut() {
+                None => tracing::debug!("SetPlaybackTarget: нет rx — игнорируем"),
+                Some(h) => {
+                    if handle_set_playback_target(&playback_target, device_key, h)
+                        == SetCaptureTargetOutcome::Changed
+                    {
+                        tracing::info!("rx: цель воспроизведения изменилась, пересборка");
+                    }
+                }
+            },
+            Ok(CtlMsg::SetMutedZones { zones }) => match tx_half.as_mut() {
+                None => tracing::debug!("SetMutedZones: нет tx — игнорируем"),
+                Some(h) => {
+                    if handle_set_muted_zones(&muted_zones, zones, h)
+                        == SetCaptureTargetOutcome::Changed
+                    {
+                        tracing::info!("tx: заглушённые зоны изменились, пересборка");
+                    }
+                }
+            },
             Ok(CtlMsg::ApplyUpdate { .. }) => {
                 // Команду забирает ws-домен и запускает скрипт вне этого cgroup.
                 tracing::warn!("ApplyUpdate в gst-домене — игнорируем")
@@ -1443,7 +1581,16 @@ fn gst_domain(
                     let t = transport.borrow();
                     let linked_now = linked.borrow();
                     let table_now = table.borrow();
-                    let desired = zone_sources(&t.zones, &linked_now, &table_now);
+                    let key = capture_target.borrow().clone();
+                    let head = capture_head_name(cfg.playback_backend, key.as_deref());
+                    let muted_now = muted_zones.borrow();
+                    let desired = zone_sources(
+                        &t.zones,
+                        &linked_now,
+                        &table_now,
+                        &muted_now,
+                        head.as_deref(),
+                    );
                     let changed = sources_changed(&previous_sources, &desired);
                     previous_sources = desired;
                     changed
@@ -1453,7 +1600,16 @@ fn gst_domain(
                         let t = transport.borrow();
                         let linked_now = linked.borrow();
                         let table_now = table.borrow();
-                        overlay_sources(&t.zones, &linked_now, &table_now)
+                        let key = capture_target.borrow().clone();
+                        let head = capture_head_name(cfg.playback_backend, key.as_deref());
+                        let muted_now = muted_zones.borrow();
+                        overlay_sources(
+                            &t.zones,
+                            &linked_now,
+                            &table_now,
+                            &muted_now,
+                            head.as_deref(),
+                        )
                     };
                     // Пересборка заново открывает RTP. Колонка тогда теряет
                     // остальные источники, а микрофон выпадает из потока.
@@ -1731,11 +1887,90 @@ mod tests {
         }]);
         table.on_wire("hall", crate::sendspin::Wire::StreamStart);
         let linked = BTreeSet::new();
-        let out = overlay_sources(&zones, &linked, &table);
+        let out = overlay_sources(&zones, &linked, &table, &BTreeSet::new(), None);
         assert_eq!(
             out[0].source.as_deref(),
             Some("zvucast-sendspin-hall-monitor")
         );
+    }
+
+    #[test]
+    fn overlay_drops_muted_zone_and_the_head_monitor() {
+        let zones = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![],
+            source: Some("zvucast-hall-monitor".into()),
+        }];
+        let linked = BTreeSet::from(["hall".to_string()]);
+        let table = crate::sendspin::ZoneTable::new();
+        let muted = BTreeSet::from(["hall".to_string()]);
+        let out = overlay_sources(&zones, &linked, &table, &muted, None);
+        assert_eq!(out[0].source, None, "mute hall гасит монитор зоны");
+
+        let out = overlay_sources(
+            &zones,
+            &linked,
+            &table,
+            &BTreeSet::new(),
+            Some("zvucast-hall-monitor"),
+        );
+        assert_eq!(out[0].source, None, "голова уже открыла этот монитор");
+
+        let mut foreign = crate::sendspin::ZoneTable::new();
+        foreign.sync(&[zproto::VirtualZone {
+            zone_id: "hall".into(),
+            name: "Зал".into(),
+        }]);
+        foreign.on_wire("hall", crate::sendspin::Wire::StreamStart);
+        let out = overlay_sources(
+            &zones,
+            &BTreeSet::new(),
+            &foreign,
+            &BTreeSet::new(),
+            Some("alsa_input.usb-mic"),
+        );
+        assert_eq!(
+            out[0].source.as_deref(),
+            Some("zvucast-sendspin-hall-monitor"),
+            "чужой источник при голове line-in остаётся"
+        );
+    }
+
+    #[test]
+    fn open_plan_follows_the_backend_table() {
+        use crate::config::Backend;
+        let alsa = "plughw:CARD=Generic_1";
+        let node = "alsa_input.usb-mic";
+        let sink = "alsa_output.pci.analog-stereo";
+
+        assert_eq!(tx_open(Backend::Alsa, Some(alsa)), TxOpen::Alsa(alsa.into()));
+        assert_eq!(tx_open(Backend::Alsa, None), TxOpen::Missing);
+        assert_eq!(tx_open(Backend::Alsa, Some(node)), TxOpen::Missing);
+        assert_eq!(tx_open(Backend::PipeWire, Some(node)), TxOpen::PipeWire(node.into()));
+        assert_eq!(
+            tx_open(Backend::PipeWire, Some("zvucast")),
+            TxOpen::PipeWire("zvucast-monitor".into())
+        );
+        assert_eq!(
+            tx_open(Backend::PipeWire, Some("zvucast-hall")),
+            TxOpen::PipeWire("zvucast-hall-monitor".into())
+        );
+        assert_eq!(
+            tx_open(Backend::PipeWire, Some("zvucast-hall-monitor")),
+            TxOpen::PipeWire("zvucast-hall-monitor".into())
+        );
+        assert_eq!(tx_open(Backend::PipeWire, Some(alsa)), TxOpen::Silence);
+        assert_eq!(tx_open(Backend::PipeWire, None), TxOpen::Silence);
+
+        assert_eq!(rx_open(Backend::Alsa, Some(alsa)), RxOpen::Alsa(alsa.into()));
+        assert_eq!(rx_open(Backend::Alsa, None), RxOpen::Missing);
+        assert_eq!(rx_open(Backend::Alsa, Some("zvucast")), RxOpen::Missing);
+        assert_eq!(rx_open(Backend::Alsa, Some("zvucast-hall")), RxOpen::Missing);
+        assert_eq!(rx_open(Backend::PipeWire, Some(sink)), RxOpen::PipeWire(Some(sink.into())));
+        assert_eq!(rx_open(Backend::PipeWire, None), RxOpen::PipeWire(None));
+        assert_eq!(rx_open(Backend::PipeWire, Some(alsa)), RxOpen::PipeWire(None));
+        assert_eq!(rx_open(Backend::PipeWire, Some("zvucast")), RxOpen::PipeWire(None));
+        assert_eq!(rx_open(Backend::PipeWire, Some("zvucast-hall")), RxOpen::PipeWire(None));
     }
 
     #[test]
@@ -1762,8 +1997,6 @@ mod tests {
             id: None,
             roles: None,
             controller: "ws://127.0.0.1:9/ws".into(),
-            capture_device: Some("plughw:CARD=Cap".into()),
-            playback_device: Some("plughw:CARD=Play".into()),
             playback_backend: crate::config::Backend::Alsa,
             sync_interface: "end0".into(),
             ptp_priority: 128,
@@ -1773,14 +2006,18 @@ mod tests {
 
     #[test]
     fn resolve_roles_autodetect_uses_probe() {
+        // Alsa открывать нечего: удачный probe роли не добавляет.
         let cfg = cfg_for_mixed();
-        // probe «видит» только playback — поднимается только rx
+        let err = resolve_roles(&cfg, &|_, _| true).unwrap_err();
+        assert!(err.to_string().contains("roles"), "{err}");
+
+        // PipeWire: probe выбирает роли. Плейсхолдер не из конфига.
+        let mut cfg = cfg_for_mixed();
+        cfg.playback_backend = crate::config::Backend::PipeWire;
         let roles = resolve_roles(&cfg, &|_, role| role == Role::Rx).unwrap();
         assert_eq!(roles, vec![Role::Rx]);
-        // probe видит всё — обе роли, порядок канонический [Tx, Rx]
         let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
         assert_eq!(roles, vec![Role::Tx, Role::Rx]);
-        // probe не видит ничего — старт запрещён
         assert!(resolve_roles(&cfg, &|_, _| false).is_err());
     }
 
@@ -1788,14 +2025,12 @@ mod tests {
     fn resolve_roles_explicit_does_not_need_devices() {
         let mut cfg = cfg_for_mixed();
         cfg.roles = Some(vec![Role::Tx]);
-        cfg.capture_device = None;
         let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
         assert_eq!(roles, vec![Role::Tx]);
 
         let mut cfg = cfg_for_mixed();
         cfg.roles = Some(vec![Role::Rx]);
         cfg.playback_backend = crate::config::Backend::Alsa;
-        cfg.playback_device = None;
         let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
         assert_eq!(roles, vec![Role::Rx]);
 
@@ -1820,8 +2055,6 @@ mod tests {
     fn resolve_roles_alsa_without_devices_asks_for_roles() {
         let mut cfg = cfg_for_mixed();
         cfg.roles = None;
-        cfg.capture_device = None;
-        cfg.playback_device = None;
         cfg.playback_backend = crate::config::Backend::Alsa;
         let e = resolve_roles(&cfg, &|_, _| true).unwrap_err();
         assert!(
@@ -1834,7 +2067,6 @@ mod tests {
     fn resolve_roles_pipewire_skips_device_requirement() {
         let mut cfg = cfg_for_mixed();
         cfg.roles = Some(vec![Role::Rx]);
-        cfg.playback_device = None;
         cfg.playback_backend = crate::config::Backend::PipeWire;
         let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
         assert_eq!(roles, vec![Role::Rx]);
@@ -1844,8 +2076,6 @@ mod tests {
     fn resolve_roles_pipewire_autodetect_without_device() {
         let mut cfg = cfg_for_mixed();
         cfg.roles = None;
-        cfg.capture_device = None;
-        cfg.playback_device = None;
         cfg.playback_backend = crate::config::Backend::PipeWire;
         let roles = resolve_roles(&cfg, &|_, role| role == Role::Rx).unwrap();
         assert_eq!(roles, vec![Role::Rx]);
@@ -1854,8 +2084,6 @@ mod tests {
         let roles = resolve_roles(&cfg, &|_, _| true).unwrap();
         assert_eq!(roles, vec![Role::Tx, Role::Rx]);
 
-        cfg.capture_device = Some("plughw:CARD=Cap".into());
-        cfg.playback_device = Some("plughw:CARD=Play".into());
         let seen = std::cell::RefCell::new(Vec::new());
         let roles = resolve_roles(&cfg, &|dev, role| {
             seen.borrow_mut().push((dev.to_string(), role));
@@ -2709,5 +2937,54 @@ mod tests {
         );
         assert!(half.runner.is_none());
         assert_eq!(target.borrow().as_deref(), Some("zvucast"));
+    }
+
+    #[test]
+    fn playback_target_change_drops_the_runner_once() {
+        gstreamer::init().unwrap();
+        let target = RefCell::new(None);
+        let mut half = RoleHalf::new();
+        half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
+        assert_eq!(
+            handle_set_playback_target(&target, None, &mut half),
+            SetCaptureTargetOutcome::Unchanged
+        );
+        assert!(half.runner.is_some());
+        assert_eq!(
+            handle_set_playback_target(&target, Some("zvucast".into()), &mut half),
+            SetCaptureTargetOutcome::Unchanged,
+            "виртуальный sink целью не считается"
+        );
+        assert!(half.runner.is_some());
+        assert_eq!(target.borrow().as_deref(), None);
+
+        assert_eq!(
+            handle_set_playback_target(
+                &target,
+                Some("alsa_output.pci.analog-stereo".into()),
+                &mut half,
+            ),
+            SetCaptureTargetOutcome::Changed
+        );
+        assert!(half.runner.is_none());
+        assert_eq!(target.borrow().as_deref(), Some("alsa_output.pci.analog-stereo"));
+
+        half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
+        assert_eq!(
+            handle_set_playback_target(
+                &target,
+                Some("alsa_output.pci.analog-stereo".into()),
+                &mut half,
+            ),
+            SetCaptureTargetOutcome::Unchanged
+        );
+        assert!(half.runner.is_some());
+
+        assert_eq!(
+            handle_set_playback_target(&target, Some("zvucast-hall".into()), &mut half),
+            SetCaptureTargetOutcome::Changed
+        );
+        assert!(half.runner.is_none());
+        assert_eq!(target.borrow().as_deref(), None);
     }
 }

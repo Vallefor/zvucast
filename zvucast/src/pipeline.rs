@@ -195,14 +195,11 @@ pub fn build_rx_ports(
     Ok(pipe)
 }
 
-/// Имя узла, которое pipewiresrc открывает как обычный источник.
-/// Виртуальный выход — это source кабеля, не монитор sink.
-pub(crate) fn capture_node_name(device_key: &str) -> &str {
-    if device_key == crate::inputs::VIRTUAL_DEVICE_KEY {
-        crate::inputs::VIRTUAL_SOURCE_KEY
-    } else {
-        device_key
-    }
+/// Имя, которое pw-record открывает.
+/// `zvucast` → `zvucast-monitor`. `zvucast-{id}` → `zvucast-{id}-monitor`.
+/// Имя, которое уже кончается на `-monitor`, второй раз не дописываем.
+pub(crate) fn capture_node_name(device_key: &str) -> String {
+    crate::inputs::open_capture_name(device_key)
 }
 
 /// Имя узла PipeWire из конфига. Строка ALSA (`plughw:`, `hw:`) — не узел:
@@ -1513,6 +1510,8 @@ mod tests {
         assert!(src.property::<bool>("do-timestamp"));
         assert!(!src.property::<bool>("block"));
         assert_eq!(capture_node_name("zvucast"), "zvucast-monitor");
+        assert_eq!(capture_node_name("zvucast-hall"), "zvucast-hall-monitor");
+        assert_eq!(capture_node_name("zvucast-hall-monitor"), "zvucast-hall-monitor");
         assert_eq!(capture_node_name("mic"), "mic");
         assert_eq!(configured_pipewire_node("plughw:CARD=Generic_1"), None);
         assert_eq!(configured_pipewire_node("hw:CARD=CODEC"), None);

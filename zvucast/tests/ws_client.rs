@@ -17,8 +17,6 @@ fn cfg_for(url: String) -> AgentConfig {
         id: None,
         roles: Some(vec![Role::Rx]),
         controller: url,
-        capture_device: None,
-        playback_device: Some("plughw:CARD=Whatever".into()),
         playback_backend: zvucast::config::Backend::Alsa,
         sync_interface: "end0".into(),
         ptp_priority: 128,
@@ -128,8 +126,8 @@ async fn hello_telemetry_command_reconnect() {
     assert_eq!(hello["name"], "test-agent");
     assert_eq!(hello["roles"], serde_json::json!(["rx"]));
     assert_eq!(hello["version"], "0.1.0-test");
-    assert_eq!(hello["playback_device"], "plughw:CARD=Whatever");
-    assert!(hello["capture_device"].is_null());
+    assert!(hello["playback_device"].is_null(), "цель ещё не задана командой");
+    assert!(hello["capture_device"].is_null(), "цель ещё не задана командой");
     assert_eq!(hello["link"], "wired");
 
     // 2. телеметрия со state=stopped в rx-половине приходит в течение 3 с

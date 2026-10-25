@@ -47,9 +47,9 @@ fn default_ptp_priority() -> u8 {
     128
 }
 
-/// Бэкенд вывода для роли rx: alsa = alsasink на playback_device;
-/// pipewire = pipewiresink (маршрутизация WirePlumber на дефолтный выход) —
-/// для десктопов, где PipeWire эксклюзивно держит ALSA-устройство.
+/// Бэкенд вывода для роли rx: alsa = alsasink на цель из УИ;
+/// pipewire = pw-play. Пустая цель — запасной sink, не zvucast.
+/// Для десктопов, где PipeWire эксклюзивно держит ALSA-устройство.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
@@ -70,19 +70,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub id: Option<String>,
     /// Явные роли узла; None (поле отсутствует) — авто-детект.
-    /// pipewire пробует tx и rx без имени устройства; alsa без устройств
-    /// открывать нечего — roles надо задать явно.
+    /// pipewire пробует tx и rx без имени устройства; alsa открывать нечего —
+    /// roles надо задать явно.
     #[serde(default)]
     pub roles: Option<Vec<Role>>,
     pub controller: String,
-    /// Вход (alsasrc) для роли tx. load выкидывает ключ до разбора;
-    /// поле остаётся, пока агент ещё может его открыть.
-    #[serde(default)]
-    pub capture_device: Option<String>,
-    /// Выход (alsasink) для роли rx. load выкидывает ключ до разбора.
-    #[serde(default)]
-    pub playback_device: Option<String>,
-    /// Бэкенд вывода rx (см. Backend). При pipewire устройство не нужно.
+    /// Бэкенд вывода rx (см. Backend). Устройство берётся из команды УИ.
     #[serde(default = "default_backend")]
     pub playback_backend: Backend,
     /// Сетевой интерфейс для PTP (zsync). GM выбирается BMCA по ptp_priority.
@@ -228,8 +221,6 @@ port = 5004
         let c = load(&write_tmp(SAMPLE_FULL, "full")).unwrap();
         assert_eq!(c.name, "opi-rx2");
         assert_eq!(c.roles, Some(vec![zproto::Role::Rx]));
-        assert!(c.playback_device.is_none(), "playback_device выкинут до разбора");
-        assert!(c.capture_device.is_none());
         assert_eq!(c.ptp_priority, 128);
         assert_eq!(c.pipeline.jb_ms, 2);
     }
@@ -239,8 +230,6 @@ port = 5004
         let c = load(&write_tmp(SAMPLE_AUTO, "auto")).unwrap();
         assert_eq!(c.roles, None, "roles отсутствует — авто-детект");
         assert_eq!(c.ptp_priority, 128, "дефолт priority1");
-        assert!(c.capture_device.is_none(), "capture_device выкинут до разбора");
-        assert!(c.playback_device.is_none(), "playback_device выкинут до разбора");
     }
 
     #[test]
@@ -270,8 +259,7 @@ port = 5004
         assert_eq!(before, after, "файл на диске не переписывается");
         assert!(after.contains("# capture_device = \"from-comment\""));
         assert!(after.contains("capture_device = \"from-key\""));
-        assert!(c.capture_device.is_none(), "ключ и комментарий не становятся значением");
-        assert!(c.playback_device.is_none());
+        assert_eq!(c.name, "pc", "ключи выкинуты до разбора, иначе deny_unknown_fields");
         assert_eq!(c.playback_backend, Backend::PipeWire);
     }
 
@@ -293,16 +281,16 @@ port = 5004
 
     #[test]
     fn playback_backend_default_and_pipewire() {
-        // дефолт — alsa
-        let cfg: AgentConfig = toml::from_str(SAMPLE_AUTO).unwrap();
+        // дефолт — alsa. Ключи устройств выкинуты: в структуре их больше нет.
+        let cfg: AgentConfig = toml::from_str(&strip_retired_device_keys(SAMPLE_AUTO)).unwrap();
         assert_eq!(cfg.playback_backend, Backend::Alsa);
         // явный pipewire
         let text = SAMPLE_AUTO.replace("sync_interface", "playback_backend = \"pipewire\"\nsync_interface");
-        let cfg: AgentConfig = toml::from_str(&text).unwrap();
+        let cfg: AgentConfig = toml::from_str(&strip_retired_device_keys(&text)).unwrap();
         assert_eq!(cfg.playback_backend, Backend::PipeWire);
         // неизвестный бэкенд — ошибка парсинга
         let bad = SAMPLE_AUTO.replace("sync_interface", "playback_backend = \"pulse\"\nsync_interface");
-        assert!(toml::from_str::<AgentConfig>(&bad).is_err());
+        assert!(toml::from_str::<AgentConfig>(&strip_retired_device_keys(&bad)).is_err());
     }
 
     #[test]

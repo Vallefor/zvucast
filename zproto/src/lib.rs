@@ -208,8 +208,12 @@ pub mod proto {
         SetSendspin { zones: Vec<VirtualZone> },
         /// Создать или убрать виртуальный выход zvucast.
         SetVirtualOutput { enabled: bool },
-        /// Куда смотрит pipewiresrc. None — источник по умолчанию.
+        /// Куда смотрит захват. None — голова без цели (на PipeWire это тишина).
         SetCaptureTarget { device_key: Option<String> },
+        /// Куда играет rx. None — на PipeWire прежний запасной sink, не zvucast.
+        SetPlaybackTarget { device_key: Option<String> },
+        /// Зоны, чей монитор не подмешивается: id в множестве → source зоны None.
+        SetMutedZones { zones: Vec<String> },
         ApplyUpdate {
             version: String,
             url: String,
@@ -275,6 +279,30 @@ mod tests {
 
         let clear = CtlMsg::SetCaptureTarget { device_key: None };
         assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&clear).unwrap()).unwrap(), clear);
+    }
+
+    #[test]
+    fn playback_and_mute_messages_roundtrip() {
+        let play = CtlMsg::SetPlaybackTarget { device_key: Some("alsa_output.pci.analog-stereo".into()) };
+        assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&play).unwrap()).unwrap(), play);
+
+        let clear = CtlMsg::SetPlaybackTarget { device_key: None };
+        assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&clear).unwrap()).unwrap(), clear);
+
+        let muted = CtlMsg::SetMutedZones { zones: vec!["hall".into(), "bed".into()] };
+        assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&muted).unwrap()).unwrap(), muted);
+
+        let none = CtlMsg::SetMutedZones { zones: vec![] };
+        assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&none).unwrap()).unwrap(), none);
+
+        // Старое сообщение без новых вариантов читается как раньше.
+        let start = r#"{"type":"Start"}"#;
+        assert_eq!(serde_json::from_str::<CtlMsg>(start).unwrap(), CtlMsg::Start);
+        let capture = r#"{"type":"SetCaptureTarget","device_key":"zvucast"}"#;
+        assert_eq!(
+            serde_json::from_str::<CtlMsg>(capture).unwrap(),
+            CtlMsg::SetCaptureTarget { device_key: Some("zvucast".into()) }
+        );
     }
 
     #[test]
