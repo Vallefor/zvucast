@@ -686,19 +686,64 @@ fn handle_set_playback_target(
     handle_set_capture_target(current, playback_device_key(device_key), half)
 }
 
+/// Mute меняет только `zone.source`. Живой tx микширует это на месте, RTP
+/// остаётся. Тот же набор — no-op. Нет runner или монитор не встал — дроп
+/// и вооружение гейта, как при смене устройства.
 fn handle_set_muted_zones(
     current: &RefCell<BTreeSet<String>>,
     zones: Vec<String>,
     half: &mut RoleHalf,
+    transport: &Transport,
+    linked: &BTreeSet<String>,
+    table: &crate::sendspin::ZoneTable,
+    backend: crate::config::Backend,
+    capture_key: Option<&str>,
+    previous_sources: &mut BTreeMap<String, Option<String>>,
 ) -> SetCaptureTargetOutcome {
     let next: BTreeSet<String> = zones.into_iter().collect();
     if *current.borrow() == next {
         return SetCaptureTargetOutcome::Unchanged;
     }
     *current.borrow_mut() = next;
-    drop_runner(&mut half.runner);
-    half.gate.arm(&mut half.policy);
-    SetCaptureTargetOutcome::Changed
+    let head = capture_head_name(backend, capture_key);
+    let mixed = match half.runner.as_mut() {
+        Some(runner) => {
+            let muted_now = current.borrow();
+            let overlay = overlay_sources(
+                &transport.zones,
+                linked,
+                table,
+                &muted_now,
+                head.as_deref(),
+            );
+            match runner.reconcile_monitors(&overlay) {
+                Ok(()) => {
+                    *previous_sources = zone_sources(
+                        &transport.zones,
+                        linked,
+                        table,
+                        &muted_now,
+                        head.as_deref(),
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("tx: монитор в живой микс не встал, пересобираем: {e:#}");
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+    if mixed {
+        tracing::info!("tx: монитор зоны в миксе с line-in, RTP на месте");
+        SetCaptureTargetOutcome::Changed
+    } else {
+        tracing::info!("tx: заглушённые зоны изменились, пересборка");
+        drop_runner(&mut half.runner);
+        half.gate.arm(&mut half.policy);
+        SetCaptureTargetOutcome::Changed
+    }
 }
 
 /// Чем открыть голову захвата. Строка ALSA — только alsasrc.
@@ -1518,11 +1563,21 @@ fn gst_domain(
             Ok(CtlMsg::SetMutedZones { zones }) => match tx_half.as_mut() {
                 None => tracing::debug!("SetMutedZones: нет tx — игнорируем"),
                 Some(h) => {
-                    if handle_set_muted_zones(&muted_zones, zones, h)
-                        == SetCaptureTargetOutcome::Changed
-                    {
-                        tracing::info!("tx: заглушённые зоны изменились, пересборка");
-                    }
+                    let t = transport.borrow();
+                    let linked_now = linked.borrow();
+                    let table_now = table.borrow();
+                    let key = capture_target.borrow();
+                    handle_set_muted_zones(
+                        &muted_zones,
+                        zones,
+                        h,
+                        &t,
+                        &linked_now,
+                        &table_now,
+                        cfg.playback_backend,
+                        key.as_deref(),
+                        &mut previous_sources,
+                    );
                 }
             },
             Ok(CtlMsg::ApplyUpdate { .. }) => {
@@ -2937,6 +2992,74 @@ mod tests {
         );
         assert!(half.runner.is_none());
         assert_eq!(target.borrow().as_deref(), Some("zvucast"));
+    }
+
+    #[test]
+    fn muted_zone_change_keeps_the_runner_when_reconcile_succeeds() {
+        gstreamer::init().unwrap();
+        let muted = RefCell::new(BTreeSet::new());
+        let mut half = RoleHalf::new();
+        half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
+        let transport = Transport::default();
+        let linked = BTreeSet::new();
+        let table = crate::sendspin::ZoneTable::new();
+        let mut previous_sources =
+            BTreeMap::from([("stale".to_string(), Some("monitor".to_string()))]);
+        let call = |zones: Vec<String>,
+                    half: &mut RoleHalf,
+                    previous: &mut BTreeMap<String, Option<String>>| {
+            handle_set_muted_zones(
+                &muted,
+                zones,
+                half,
+                &transport,
+                &linked,
+                &table,
+                crate::config::Backend::PipeWire,
+                None,
+                previous,
+            )
+        };
+
+        assert_eq!(
+            call(vec![], &mut half, &mut previous_sources),
+            SetCaptureTargetOutcome::Unchanged
+        );
+        assert!(half.runner.is_some());
+        assert!(half.gate.restart_at.is_none());
+        assert_eq!(
+            previous_sources.get("stale").map(Option::as_deref),
+            Some(Some("monitor"))
+        );
+
+        assert_eq!(
+            call(vec!["hall".into()], &mut half, &mut previous_sources),
+            SetCaptureTargetOutcome::Changed
+        );
+        assert!(
+            half.runner.is_some(),
+            "живой runner остаётся, если reconcile вернул Ok"
+        );
+        assert!(half.gate.restart_at.is_none());
+        assert_eq!(*muted.borrow(), BTreeSet::from(["hall".to_string()]));
+        let head = capture_head_name(crate::config::Backend::PipeWire, None);
+        assert_eq!(
+            previous_sources,
+            zone_sources(
+                &transport.zones,
+                &linked,
+                &table,
+                &muted.borrow(),
+                head.as_deref()
+            )
+        );
+
+        assert_eq!(
+            call(vec!["hall".into()], &mut half, &mut previous_sources),
+            SetCaptureTargetOutcome::Unchanged
+        );
+        assert!(half.runner.is_some());
+        assert!(half.gate.restart_at.is_none());
     }
 
     #[test]
