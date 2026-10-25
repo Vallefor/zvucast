@@ -39,6 +39,12 @@ export interface InputView {
   stream: 'l' | 'r' | null
 }
 
+export interface SetupIssue {
+  id: string
+  command: string
+  detail?: string
+}
+
 export interface NodeView {
   node_id: string
   name: string
@@ -64,6 +70,7 @@ export interface NodeView {
   soloist_key?: string | null
   spotify?: boolean
   sendspin?: boolean
+  setup?: SetupIssue[] | null
 }
 
 export interface MasterInfo {

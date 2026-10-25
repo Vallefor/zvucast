@@ -471,3 +471,17 @@ table.data tr:last-child td { border-bottom: 0; }
   .toasts { bottom: calc(4.6rem + env(safe-area-inset-bottom)); }
   h1 { font-size: 1.35rem; }
 }
+
+.setup-gap { margin: 0 0 1rem; }
+.setup-gap h2 { margin: 0 0 0.75rem; font-size: 1.05rem; }
+.setup-cmd {
+  margin: 0.35rem 0 0.75rem;
+  padding: 0.55rem 0.7rem;
+  background: var(--bg-sunken);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  cursor: pointer;
+  color: var(--text);
+}

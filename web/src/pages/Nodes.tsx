@@ -45,6 +45,77 @@ function nodeTitle(n: NodeView) {
   )
 }
 
+const SETUP_TITLE: Record<string, string> = {
+  pipewire: 'Служба PipeWire не запущена',
+  wireplumber: 'WirePlumber не запущен',
+  'pipewire-pulse': 'PipeWire Pulse не запущен',
+  gstreamer: 'Нет плагинов GStreamer',
+  linger: 'После перезагрузки PipeWire не поднимется',
+  'pipewire-socket': 'Нет сокета PipeWire',
+  'rt-limits': 'Нет rtprio для группы audio',
+  'wifi-powersave': 'На Wi-Fi включено энергосбережение',
+  controller: 'Контроллер включён, но не работает',
+  soloist: 'Spotify включён, а Soloist недоступен',
+}
+
+async function copyCommand(text: string, el: HTMLElement) {
+  try {
+    const clip = navigator.clipboard
+    if (!clip) throw new Error('clipboard')
+    await clip.writeText(text)
+  } catch {
+    const sel = window.getSelection()
+    if (!sel) return
+    const range = document.createRange()
+    range.selectNodeContents(el)
+    sel.removeAllRanges()
+    sel.addRange(range)
+  }
+}
+
+function setupBlock(nodes: NodeView[]) {
+  const groups = nodes.filter((n) => n.online).flatMap((n) => {
+    const rows: { key: string; title: string; detail: string; command: string }[] = []
+    if (n.setup == null) {
+      rows.push({ key: 'old', title: 'Агент не прислал проверку, обновите узел', detail: '', command: '' })
+      if (n.spotify) {
+        rows.push({ key: 'soloist-old', title: 'Spotify включён, а агент не сообщил про Soloist', detail: '', command: '' })
+      }
+    } else {
+      n.setup.forEach((issue, i) => {
+        rows.push({
+          key: `${issue.id}-${i}`,
+          title: SETUP_TITLE[issue.id] ?? issue.id,
+          detail: issue.detail ?? '',
+          command: issue.command,
+        })
+      })
+    }
+    if (rows.length === 0) return []
+    return [{ id: n.node_id, name: n.display_name ?? n.name, rows }]
+  })
+  if (groups.length === 0) return null
+  return (
+    <section className="card setup-gap">
+      <h2>Системе не хватает</h2>
+      {groups.map((g) => (
+        <div key={g.id}>
+          <h3 className="device-name">{g.name}</h3>
+          {g.rows.map((row) => (
+            <div key={row.key}>
+              <div>{row.title}</div>
+              {row.detail && <p className="hint">{row.detail}</p>}
+              {row.command && (
+                <pre className="setup-cmd" onClick={(e) => void copyCommand(row.command, e.currentTarget)}>{row.command}</pre>
+              )}
+            </div>
+          ))}
+        </div>
+      ))}
+    </section>
+  )
+}
+
 function groupChans(rows: InputView[]) {
   const order: string[] = []
   const by = new Map<string, InputView[]>()
@@ -514,6 +585,8 @@ export default function Nodes() {
           <Button onClick={() => void updateAll()}>Обновить все</Button>
         </div>
       </div>
+
+      {setupBlock(nodes)}
 
       <div className="table-wrap only-wide">
         <table className="data">
