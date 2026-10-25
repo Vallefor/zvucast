@@ -2,6 +2,8 @@
 //! В стереопоток попадают только index 0 и 1 устройства, с которого реально
 //! идёт захват. Остальные каналы видны в настройках, но в карту зоны не входят.
 
+use std::collections::BTreeSet;
+
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,11 @@ pub fn is_virtual_sink_name(name: &str) -> bool {
     name == VIRTUAL_DEVICE_KEY || name.starts_with("zvucast-")
 }
 
+/// Кабельный sink зоны: `zvucast-…`, не общий `zvucast` и не монитор `*-monitor`.
+pub fn is_zone_sink_key(key: &str) -> bool {
+    key.starts_with("zvucast-") && !key.ends_with("-monitor")
+}
+
 /// Два канала виртуального выхода. Имена по умолчанию ставит merge_inputs.
 pub fn virtual_capture_channels() -> Vec<CaptureChan> {
     (0..2u16)
@@ -33,21 +40,60 @@ pub fn virtual_capture_channels() -> Vec<CaptureChan> {
         .collect()
 }
 
-/// Узел PipeWire общей головы: устройство, которому `assign_stream` отдал
-/// слот стерео. Виртуальные кабели зон сюда не входят. Строка ALSA
-/// (`plughw:`) — не узел, её открывает alsasrc; на PipeWire такая строка
-/// оставила бы голову тишиной, поэтому её не возвращаем.
+/// Имя источника, которое уже можно открыть.
+/// `zvucast` → `zvucast-monitor`. `zvucast-{id}` без суффикса → `zvucast-{id}-monitor`.
+/// Готовый монитор второй раз не дописываем.
+pub fn open_capture_name(key: &str) -> String {
+    if key == VIRTUAL_DEVICE_KEY {
+        VIRTUAL_SOURCE_KEY.to_string()
+    } else if is_zone_sink_key(key) {
+        format!("{key}-monitor")
+    } else {
+        key.to_string()
+    }
+}
+
+/// Имя слота захвата, которое уже можно открыть. Обычный ключ возвращаем
+/// как есть, в том числе строку ALSA: на PipeWire её отсеет агент.
+/// Заглушки `capture` и `playback` устройством не являются.
 pub fn capture_target(views: &[InputView]) -> Option<String> {
-    let key = views
+    let key = views.iter().find(|v| v.stream.is_some())?.device_key.as_str();
+    if key == "capture" || key == "playback" {
+        return None;
+    }
+    Some(open_capture_name(key))
+}
+
+/// Ключ слота выхода. Правило то же, что у захвата, но виртуальный sink
+/// в слот не входит и целью воспроизведения не бывает.
+pub fn playback_target(views: &[InputView]) -> Option<String> {
+    stereo_slot_key(views, false).filter(|key| !is_virtual_device_key(key))
+}
+
+/// Зона кабеля `zvucast-{id}`, у которого все каналы index <= 1 выключены.
+/// Кабеля в списке нет — зону не глушим.
+pub fn muted_zone_ids(views: &[InputView]) -> BTreeSet<String> {
+    let mut keys: Vec<&str> = views
         .iter()
-        .find(|v| v.stream.as_deref() == Some("l") && !is_virtual_device_key(&v.device_key))
-        .or_else(|| {
-            views
-                .iter()
-                .find(|v| v.stream.is_some() && !is_virtual_device_key(&v.device_key))
-        })
-        .map(|v| v.device_key.as_str())?;
-    crate::pipeline::configured_pipewire_node(key).map(str::to_string)
+        .map(|v| v.device_key.as_str())
+        .filter(|key| is_zone_sink_key(key))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let mut muted = BTreeSet::new();
+    for key in keys {
+        let stereo: Vec<&InputView> = views
+            .iter()
+            .filter(|v| v.device_key == key && v.index <= 1)
+            .collect();
+        if stereo.is_empty() || stereo.iter().any(|v| v.enabled) {
+            continue;
+        }
+        if let Some(id) = key.strip_prefix("zvucast-").filter(|id| !id.is_empty()) {
+            muted.insert(id.to_string());
+        }
+    }
+    muted
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,19 +123,26 @@ pub fn default_chan_name(index: u16) -> String {
     }
 }
 
-/// Кабели переброса с виртуальных динамиков не настраиваются.
-/// В списке входов их нет: ни по нашему ключу, ни по подписи «Zvucast: {зона}».
+/// Кабельный sink зоны виден в настройках. Скрыты старый ключ `zvucast`,
+/// мониторы `*-monitor` и чужой ключ с подписью «Zvucast» или «Zvucast: …».
 pub fn visible_inputs(views: Vec<InputView>) -> Vec<InputView> {
     views.into_iter().filter(|v| !hidden_from_settings(v)).collect()
 }
 
 fn hidden_from_settings(v: &InputView) -> bool {
-    is_virtual_device_key(&v.device_key) || v.device_name == "Zvucast" || v.device_name.starts_with("Zvucast:")
+    if is_zone_sink_key(&v.device_key) {
+        return false;
+    }
+    v.device_key == VIRTUAL_DEVICE_KEY
+        || v.device_key.ends_with("-monitor")
+        || v.device_name == "Zvucast"
+        || v.device_name.starts_with("Zvucast:")
 }
 
 /// Новый канал включён. Уже сохранённые имя и галочка не затираются.
 /// Каналов, которых агент больше не видит, в списке нет.
-pub fn merge_inputs(discovered: &[CaptureChan], prefs: &[InputPref], capture_device: Option<&str>) -> Vec<InputView> {
+/// Слот стерео берётся из включённых каналов, не из устройства в конфиге.
+pub fn merge_inputs(discovered: &[CaptureChan], prefs: &[InputPref]) -> Vec<InputView> {
     let mut views: Vec<InputView> = discovered
         .iter()
         .map(|ch| {
@@ -110,67 +163,48 @@ pub fn merge_inputs(discovered: &[CaptureChan], prefs: &[InputPref], capture_dev
             }
         })
         .collect();
-    assign_stream(&mut views, capture_device);
+    assign_stream(&mut views);
     views
 }
 
-fn card_token(capture_device: &str) -> Option<&str> {
-    capture_device.split("CARD=").nth(1).filter(|s| !s.is_empty())
-}
-
-fn belongs_to_capture(ch: &InputView, capture_device: &str) -> bool {
-    if ch.device_key == capture_device || capture_device.contains(&ch.device_key) || ch.device_key.contains(capture_device) {
-        return true;
-    }
-    match card_token(capture_device) {
-        Some(card) => ch.device_key.contains(card) || ch.device_name.contains(card),
-        None => false,
-    }
-}
-
-fn enabled_stereo(views: &[InputView], pool: &[usize]) -> bool {
-    pool.iter().any(|&i| views[i].enabled && views[i].index <= 1)
-}
-
-/// Слот стерео — это аппаратный index 0/1 одного устройства, а не «первый
-/// включённый канал». Выключенный левый не превращает правый в левый.
-/// Виртуальные выходы зон в этот слот не входят: каждый слышен только своей
-/// зоной, line-in остаётся общим. Слот у настроенного устройства, а если у
-/// него стерео выключено — у первого по алфавиту, где канал 0 или 1 включён.
-fn assign_stream(views: &mut [InputView], capture_device: Option<&str>) {
-    let matched: Vec<usize> = views
+/// Первое по алфавиту невиртуальное устройство с включённым каналом
+/// index <= 1. Такого нет и `allow_virtual` — первое виртуальное.
+/// Для выхода виртуальные ключи в слот не входят.
+fn stereo_slot_key(views: &[InputView], allow_virtual: bool) -> Option<String> {
+    let mut hardware: Vec<&str> = views
         .iter()
-        .enumerate()
-        .filter(|(_, ch)| {
-            !is_virtual_device_key(&ch.device_key) && capture_device.is_some_and(|dev| belongs_to_capture(ch, dev))
-        })
-        .map(|(i, _)| i)
+        .filter(|ch| ch.enabled && ch.index <= 1 && !is_virtual_device_key(&ch.device_key))
+        .map(|ch| ch.device_key.as_str())
         .collect();
-    let pool: Vec<usize> = if enabled_stereo(views, &matched) {
-        matched
-    } else {
-        let mut keys: Vec<&str> = views
-            .iter()
-            .filter(|ch| ch.enabled && ch.index <= 1 && !is_virtual_device_key(&ch.device_key))
-            .map(|ch| ch.device_key.as_str())
-            .collect();
-        keys.sort();
-        keys.dedup();
-        match keys.first() {
-            Some(key) => views
-                .iter()
-                .enumerate()
-                .filter(|(_, ch)| ch.device_key == *key)
-                .map(|(i, _)| i)
-                .collect(),
-            None => Vec::new(),
-        }
+    hardware.sort();
+    hardware.dedup();
+    if let Some(key) = hardware.first() {
+        return Some((*key).to_string());
+    }
+    if !allow_virtual {
+        return None;
+    }
+    let mut virtual_keys: Vec<&str> = views
+        .iter()
+        .filter(|ch| ch.enabled && ch.index <= 1 && is_virtual_device_key(&ch.device_key))
+        .map(|ch| ch.device_key.as_str())
+        .collect();
+    virtual_keys.sort();
+    virtual_keys.dedup();
+    virtual_keys.first().map(|key| (*key).to_string())
+}
+
+/// Канал 0 включённого слота захвата → `l`, канал 1 → `r`.
+/// Выключенный левый не становится правым.
+fn assign_stream(views: &mut [InputView]) {
+    let Some(key) = stereo_slot_key(views, true) else {
+        return;
     };
-    for i in pool {
-        if !views[i].enabled {
+    for ch in views.iter_mut() {
+        if ch.device_key != key || !ch.enabled {
             continue;
         }
-        views[i].stream = match views[i].index {
+        ch.stream = match ch.index {
             0 => Some("l".into()),
             1 => Some("r".into()),
             _ => None,
@@ -178,13 +212,25 @@ fn assign_stream(views: &mut [InputView], capture_device: Option<&str>) {
     }
 }
 
-/// Выключенный слот стерео в карту не попадает: этот выход молчит.
-/// Пустой список видов — агент ещё не прислал выходы, карту не трогаем.
+/// Выключенный слот выхода в карту не попадает: этот выход молчит.
+/// Виртуальный sink слот выхода не занимает. Пустой список видов — агент
+/// ещё не прислал выходы, карту не трогаем.
 pub fn mask_disabled_outputs(map: zproto::ChannelMap, views: &[InputView]) -> zproto::ChannelMap {
     if views.is_empty() {
         return map;
     }
-    let has = |slot: &str| views.iter().any(|v| v.enabled && v.stream.as_deref() == Some(slot));
+    let key = stereo_slot_key(views, false);
+    let has = |slot: &str| {
+        let Some(key) = key.as_deref() else {
+            return false;
+        };
+        let index = match slot {
+            "l" => 0,
+            "r" => 1,
+            _ => return false,
+        };
+        views.iter().any(|v| v.device_key == key && v.enabled && v.index == index)
+    };
     zproto::ChannelMap {
         out_l: if has("l") { map.out_l } else { None },
         out_r: if has("r") { map.out_r } else { None },
@@ -285,7 +331,7 @@ mod tests {
 
     #[test]
     fn new_channels_start_enabled_and_named() {
-        let views = merge_inputs(&[ch("card:0", "card", 0), ch("card:1", "card", 1)], &[], Some("plughw:CARD=card"));
+        let views = merge_inputs(&[ch("card:0", "card", 0), ch("card:1", "card", 1)], &[]);
         assert!(views.iter().all(|v| v.enabled));
         assert_eq!(views[0].name, "Левый");
         assert_eq!(views[0].stream.as_deref(), Some("l"));
@@ -295,7 +341,7 @@ mod tests {
     #[test]
     fn prefs_stick_and_disabling_left_does_not_promote_right() {
         let prefs = vec![InputPref { id: "card:0".into(), name: "ТВ: левый".into(), enabled: false }];
-        let views = merge_inputs(&[ch("card:0", "card", 0), ch("card:1", "card", 1)], &prefs, Some("hw:CARD=card"));
+        let views = merge_inputs(&[ch("card:0", "card", 0), ch("card:1", "card", 1)], &prefs);
         assert!(!views[0].enabled);
         assert_eq!(views[0].name, "ТВ: левый");
         assert!(views[0].stream.is_none());
@@ -307,7 +353,7 @@ mod tests {
         use zproto::{ChanSel, ChannelMap};
         let views = merge_inputs(&[ch("card:0", "card", 0), ch("card:1", "card", 1)], &[
             InputPref { id: "card:0".into(), name: "ТВ: левый".into(), enabled: false },
-        ], Some("plughw:CARD=card"));
+        ]);
         let masked = mask_disabled_outputs(
             ChannelMap { out_l: Some(ChanSel::L), out_r: Some(ChanSel::R) },
             &views,
@@ -327,7 +373,6 @@ mod tests {
         let views = merge_inputs(
             &[ch("card:0", "card", 0), ch("card:1", "card", 1), ch("spk:0", "spk", 0), ch("spk:1", "spk", 1)],
             &prefs,
-            Some("plughw:CARD=card"),
         );
         let spk_l = views.iter().find(|v| v.id == "spk:0").unwrap();
         let spk_r = views.iter().find(|v| v.id == "spk:1").unwrap();
@@ -339,7 +384,7 @@ mod tests {
     #[test]
     fn gone_device_drops_its_pref() {
         let prefs = vec![InputPref { id: "old:0".into(), name: "старый".into(), enabled: true }];
-        let views = merge_inputs(&[ch("card:0", "card", 0)], &prefs, None);
+        let views = merge_inputs(&[ch("card:0", "card", 0)], &prefs);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].id, "card:0");
     }
@@ -368,8 +413,8 @@ mod tests {
             index: 0,
         });
 
-        let both_on = merge_inputs(&discovered, &[], Some("plughw:CARD=Generic_1"));
-        assert_eq!(capture_target(&both_on), None);
+        let both_on = merge_inputs(&discovered, &[]);
+        assert_eq!(capture_target(&both_on).as_deref(), Some("plughw:CARD=Generic_1"));
         assert!(both_on.iter().filter(|v| is_virtual_device_key(&v.device_key)).all(|v| v.stream.is_none()));
         assert!(both_on.iter().any(|v| v.device_key == "plughw:CARD=Generic_1" && v.stream.as_deref() == Some("l")));
 
@@ -377,17 +422,21 @@ mod tests {
             ch("mic:0", "alsa_input.usb-BY-V20.analog-stereo", 0),
             ch("mic:1", "alsa_input.usb-BY-V20.analog-stereo", 1),
         ];
-        let aimed = merge_inputs(&mic, &[], Some("plughw:CARD=Generic_1"));
+        let aimed = merge_inputs(&mic, &[]);
         assert_eq!(
             capture_target(&aimed).as_deref(),
             Some("alsa_input.usb-BY-V20.analog-stereo"),
-            "слот стерео на узле PipeWire — это голова захвата, строка plughw её не открывает"
+            "имя узла PipeWire остаётся ключом слота"
         );
 
+        // Железо выключено — слот захвата у первого виртуального ключа.
         let prefs = vec![InputPref { id: "hw:0".into(), name: "Левый".into(), enabled: false }];
-        let hw_off = merge_inputs(&discovered, &prefs, Some("plughw:CARD=Generic_1"));
-        assert_eq!(capture_target(&hw_off), None);
-        assert!(hw_off.iter().all(|v| v.stream.is_none()));
+        let hw_off = merge_inputs(&discovered, &prefs);
+        assert_eq!(capture_target(&hw_off).as_deref(), Some("zvucast-monitor"));
+        assert_eq!(hw_off.iter().find(|v| v.id == "zvucast:0").unwrap().stream.as_deref(), Some("l"));
+        assert_eq!(hw_off.iter().find(|v| v.id == "zvucast:1").unwrap().stream.as_deref(), Some("r"));
+        assert!(hw_off.iter().find(|v| v.id == "zvucast-z1:0").unwrap().stream.is_none());
+        assert!(hw_off.iter().find(|v| v.id == "hw:0").unwrap().stream.is_none());
     }
 
     #[test]
@@ -414,19 +463,83 @@ mod tests {
             device_name: "Zvucast: Спальня".into(),
             index: 0,
         });
-        let shown = visible_inputs(merge_inputs(&discovered, &[], Some("plughw:CARD=Generic_1")));
-        assert_eq!(shown.len(), 1);
-        assert_eq!(shown[0].device_name, "HD-Audio Generic");
-        assert!(shown.iter().all(|v| !v.device_name.starts_with("Zvucast")));
+        discovered.push(CaptureChan {
+            id: "src:0".into(),
+            device_key: "zvucast-hall-monitor".into(),
+            device_name: "monitor".into(),
+            index: 0,
+        });
+        let shown = visible_inputs(merge_inputs(&discovered, &[]));
+        assert!(shown.iter().any(|v| v.device_key == "plughw:CARD=Generic_1"));
+        assert!(shown.iter().any(|v| v.device_key == "zvucast-z1" && v.device_name == "Zvucast: Зал"));
+        assert!(shown.iter().all(|v| v.device_key != VIRTUAL_DEVICE_KEY));
+        assert!(shown.iter().all(|v| v.device_name != "Zvucast: Спальня"));
+        assert!(shown.iter().all(|v| !v.device_key.ends_with("-monitor")));
+    }
+
+    #[test]
+    fn hardware_slot_beats_the_virtual_cable() {
+        let discovered = vec![
+            ch("hw:0", "plughw:CARD=Generic_1", 0),
+            ch("hw:1", "plughw:CARD=Generic_1", 1),
+            ch("z:0", "zvucast-hall", 0),
+            ch("z:1", "zvucast-hall", 1),
+        ];
+        let views = merge_inputs(&discovered, &[]);
+        assert_eq!(capture_target(&views).as_deref(), Some("plughw:CARD=Generic_1"));
+        assert!(views.iter().filter(|v| v.device_key == "zvucast-hall").all(|v| v.stream.is_none()));
+        assert_eq!(playback_target(&views).as_deref(), Some("plughw:CARD=Generic_1"));
+    }
+
+    #[test]
+    fn virtual_cable_becomes_the_slot_when_hardware_is_off() {
+        let prefs = vec![
+            InputPref { id: "hw:0".into(), name: "л".into(), enabled: false },
+            InputPref { id: "hw:1".into(), name: "п".into(), enabled: false },
+        ];
+        let discovered = vec![
+            ch("hw:0", "mic", 0),
+            ch("hw:1", "mic", 1),
+            ch("z:0", "zvucast-hall", 0),
+            ch("z:1", "zvucast-hall", 1),
+        ];
+        let views = merge_inputs(&discovered, &prefs);
+        assert_eq!(capture_target(&views).as_deref(), Some("zvucast-hall-monitor"));
+        assert_eq!(views.iter().find(|v| v.id == "z:0").unwrap().stream.as_deref(), Some("l"));
+        assert_eq!(playback_target(&views), None);
+    }
+
+    #[test]
+    fn both_virtual_channels_off_mutes_that_zone_only() {
+        let prefs = vec![
+            InputPref { id: "z:0".into(), name: "л".into(), enabled: false },
+            InputPref { id: "z:1".into(), name: "п".into(), enabled: false },
+        ];
+        let views = merge_inputs(&[
+            ch("z:0", "zvucast-hall", 0),
+            ch("z:1", "zvucast-hall", 1),
+            ch("b:0", "zvucast-bed", 0),
+        ], &prefs);
+        assert!(muted_zone_ids(&views).contains("hall"));
+        assert!(!muted_zone_ids(&views).contains("bed"));
+    }
+
+    #[test]
+    fn pipewire_node_stays_the_capture_name() {
+        let views = merge_inputs(&[
+            ch("mic:0", "alsa_input.usb-BY-V20.analog-stereo", 0),
+            ch("mic:1", "alsa_input.usb-BY-V20.analog-stereo", 1),
+        ], &[]);
+        assert_eq!(capture_target(&views).as_deref(), Some("alsa_input.usb-BY-V20.analog-stereo"));
     }
 
     #[test]
     fn saved_virtual_name_returns_when_the_device_comes_back() {
         let prefs = vec![InputPref { id: "zvucast:0".into(), name: "Браузер левый".into(), enabled: false }];
-        let views = merge_inputs(&virtual_capture_channels(), &prefs, Some("other"));
+        let views = merge_inputs(&virtual_capture_channels(), &prefs);
         assert_eq!(views[0].name, "Браузер левый");
         assert!(!views[0].enabled);
-        let gone = merge_inputs(&[], &prefs, Some("other"));
+        let gone = merge_inputs(&[], &prefs);
         assert!(gone.is_empty());
     }
 }

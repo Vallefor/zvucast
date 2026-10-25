@@ -440,7 +440,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 } else {
                     found
                 };
-                crate::inputs::visible_inputs(crate::inputs::merge_inputs(&found, prefs, cap.as_deref()))
+                crate::inputs::visible_inputs(crate::inputs::merge_inputs(&found, prefs))
             } else {
                 Vec::new()
             };
@@ -451,7 +451,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 } else {
                     outs
                 };
-                crate::inputs::merge_inputs(&outs, out_prefs, play.as_deref())
+                crate::inputs::merge_inputs(&outs, out_prefs)
             } else {
                 Vec::new()
             };
@@ -1665,8 +1665,7 @@ async fn patch_node(
             }
         }
         if patched_inputs {
-            let capture_device = reg.capture_device_of(&node_id);
-            push_capture_target(&mut reg, &node_id, &prefs, capture_device.as_deref());
+            push_capture_target(&mut reg, &node_id, &prefs);
         }
     }
     let reg = st.reg.lock().await;
@@ -1938,7 +1937,6 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
                 let views = crate::inputs::merge_inputs(
                     &found,
                     output_prefs.get(id).map(|p| p.as_slice()).unwrap_or(&[]),
-                    dev.as_deref(),
                 );
                 let Some(zone) = owners.get(id).and_then(|zid| zones.iter().find(|z| &z.id == zid))
                 else {
@@ -2145,12 +2143,12 @@ async fn push_virtual_zones(st: &AppState, node_id: &str) {
     }
 }
 
-fn push_capture_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref], capture_device: Option<&str>) {
+fn push_capture_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref]) {
     if !reg.supports_virtual_output(node_id) {
         return;
     }
     let found = reg.capture_inputs(node_id);
-    let views = crate::inputs::merge_inputs(&found, prefs, capture_device);
+    let views = crate::inputs::merge_inputs(&found, prefs);
     let device_key = crate::inputs::capture_target(&views);
     let _ = reg.send_cmd(node_id, CtlMsg::SetCaptureTarget { device_key });
 }
@@ -2230,7 +2228,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
         (zone, prefs)
     };
     if let Some(zone) = owned.0 {
-        let views = crate::inputs::merge_inputs(&reported_out, &owned.1, playback_device.as_deref());
+        let views = crate::inputs::merge_inputs(&reported_out, &owned.1);
         let reg = st.reg.lock().await;
         let ports = mix_ports_for(&reg, &reg.online_tx());
         let cmd = zone_channel_cmd(&zone, &node_id, &ports, &views);
@@ -2254,8 +2252,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
         };
         let mut reg = st.reg.lock().await;
         let _ = reg.send_cmd(&node_id, CtlMsg::SetVirtualOutput { enabled });
-        let capture_device = reg.capture_device_of(&node_id);
-        push_capture_target(&mut reg, &node_id, &prefs, capture_device.as_deref());
+        push_capture_target(&mut reg, &node_id, &prefs);
         let _ = reg.send_cmd(&node_id, zones_cmd);
         let _ = reg.send_cmd(&node_id, soloist);
         let _ = reg.send_cmd(&node_id, sendspin);
@@ -2279,8 +2276,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                         };
                         let mut reg = st.reg.lock().await;
                         reg.set_capture_inputs(&node_id, inputs);
-                        let capture_device = reg.capture_device_of(&node_id);
-                        push_capture_target(&mut reg, &node_id, &prefs, capture_device.as_deref());
+                        push_capture_target(&mut reg, &node_id, &prefs);
                     }
                     Err(e) => tracing::warn!(node = name, "ws: неразобранное сообщение: {e}: {text}"),
                 },
