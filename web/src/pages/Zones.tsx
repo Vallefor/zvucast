@@ -8,6 +8,8 @@ import {
   ChannelMap,
   ChanSel,
   DEFAULT_ZONE_MAP,
+  mappingChoices,
+  MappingChoice,
   sameChannelMap,
   shouldSendZoneMap,
 } from '../zoneMap'
@@ -36,10 +38,6 @@ function storedMap(zone: ZoneView, member: string, sourceId: string | null): Cha
   return zone.maps[member]
 }
 
-type StreamOpt = { value: ChanSel; label: string }
-
-/// Включенные каналы источника, у которых есть слот стереопотока.
-/// Пустой список устройств — два имени по умолчанию, пока агент их не прислал.
 type OutputRow = { side: 'out_l' | 'out_r'; label: string }
 
 /// Включённые выходы колонки со слотом стерео. Пустой список — два выхода
@@ -59,18 +57,6 @@ function outputRows(rx: NodeView | undefined): OutputRow[] {
   }))
 }
 
-function streamOptions(tx: NodeView | undefined): StreamOpt[] {
-  const inputs = tx?.inputs ?? []
-  const slotted = inputs.filter((i) => i.enabled && (i.stream === 'l' || i.stream === 'r'))
-  if (inputs.length === 0) {
-    return [
-      { value: 'l', label: 'Левый' },
-      { value: 'r', label: 'Правый' },
-    ]
-  }
-  return slotted.map((i) => ({ value: i.stream as ChanSel, label: i.name }))
-}
-
 function ChanSelect({
   value,
   label,
@@ -79,19 +65,29 @@ function ChanSelect({
 }: {
   value: ChanSel | null
   label: string
-  options: StreamOpt[]
+  options: MappingChoice[]
   onChange: (v: ChanSel | null) => void
 }) {
-  const known = value != null && options.some((o) => o.value === value)
+  // Несколько каналов могут быть одной стороной (линейный вход и кабель).
+  // Выбор держим на том пункте, который нажали: иначе селект схлопывается
+  // на первый канал этой стороны.
+  const [picked, setPicked] = useState<string | null>(null)
+  const held = value != null ? options.find((o) => o.id === picked && o.side === value) : undefined
+  const shown = held?.id ?? (value == null ? '' : options.find((o) => o.side === value)?.id ?? '')
   return (
     <select
       className="select"
       aria-label={label}
-      value={known ? value : ''}
-      onChange={(e) => onChange((e.target.value || null) as ChanSel | null)}
+      value={shown}
+      onChange={(e) => {
+        const id = e.target.value
+        setPicked(id || null)
+        const choice = options.find((o) => o.id === id)
+        onChange(choice ? choice.side : null)
+      }}
     >
       {options.map((o) => (
-        <option key={o.value} value={o.value}>{o.label}</option>
+        <option key={o.id} value={o.id}>{o.label}</option>
       ))}
       <option value="">—</option>
     </select>
@@ -375,7 +371,7 @@ function ZoneCard({
                   {sourceIds.map((sourceId) => {
                     const src = txNodes.find((node) => node.node_id === sourceId)
                     const srcName = src ? nodeLabel(src) : sourceId
-                    const srcOptions = streamOptions(src)
+                    const srcOptions = mappingChoices(src?.inputs ?? [])
                     const sourceKey = manySources ? sourceId : null
                     const map = mapOverrides[mapStorageKey(id, sourceKey)]
                       ?? storedMap(zone, id, sourceKey)
@@ -406,7 +402,8 @@ function ZoneCard({
           </div>
           {sourceIds.map((sourceId) => {
             const src = txNodes.find((node) => node.node_id === sourceId)
-            const idle = (src?.inputs ?? []).filter((i) => i.enabled && i.stream == null)
+            const listed = new Set(mappingChoices(src?.inputs ?? []).map((c) => c.id))
+            const idle = (src?.inputs ?? []).filter((i) => i.enabled && i.stream == null && !listed.has(i.id))
             if (idle.length === 0) return null
             const prefix = manySources ? `${src ? nodeLabel(src) : sourceId}: ` : ''
             return (

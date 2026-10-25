@@ -4,6 +4,53 @@
 
 export type ChanSel = 'l' | 'r'
 
+/// Канал входа, как его отдаёт список узлов. Карта зоны выбирает сторону
+/// стерео, но кабельный выход зоны — такой же вход: отмеченный канал должен
+/// быть в списке, даже когда слот захвата занят линейным входом.
+export type MappingInput = {
+  id: string
+  device_key: string
+  device_name: string
+  index: number
+  name: string
+  enabled: boolean
+  stream: ChanSel | null
+}
+
+export type MappingChoice = { id: string; side: ChanSel; label: string }
+
+/// `zvucast-{зона}`, не монитор `*-monitor` и не старый ключ `zvucast`.
+export function isZoneCableKey(key: string): boolean {
+  return key.startsWith('zvucast-') && !key.endsWith('-monitor')
+}
+
+/// Что можно выбрать источником выхода колонки.
+/// Пустой список входов — два имени по умолчанию, пока агент их не прислал.
+/// У кабеля подпись с именем устройства: иначе все «Левый» неразличимы.
+export function mappingChoices(inputs: readonly MappingInput[]): MappingChoice[] {
+  if (inputs.length === 0) {
+    return [
+      { id: 'default-l', side: 'l', label: 'Левый' },
+      { id: 'default-r', side: 'r', label: 'Правый' },
+    ]
+  }
+  const choices: MappingChoice[] = []
+  for (const side of ['l', 'r'] as const) {
+    const index = side === 'l' ? 0 : 1
+    for (const input of inputs) {
+      if (!input.enabled || input.index !== index) continue
+      const cable = isZoneCableKey(input.device_key)
+      if (input.stream !== side && !cable) continue
+      choices.push({
+        id: input.id,
+        side,
+        label: cable ? `${input.device_name}: ${input.name}` : input.name,
+      })
+    }
+  }
+  return choices
+}
+
 export interface ChannelMap {
   out_l: ChanSel | null
   out_r: ChanSel | null
