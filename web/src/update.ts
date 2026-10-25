@@ -16,8 +16,9 @@ export function offer(
   return 'missing'
 }
 
-/// «не вернулся» — 90 с прошли и узел offline. Пока он online, это
-/// «обновляется», пока версия не совпадёт или заметка не станет `rolled_back`.
+/// «не вернулся» — срок вышел и узел offline. Тот же срок на живом узле
+/// со старой версией — «не установилось»: агент уже прислал отказ или
+/// установка не сменила процесс. Заметка `failed` кончает ожидание сразу.
 /// `rolledBack` не гасится: страница показывает «откат», пока заметка такая.
 export function updateWait(
   online: boolean,
@@ -26,11 +27,15 @@ export function updateWait(
   wait: { version: string; note: string | null } | null,
   elapsedMs: number,
   limitMs: number,
-): { updating: boolean; silent: boolean; rolledBack: boolean } {
+): { updating: boolean; silent: boolean; rolledBack: boolean; failed: boolean } {
   const rolledBack = updateNote === 'rolled_back'
+  const notedFailed = updateNote === 'failed'
   const waiting = wait != null && nodeVersion !== wait.version
   const becameRolledBack = rolledBack && wait?.note !== 'rolled_back'
-  const silent = waiting && !becameRolledBack && !online && elapsedMs >= limitMs
-  const updating = waiting && !becameRolledBack && !silent
-  return { updating, silent, rolledBack }
+  const becameFailed = notedFailed && wait?.note !== 'failed'
+  const timedOut = waiting && !becameRolledBack && !becameFailed && elapsedMs >= limitMs
+  const silent = timedOut && !online
+  const failed = !rolledBack && (becameFailed || (timedOut && online) || (notedFailed && wait == null))
+  const updating = waiting && !becameRolledBack && !becameFailed && !timedOut
+  return { updating, silent, rolledBack, failed }
 }

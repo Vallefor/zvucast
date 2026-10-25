@@ -312,6 +312,22 @@ pub fn write_script(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf
 /// этого запуска — «уже обновляется». Ноль — служба стартовала, дальше
 /// [`wait_apply_unit`]. `--wait` на этом пути убил бы рестарт агента и вместе
 /// с ним отказ скрипта, который вышел до записи статуса.
+/// `/run` на платах смонтирован `noexec`, поэтому юнит не может запустить
+/// сам скрипт. `bash` читает файл, и `noexec` ему не мешает.
+pub fn apply_argv(script: &std::path::Path, file: &std::path::Path, sha256: &str, from: &str, to: &str) -> Vec<String> {
+    vec![
+        "systemd-run".into(),
+        "--collect".into(),
+        "--unit=zvucast-apply-update".into(),
+        "/bin/bash".into(),
+        script.display().to_string(),
+        file.display().to_string(),
+        sha256.into(),
+        from.into(),
+        to.into(),
+    ]
+}
+
 pub fn spawn_apply(
     script: &std::path::Path,
     file: &std::path::Path,
@@ -319,16 +335,10 @@ pub fn spawn_apply(
     from: &str,
     to: &str,
 ) -> std::io::Result<()> {
-    let status = std::process::Command::new("systemd-run")
-        .arg("--collect")
-        .arg("--unit=zvucast-apply-update")
-        .arg(script)
-        .arg(file)
-        .arg(sha256)
-        .arg(from)
-        .arg(to)
-        .status()?;
-    map_systemd_run_status(status)
+    let args = apply_argv(script, file, sha256, from, to);
+    let mut cmd = std::process::Command::new(&args[0]);
+    cmd.args(&args[1..]);
+    map_systemd_run_status(cmd.status()?)
 }
 
 fn map_systemd_run_status(status: std::process::ExitStatus) -> std::io::Result<()> {
@@ -605,6 +615,31 @@ mod tests {
         assert_eq!(
             apply_outcome(Some(r#"{"result":"rolled_back","from":"0.1.0+dev","to":"0.1.0"}"#)).unwrap(),
             Some("rolled_back")
+        );
+    }
+
+    #[test]
+    fn apply_unit_reads_the_script_because_run_is_noexec() {
+        let args = apply_argv(
+            std::path::Path::new("/run/zvucast-update/apply-update.sh"),
+            std::path::Path::new("/run/zvucast-update/zvucast"),
+            "abc",
+            "0.1.0+dev",
+            "0.1.2",
+        );
+        assert_eq!(
+            args,
+            [
+                "systemd-run",
+                "--collect",
+                "--unit=zvucast-apply-update",
+                "/bin/bash",
+                "/run/zvucast-update/apply-update.sh",
+                "/run/zvucast-update/zvucast",
+                "abc",
+                "0.1.0+dev",
+                "0.1.2",
+            ]
         );
     }
 

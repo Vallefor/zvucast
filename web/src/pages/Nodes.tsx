@@ -5,6 +5,7 @@ import { Badge, Button, Popup, useRun, useUi } from '../ui'
 
 const POLL_MS = 2000
 /// Свой POST: «не вернулся», если за это время узел так и остался offline.
+/// Живой узел на старой версии к этому сроку — «не установилось».
 const UPDATE_WAIT_MS = 90_000
 
 type ReleaseView = Awaited<ReturnType<typeof api.release>>
@@ -323,7 +324,8 @@ export default function Nodes() {
         for (const n of ns) {
           const wait = next[n.node_id]
           const rolled = n.update_note === 'rolled_back' && wait?.note !== 'rolled_back'
-          if (wait && (n.version === wait.version || rolled)) {
+          const failed = n.update_note === 'failed' && wait?.note !== 'failed'
+          if (wait && (n.version === wait.version || rolled || failed)) {
             delete next[n.node_id]
             changed = true
           }
@@ -455,6 +457,7 @@ export default function Nodes() {
         <span className="num">{n.version || '—'}</span>
         {phase.updating && <span>обновляется</span>}
         {phase.silent && <span>не вернулся</span>}
+        {phase.failed && !phase.updating && <span>не установилось</span>}
         {phase.rolledBack && <span>откат</span>}
         {kind === 'missing' && <span>нет файла в релизе</span>}
         {kind === 'ready' && !phase.updating && (

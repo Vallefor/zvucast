@@ -725,9 +725,21 @@ async fn apply_update(
 }
 
 async fn clear_updating_if_release(st: &AppState, node_id: &str, version: &str) {
-    let mut updating = st.updating.lock().await;
-    if updating.get(node_id).is_some_and(|sent| sent == version) {
-        updating.remove(node_id);
+    let hit = {
+        let mut updating = st.updating.lock().await;
+        if updating.get(node_id).is_some_and(|sent| sent == version) {
+            updating.remove(node_id);
+            true
+        } else {
+            false
+        }
+    };
+    if !hit {
+        return;
+    }
+    let mut reg = st.reg.lock().await;
+    if reg.list().iter().any(|n| n.node_id == node_id && n.update_note.as_deref() == Some("failed")) {
+        reg.set_update_note(node_id, None);
     }
 }
 
@@ -738,6 +750,9 @@ async fn record_node_event(st: &AppState, node_id: &str, kind: zproto::EventKind
         let mut reg = st.reg.lock().await;
         if rolled_back {
             reg.set_update_note(node_id, Some("rolled_back".into()));
+        }
+        if failed {
+            reg.set_update_note(node_id, Some("failed".into()));
         }
         reg.event(node_id, kind, detail);
     }
@@ -851,6 +866,8 @@ mod updating_set {
 
         record_node_event(&st, "n1", zproto::EventKind::UpdateFailed, "служба завершилась".into()).await;
         assert!(!st.updating.lock().await.contains_key("n1"));
+        let note = st.reg.lock().await.list().into_iter().find(|n| n.node_id == "n1").unwrap().update_note;
+        assert_eq!(note.as_deref(), Some("failed"));
         assert_eq!(
             st.reg.lock().await.last_event("n1").map(|(k, _)| *k),
             Some(zproto::EventKind::UpdateFailed)

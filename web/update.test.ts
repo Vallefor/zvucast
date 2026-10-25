@@ -13,37 +13,49 @@ test('не вернулся только когда узел замолчал', 
   const wait = { version: '0.1.0', note: null }
   const limit = 90_000
   assert.deepEqual(updateWait(true, '0.1.0+dev', null, wait, limit, limit), {
-    updating: true,
+    updating: false,
     silent: false,
     rolledBack: false,
+    failed: true,
   })
   assert.deepEqual(updateWait(false, '0.1.0+dev', null, wait, limit, limit), {
     updating: false,
     silent: true,
     rolledBack: false,
+    failed: false,
   })
   assert.deepEqual(updateWait(false, '0.1.0+dev', null, wait, limit - 1, limit), {
     updating: true,
     silent: false,
     rolledBack: false,
+    failed: false,
   })
   assert.deepEqual(updateWait(true, '0.1.0', null, wait, limit, limit), {
     updating: false,
     silent: false,
     rolledBack: false,
+    failed: false,
   })
   assert.deepEqual(updateWait(false, '0.1.0+dev', 'rolled_back', wait, limit, limit), {
     updating: false,
     silent: false,
     rolledBack: true,
+    failed: false,
   })
   assert.deepEqual(
     updateWait(true, '0.1.0+dev', 'rolled_back', { version: '0.1.0', note: 'rolled_back' }, limit, limit),
-    { updating: true, silent: false, rolledBack: true },
+    { updating: false, silent: false, rolledBack: true, failed: false },
   )
   assert.deepEqual(updateWait(true, '0.1.0+dev', 'rolled_back', null, limit, limit), {
     updating: false,
     silent: false,
     rolledBack: true,
+    failed: false,
+  })
+  assert.deepEqual(updateWait(true, '0.1.0+dev', 'failed', wait, 0, limit), {
+    updating: false,
+    silent: false,
+    rolledBack: false,
+    failed: true,
   })
 })
