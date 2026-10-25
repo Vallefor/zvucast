@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use zproto::{
     AgentMsg, BranchChannelMap, ChanSel, ChannelMap, CtlMsg, Endpoint, LinkKind, PipelineState, Role, RoleRx, RoleTx,
-    SecretString, Telemetry, ZoneEndpoints,
+    SecretString, SoloistState, Telemetry, ZoneEndpoints,
 };
 use zvucast::controller::{app, spawn_endpoint_pusher, AppState};
 
@@ -174,6 +174,9 @@ impl MockAgent {
             outputs: vec![],
             supports_virtual_output: false,
             link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap()))
             .await
@@ -199,6 +202,9 @@ impl MockAgent {
             outputs: vec![],
             supports_virtual_output: true,
             link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap())).await.unwrap();
         Self { ws }
@@ -285,6 +291,9 @@ impl MockAgent {
             outputs: vec![],
             supports_virtual_output: false,
             link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         ws.send(Message::Text(serde_json::to_string(&hello).unwrap()))
             .await
@@ -367,6 +376,9 @@ async fn node_list_reports_wifi_link() {
         outputs: vec![],
         supports_virtual_output: false,
         link: Some(LinkKind::Wifi),
+        setup: Some(vec![]),
+        soloist: SoloistState::Unknown,
+        soloist_command: String::new(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap()))
         .await
@@ -2106,6 +2118,9 @@ async fn ui_targets_follow_hello_and_prefs() {
         outputs: outs.collect(),
         supports_virtual_output: false,
         link: None,
+        setup: Some(vec![]),
+        soloist: SoloistState::Unknown,
+        soloist_command: String::new(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap())).await.unwrap();
     let mut col = MockAgent { ws };

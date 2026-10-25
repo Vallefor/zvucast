@@ -2204,7 +2204,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     let (mut sink, mut stream) = socket.split();
 
     // Первый кадр обязан быть Hello — иначе закрываем соединение.
-    let (node_id, name, roles, version, target, capture_device, playback_device, inputs, outputs, supports_virtual_output, link) = loop {
+    let (node_id, name, roles, version, target, capture_device, playback_device, inputs, outputs, supports_virtual_output, link, setup, soloist, soloist_command) = loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => match serde_json::from_str::<AgentMsg>(&text) {
                 Ok(AgentMsg::Hello {
@@ -2219,7 +2219,10 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                     outputs,
                     supports_virtual_output,
                     link,
-                }) => break (node_id, name, roles, version, target, capture_device, playback_device, inputs, outputs, supports_virtual_output, link),
+                    setup,
+                    soloist,
+                    soloist_command,
+                }) => break (node_id, name, roles, version, target, capture_device, playback_device, inputs, outputs, supports_virtual_output, link, setup, soloist, soloist_command),
                 _ => {
                     tracing::warn!("ws: первое сообщение не Hello — закрываем");
                     return;
@@ -2234,6 +2237,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
             }
         }
     };
+    let _ = (setup, soloist, soloist_command);
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<CtlMsg>(16);
     // Проба для финального mark_offline: после re-hello канал в реестре
@@ -2327,6 +2331,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<AgentMsg>(&text) {
                     Ok(AgentMsg::Telemetry(t)) => st.reg.lock().await.telemetry(&node_id, t),
+                    Ok(AgentMsg::Setup { .. }) => {}
                     Ok(AgentMsg::Event { kind, detail }) => {
                         record_node_event(&st, &node_id, kind, detail).await;
                     }

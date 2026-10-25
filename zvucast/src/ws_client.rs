@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use zproto::{AgentMsg, CtlMsg, EventKind, LinkKind, Role, Telemetry};
+use zproto::{AgentMsg, CtlMsg, EventKind, LinkKind, Role, SoloistState, Telemetry};
 
 use crate::config::AgentConfig;
 use crate::discovery::{query_bound, DISCOVERY_PORT};
@@ -269,6 +269,9 @@ async fn connect_once(
         outputs: outputs.to_vec(),
         supports_virtual_output,
         link: Some(if dial_link.wireless { LinkKind::Wifi } else { LinkKind::Wired }),
+        setup: Some(vec![]),
+        soloist: SoloistState::Unknown,
+        soloist_command: String::new(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;

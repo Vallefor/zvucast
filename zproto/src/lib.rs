@@ -89,6 +89,25 @@ pub mod proto {
         Wired,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SetupIssue {
+        pub id: String,
+        pub command: String,
+        #[serde(default)]
+        pub detail: String,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum SoloistState {
+        #[default]
+        Unknown,
+        Missing,
+        Ok,
+        Expired,
+        Failed,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[serde(tag = "type")]
     pub enum AgentMsg {
@@ -114,6 +133,19 @@ pub mod proto {
             /// Канал сессии. Старые агенты поле не шлют.
             #[serde(default)]
             link: Option<LinkKind>,
+            #[serde(default)]
+            setup: Option<Vec<SetupIssue>>,
+            #[serde(default)]
+            soloist: SoloistState,
+            #[serde(default)]
+            soloist_command: String,
+        },
+        Setup {
+            setup: Vec<SetupIssue>,
+            #[serde(default)]
+            soloist: SoloistState,
+            #[serde(default)]
+            soloist_command: String,
         },
         Telemetry(Telemetry),
         Event {
@@ -242,6 +274,9 @@ mod tests {
             outputs: vec![],
             supports_virtual_output: false,
             link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
@@ -319,6 +354,9 @@ mod tests {
             outputs: vec![],
             supports_virtual_output: false,
             link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"capture_device\":null"), "нет устройства — null: {s}");
@@ -400,6 +438,9 @@ mod tests {
             outputs: vec![],
             supports_virtual_output: false,
             link: Some(LinkKind::Wifi),
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"link\":\"wifi\""));
@@ -421,6 +462,9 @@ mod tests {
             outputs: vec![],
             supports_virtual_output: false,
             link: None,
+            setup: Some(vec![]),
+            soloist: SoloistState::Unknown,
+            soloist_command: String::new(),
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(v["node_id"], "u-1");
@@ -533,5 +577,39 @@ mod tests {
         };
         let s = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<CtlMsg>(&s).unwrap(), m);
+    }
+
+    #[test]
+    fn hello_without_setup_is_an_old_agent() {
+        let raw = r#"{"type":"Hello","node_id":"n","name":"pc","roles":["tx"],"version":"0.1.0","capture_device":null,"playback_device":null,"inputs":[],"outputs":[]}"#;
+        let AgentMsg::Hello { setup, soloist, soloist_command, .. } = serde_json::from_str(raw).unwrap() else {
+            panic!("не hello");
+        };
+        assert_eq!(setup, None);
+        assert_eq!(soloist, SoloistState::Unknown);
+        assert_eq!(soloist_command, "");
+    }
+
+    #[test]
+    fn setup_message_roundtrip() {
+        let m = AgentMsg::Setup {
+            setup: vec![SetupIssue {
+                id: "pipewire".into(),
+                command: "sudo true".into(),
+                detail: String::new(),
+            }],
+            soloist: SoloistState::Missing,
+            soloist_command: "curl soloist".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"type\":\"Setup\""));
+        assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
+        let bare = r#"{"type":"Setup","setup":[]}"#;
+        let AgentMsg::Setup { soloist, soloist_command, setup } = serde_json::from_str(bare).unwrap() else {
+            panic!("не setup");
+        };
+        assert!(setup.is_empty());
+        assert_eq!(soloist, SoloistState::Unknown);
+        assert_eq!(soloist_command, "");
     }
 }
