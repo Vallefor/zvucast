@@ -58,39 +58,52 @@ function outputRows(rx: NodeView | undefined): OutputRow[] {
 }
 
 function ChanSelect({
+  group,
   value,
   label,
   options,
   onChange,
 }: {
+  group: string
   value: ChanSel | null
   label: string
   options: MappingChoice[]
   onChange: (v: ChanSel | null) => void
 }) {
   // Несколько каналов могут быть одной стороной (линейный вход и кабель).
-  // Выбор держим на том пункте, который нажали: иначе селект схлопывается
-  // на первый канал этой стороны.
+  // Список всегда раскрыт: закрытый селект показывал только микрофон,
+  // и кабель было видно лишь когда обычные каналы выключены.
   const [picked, setPicked] = useState<string | null>(null)
   const held = value != null ? options.find((o) => o.id === picked && o.side === value) : undefined
   const shown = held?.id ?? (value == null ? '' : options.find((o) => o.side === value)?.id ?? '')
+  const choose = (id: string) => {
+    setPicked(id || null)
+    const choice = options.find((o) => o.id === id)
+    onChange(choice ? choice.side : null)
+  }
   return (
-    <select
-      className="select"
-      aria-label={label}
-      value={shown}
-      onChange={(e) => {
-        const id = e.target.value
-        setPicked(id || null)
-        const choice = options.find((o) => o.id === id)
-        onChange(choice ? choice.side : null)
-      }}
-    >
+    <div role="radiogroup" aria-label={label} className="stack" style={{ gap: '0.2rem' }}>
       {options.map((o) => (
-        <option key={o.id} value={o.id}>{o.label}</option>
+        <label key={o.id} className="inline">
+          <input
+            type="radio"
+            name={group}
+            checked={shown === o.id}
+            onChange={() => choose(o.id)}
+          />
+          {o.label}
+        </label>
       ))}
-      <option value="">—</option>
-    </select>
+      <label className="inline">
+        <input
+          type="radio"
+          name={group}
+          checked={shown === ''}
+          onChange={() => choose('')}
+        />
+        —
+      </label>
+    </div>
   )
 }
 
@@ -380,15 +393,16 @@ function ZoneCard({
                       <div key={sourceId}>
                         {manySources && <div className="device-name">{srcName}</div>}
                         {rows.map((row) => (
-                          <label key={`${sourceId}-${row.side}`} className="inline">
-                            {row.label}
+                          <div key={`${sourceId}-${row.side}`} className="stack" style={{ gap: '0.25rem', marginTop: '0.45rem' }}>
+                            <div>{row.label}</div>
                             <ChanSelect
+                              group={`${id}-${sourceId}-${row.side}`}
                               label={`${row.label}, ${label}, ${srcName}`}
                               options={srcOptions}
                               value={row.side === 'out_l' ? map.out_l : map.out_r}
                               onChange={(v) => patchMap(id, sourceKey, row.side, v)}
                             />
-                          </label>
+                          </div>
                         ))}
                       </div>
                     )

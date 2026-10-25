@@ -41,10 +41,11 @@ export function mappingChoices(inputs: readonly MappingInput[]): MappingChoice[]
       if (!input.enabled || input.index !== index) continue
       const cable = isZoneCableKey(input.device_key)
       if (input.stream !== side && !cable) continue
+      const named = input.name.startsWith(input.device_name)
       choices.push({
         id: input.id,
         side,
-        label: cable ? `${input.device_name}: ${input.name}` : input.name,
+        label: cable && !named ? `${input.device_name}: ${input.name}` : input.name,
       })
     }
   }
