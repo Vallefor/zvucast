@@ -210,8 +210,8 @@ pub mod proto {
         SetVirtualOutput { enabled: bool },
         /// Куда смотрит захват. None — голова без цели (на PipeWire это тишина).
         SetCaptureTarget { device_key: Option<String> },
-        /// Куда играет rx. None — на PipeWire прежний запасной sink, не zvucast.
-        SetPlaybackTarget { device_key: Option<String> },
+        /// Куда играет rx. Пустой вектор — запасной sink; непустой — играть только в эти узлы.
+        SetPlaybackTarget { device_keys: Vec<String> },
         /// Зоны, чей монитор не подмешивается: id в множестве → source зоны None.
         SetMutedZones { zones: Vec<String> },
         ApplyUpdate {
@@ -283,10 +283,12 @@ mod tests {
 
     #[test]
     fn playback_and_mute_messages_roundtrip() {
-        let play = CtlMsg::SetPlaybackTarget { device_key: Some("alsa_output.pci.analog-stereo".into()) };
+        let play = CtlMsg::SetPlaybackTarget {
+            device_keys: vec!["alsa_output.pci.analog-stereo".into()],
+        };
         assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&play).unwrap()).unwrap(), play);
 
-        let clear = CtlMsg::SetPlaybackTarget { device_key: None };
+        let clear = CtlMsg::SetPlaybackTarget { device_keys: vec![] };
         assert_eq!(serde_json::from_str::<CtlMsg>(&serde_json::to_string(&clear).unwrap()).unwrap(), clear);
 
         let muted = CtlMsg::SetMutedZones { zones: vec!["hall".into(), "bed".into()] };

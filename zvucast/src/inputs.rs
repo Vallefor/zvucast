@@ -87,6 +87,33 @@ pub fn playback_target(views: &[InputView]) -> Option<String> {
     playback_targets(views).into_iter().next()
 }
 
+/// Куда играть выбранные выходы. `Fallback` — запасной sink.
+/// Пустой `Nodes` — выбранное не совпало с живыми узлами, запасной не подставлять.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybackRoute {
+    Fallback,
+    Nodes(Vec<String>),
+}
+
+/// Пустой выбор — запасной sink, даже если живых узлов нет.
+/// Снимка нет, а выбор непуст — пустой маршрут.
+/// Иначе выбранные имена, которые живы, в исходном порядке и без дублей.
+pub fn playback_route(selected: &[String], live: Option<&BTreeSet<String>>) -> PlaybackRoute {
+    if selected.is_empty() {
+        return PlaybackRoute::Fallback;
+    }
+    let Some(live) = live else {
+        return PlaybackRoute::Nodes(Vec::new());
+    };
+    let mut nodes = Vec::new();
+    for key in selected {
+        if live.contains(key) && !nodes.iter().any(|seen| seen == key) {
+            nodes.push(key.clone());
+        }
+    }
+    PlaybackRoute::Nodes(nodes)
+}
+
 /// Зона кабеля `zvucast-{id}`, у которого все каналы index <= 1 выключены.
 /// Кабеля в списке нет — зону не глушим.
 pub fn muted_zone_ids(views: &[InputView]) -> BTreeSet<String> {
@@ -831,5 +858,46 @@ mod tests {
         );
         assert_eq!(masked.out_l, Some(ChanSel::L));
         assert!(masked.out_r.is_none());
+    }
+
+    #[test]
+    fn playback_route_does_not_substitute_the_default_sink() {
+        use std::collections::BTreeSet;
+        let live = BTreeSet::from([
+            "alsa_output.platform-soc_sound.stereo-fallback".to_string(),
+            "alsa_output.platform-fe00b840.mailbox.stereo-fallback".to_string(),
+        ]);
+        assert_eq!(playback_route(&[], Some(&live)), PlaybackRoute::Fallback);
+        assert_eq!(playback_route(&[], None), PlaybackRoute::Fallback);
+        assert_eq!(
+            playback_route(
+                &["alsa_output.platform-soc_sound.stereo-fallback".into()],
+                Some(&live),
+            ),
+            PlaybackRoute::Nodes(vec!["alsa_output.platform-soc_sound.stereo-fallback".into()])
+        );
+        assert_eq!(
+            playback_route(&["snd_rpi_hifiberry_dac".into()], Some(&live)),
+            PlaybackRoute::Nodes(vec![])
+        );
+        assert_eq!(
+            playback_route(
+                &["alsa_output.platform-soc_sound.stereo-fallback".into()],
+                None,
+            ),
+            PlaybackRoute::Nodes(vec![])
+        );
+        let both = vec![
+            "alsa_output.platform-fe00b840.mailbox.stereo-fallback".to_string(),
+            "alsa_output.platform-soc_sound.stereo-fallback".to_string(),
+            "snd_rpi_hifiberry_dac".to_string(),
+        ];
+        assert_eq!(
+            playback_route(&both, Some(&live)),
+            PlaybackRoute::Nodes(vec![
+                "alsa_output.platform-fe00b840.mailbox.stereo-fallback".into(),
+                "alsa_output.platform-soc_sound.stereo-fallback".into(),
+            ])
+        );
     }
 }

@@ -134,38 +134,40 @@ impl Drop for MonitorCapture {
     }
 }
 
-/// Воспроизведение зоны отдельным pw-play. pipewiresink в агенте этого не
-/// делает: в PAUSED он гасит поток, а ссылки на выход остаются active, и
-/// часы колонок встают, пока жив процесс.
+/// Воспроизведение отдельными pw-play: запасной sink или по процессу на узел.
+/// pipewiresink в агенте этого не делает: в PAUSED он гасит поток, а ссылки
+/// на выход остаются active, и часы колонок встают, пока жив процесс.
 struct DesktopPlay {
     stop: Arc<AtomicBool>,
-    child: Arc<Mutex<Option<Child>>>,
+    players: Vec<Arc<Mutex<Option<Child>>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DesktopPlay {
-    fn start(appsink: gst::Element, sink_node: Option<String>) -> Result<Self> {
+    fn start(appsink: gst::Element, route: crate::inputs::PlaybackRoute) -> Result<Self> {
         let appsink = appsink
             .dynamic_cast::<gst_app::AppSink>()
             .map_err(|_| anyhow::anyhow!("asink не appsink"))?;
         let stop = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(None));
+        let players = playback_slots(&route);
         let stop_thread = stop.clone();
-        let child_thread = child.clone();
+        let players_thread = players.clone();
         let thread = std::thread::Builder::new()
             .name("zvucast-play".into())
-            .spawn(move || play_desktop(appsink, child_thread, stop_thread, sink_node))
+            .spawn(move || play_desktop(appsink, players_thread, stop_thread, route))
             .context("поток воспроизведения")?;
         Ok(Self {
             stop,
-            child,
+            players,
             thread: Mutex::new(Some(thread)),
         })
     }
 
     fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        close_player(&self.child);
+        for slot in &self.players {
+            close_player(slot);
+        }
         if let Ok(mut slot) = self.thread.lock() {
             if let Some(thread) = slot.take() {
                 let _ = thread.join();
@@ -180,17 +182,32 @@ impl Drop for DesktopPlay {
     }
 }
 
+fn playback_slots(route: &crate::inputs::PlaybackRoute) -> Vec<Arc<Mutex<Option<Child>>>> {
+    let count = match route {
+        crate::inputs::PlaybackRoute::Fallback => 1,
+        crate::inputs::PlaybackRoute::Nodes(names) => names.len(),
+    };
+    (0..count).map(|_| Arc::new(Mutex::new(None))).collect()
+}
+
 fn play_desktop(
     appsink: gst_app::AppSink,
-    child: Arc<Mutex<Option<Child>>>,
+    players: Vec<Arc<Mutex<Option<Child>>>>,
     stop: Arc<AtomicBool>,
-    sink_node: Option<String>,
+    route: crate::inputs::PlaybackRoute,
 ) {
+    if let crate::inputs::PlaybackRoute::Nodes(names) = &route {
+        if names.is_empty() {
+            tracing::warn!("pw-play: выбранные выходы не совпали с живыми sink");
+        }
+    }
     while !stop.load(Ordering::Relaxed) {
         let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(200)) else {
             // Нет RTP — процесс не должен висеть suspended со ссылками.
             // В Null try_pull возвращается сразу, без паузы это был бы пустой цикл.
-            close_player(&child);
+            for slot in &players {
+                close_player(slot);
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
@@ -199,11 +216,27 @@ fn play_desktop(
         if map.is_empty() {
             continue;
         }
-        if !write_player(&child, map.as_slice(), sink_node.as_deref()) {
-            close_player(&child);
+        let bytes = map.as_slice();
+        match &route {
+            crate::inputs::PlaybackRoute::Fallback => {
+                if let Some(slot) = players.first() {
+                    if !write_player(slot, bytes, None) {
+                        close_player(slot);
+                    }
+                }
+            }
+            crate::inputs::PlaybackRoute::Nodes(names) => {
+                for (slot, name) in players.iter().zip(names.iter()) {
+                    if !write_player(slot, bytes, Some(name.as_str())) {
+                        close_player(slot);
+                    }
+                }
+            }
         }
     }
-    close_player(&child);
+    for slot in &players {
+        close_player(slot);
+    }
 }
 
 fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> bool {
@@ -223,12 +256,15 @@ fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&st
 }
 
 fn spawn_player(sink_node: Option<&str>) -> Result<Child> {
-    let configured = sink_node
-        .filter(|name| !crate::inputs::is_virtual_sink_name(name))
-        .map(str::to_string);
-    let target = configured
-        .or_else(crate::pipeline::desktop_playback_target)
-        .context("нет sink кроме zvucast")?;
+    let target = match sink_node {
+        Some(name) => {
+            if crate::inputs::is_virtual_sink_name(name) {
+                anyhow::bail!("виртуальный sink не цель pw-play");
+            }
+            name.to_string()
+        }
+        None => crate::pipeline::desktop_playback_target().context("нет sink кроме zvucast")?,
+    };
     Command::new("pw-play")
         .args([
             "--raw",
@@ -392,7 +428,7 @@ impl Runner {
     pub fn new_rx_pw(
         pipeline_cfg: &crate::config::PipelineCfg,
         cm: &ChannelMap,
-        sink_node: Option<&str>,
+        route: crate::inputs::PlaybackRoute,
         ports: &[u16],
         branches: &[(u16, ChannelMap)],
         bind: &mut dyn crate::pipeline::LocalUdp,
@@ -400,7 +436,7 @@ impl Runner {
         let pipeline = crate::pipeline::build_rx_pw_ports(pipeline_cfg, cm, ports, branches, bind)?;
         let mut runner = Runner::from_pipeline_with_card(pipeline, None);
         let sink = runner.pipeline.by_name("asink").context("appsink asink")?;
-        runner.playback = Some(DesktopPlay::start(sink, sink_node.map(str::to_string))?);
+        runner.playback = Some(DesktopPlay::start(sink, route)?);
         Ok(runner)
     }
 
@@ -769,14 +805,14 @@ appl_ptr    : 313632\n";
     #[test]
     fn runner_new_rx_pw_builds() {
         gst::init().unwrap();
-        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), None, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), crate::inputs::PlaybackRoute::Fallback, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
         assert!(r.pipeline().by_name("asink").is_some());
     }
 
     #[test]
     fn stop_leaves_the_playback_thread_alive() {
         gst::init().unwrap();
-        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), None, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), crate::inputs::PlaybackRoute::Fallback, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
         r.stop();
         let alive = std::fs::read_dir("/proc/self/task")
             .unwrap()

@@ -2195,9 +2195,9 @@ fn push_capture_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs
 
 fn push_playback_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref]) {
     let found = reg.playback_outputs(node_id);
-    let views = crate::inputs::merge_inputs(&found, prefs);
-    let device_key = crate::inputs::playback_target(&views);
-    let _ = reg.send_cmd(node_id, CtlMsg::SetPlaybackTarget { device_key });
+    let views = crate::inputs::merge_outputs(&found, prefs);
+    let device_keys = crate::inputs::playback_targets(&views);
+    let _ = reg.send_cmd(node_id, CtlMsg::SetPlaybackTarget { device_keys });
 }
 
 async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
