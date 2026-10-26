@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
+import { chanWord, flowDevices, isPlaying, showStartAll, showStopAll, transport } from '../nodesView'
 import { offer, updateWait } from '../update'
 import { Badge, Button, Popup, useRun, useUi } from '../ui'
 
@@ -34,6 +35,113 @@ function linkLabel(link: NodeView['link']): string {
   if (link === 'wifi') return 'Wi‑Fi'
   if (link === 'wired') return 'Провод'
   return '—'
+}
+
+/// Нет сети важнее звука: офлайн не бывает «играет», даже если телеметрия старая.
+function presenceWord(n: NodeView): { text: string; tone: 'faint' | 'good' | 'quiet' } {
+  if (!n.online) return { text: 'не в сети', tone: 'faint' }
+  if (isPlaying(n.telemetry)) return { text: 'играет', tone: 'good' }
+  return { text: 'стоит', tone: 'quiet' }
+}
+
+/// Живые метры. Пустое значение не занимает место прочерком.
+function meterFacts(n: NodeView): { key: string; label: string; value: string }[] {
+  const tm = n.telemetry
+  const tx = tm?.tx ?? null
+  const rx = tm?.rx ?? null
+  const items: { key: string; label: string; value: string }[] = []
+  const rmsLive = tx?.state === 'playing'
+    && [tx.rms_l, tx.rms_r].some((v) => Number.isFinite(v) && v !== 0)
+  if (tx && rmsLive) {
+    items.push({
+      key: 'rms',
+      label: 'RMS',
+      value: `${rmsText(tx.rms_l)} / ${rmsText(tx.rms_r)}`,
+    })
+  }
+  if (rx?.state === 'playing' && rx.queue_ms >= 0) {
+    items.push({ key: 'queue', label: 'Очередь', value: String(rx.queue_ms) })
+  }
+  if (rx && rx.dropped > 0) {
+    items.push({ key: 'drop', label: 'Заикания', value: String(rx.dropped) })
+  }
+  if (n.online && tm && Math.abs(tm.ptp_offset_ns) <= 1e12) {
+    items.push({ key: 'ptp', label: 'PTP', value: (tm.ptp_offset_ns / 1000).toFixed(1) })
+  }
+  if (tm) items.push({ key: 'up', label: 'Uptime', value: fmtUptime(tm.uptime_s) })
+  return items
+}
+
+function NodeBoard() {
+  const pins = [30, 40, 50, 60]
+  return (
+    <svg className="node-board" viewBox="0 0 148 92" aria-hidden="true">
+      <rect className="node-board-plate" x="8" y="6" width="132" height="80" rx="12" />
+      <circle className="node-board-mark" cx="20" cy="18" r="2.3" />
+      <circle className="node-board-mark" cx="128" cy="18" r="2.3" />
+      <circle className="node-board-mark" cx="20" cy="74" r="2.3" />
+      <circle className="node-board-mark" cx="128" cy="74" r="2.3" />
+      {pins.map((y) => (
+        <rect key={`l${y}`} className="node-board-pin" x="0" y={y} width="12" height="3.5" rx="1" />
+      ))}
+      {pins.map((y) => (
+        <rect key={`r${y}`} className="node-board-pin" x="136" y={y} width="12" height="3.5" rx="1" />
+      ))}
+      <path className="node-board-trace" d="M12 31.7H46M12 41.7H40M12 51.7H40M12 61.7H46M102 31.7H136M108 41.7H136M108 51.7H136M102 61.7H136" />
+      <rect className="node-board-chip" x="50" y="28" width="48" height="36" rx="4" />
+    </svg>
+  )
+}
+
+function NodeFlags({ node }: { node: NodeView }) {
+  return (
+    <>
+      {node.virtual_output && (
+        <svg className="node-flag node-flag-virtual" width="18" height="18" viewBox="0 0 18 18" role="img" aria-label="Виртуальная колонка">
+          <path fill="currentColor" d="M2.6 6.5h2.5L8.6 3.5v11L5.1 11.5H2.6V6.5z" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M10.7 7a2.6 2.6 0 0 1 0 4" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M12.4 5.3a4.9 4.9 0 0 1 0 7.4" />
+        </svg>
+      )}
+      {node.spotify && (
+        <svg className="node-flag node-flag-spotify" width="18" height="18" viewBox="0 0 18 18" role="img" aria-label="Spotify">
+          <ellipse cx="6.5" cy="13.1" rx="2.5" ry="1.75" transform="rotate(-28 6.5 13.1)" fill="currentColor" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.5 12.2V3.6" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.5 3.8c2.5.55 4.3 1.45 4.3 1.45" />
+        </svg>
+      )}
+      {node.sendspin && (
+        <svg className="node-flag node-flag-sendspin" width="18" height="18" viewBox="0 0 18 18" role="img" aria-label="Sendspin">
+          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M9.1 3.2a5.1 5.1 0 0 1 4.3 2.5" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M13.5 2.8v3.1h-3.1" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.9 14.8a5.1 5.1 0 0 1-4.3-2.5" />
+          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M4.5 15.2V12.1h3.1" />
+        </svg>
+      )}
+    </>
+  )
+}
+
+function FlowSide({
+  kind,
+  label,
+  devices,
+}: {
+  kind: 'in' | 'out'
+  label: string
+  devices: { key: string; name: string; count: number }[]
+}) {
+  return (
+    <div className={`node-flow-side node-flow-${kind}`}>
+      <div className="node-flow-label">{label}</div>
+      {devices.map((device) => (
+        <div key={device.key} className="flow-chip">
+          <span className="flow-chip-name" title={device.name}>{device.name}</span>
+          <span className="flow-count" aria-label={`${device.count} ${chanWord(device.count)}`}>{device.count}</span>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function nodeTitle(n: NodeView) {
@@ -351,24 +459,6 @@ function rolesOf(n: NodeView) {
   ))
 }
 
-function facts(n: NodeView) {
-  const tm = n.telemetry
-  const tx = tm?.tx ?? null
-  const rx = tm?.rx ?? null
-  const ptp = tm && Math.abs(tm.ptp_offset_ns) <= 1e12 ? (tm.ptp_offset_ns / 1000).toFixed(1) : '—'
-  const queue = rx && rx.queue_ms >= 0 ? String(rx.queue_ms) : '—'
-  return [
-    ['TX', tx?.state ?? '—'],
-    ['RMS L/R', tx ? `${rmsText(tx.rms_l)} / ${rmsText(tx.rms_r)}` : '—'],
-    ['RX', rx?.state ?? '—'],
-    ['Заикания', rx ? String(rx.dropped) : '—'],
-    ['Rendered', rx ? String(rx.rendered) : '—'],
-    ['Очередь, мс', queue],
-    ['PTP, мкс', ptp],
-    ['Uptime', tm ? fmtUptime(tm.uptime_s) : '—'],
-  ] as const
-}
-
 export default function Nodes() {
   const run = useRun()
   const { confirm, toast } = useUi()
@@ -538,16 +628,23 @@ export default function Nodes() {
     )
   }
 
-  const actions = (n: NodeView, compact = false) => (
-    <>
-      <Button className={compact ? 'btn-compact' : undefined} onClick={() => setSettingsId(n.node_id)}>Настройки</Button>
-      <Button className={compact ? 'btn-compact' : undefined} onClick={() => void run(api.nodeCmd(n.node_id, 'start'), 'старт')}>Старт</Button>
-      <Button className={compact ? 'btn-compact' : undefined} onClick={() => void run(api.nodeCmd(n.node_id, 'stop'), 'стоп')}>Стоп</Button>
-      {masterNodeId !== n.node_id && (
-        <Button className={compact ? 'btn-compact' : undefined} disabled={!n.online} onClick={() => void transfer(n)}>Сделать мастером</Button>
-      )}
-    </>
-  )
+  const actions = (n: NodeView) => {
+    const mode = transport(n.online, isPlaying(n.telemetry))
+    return (
+      <>
+        <Button onClick={() => setSettingsId(n.node_id)}>Настройки</Button>
+        {mode === 'start' && (
+          <Button onClick={() => void run(api.nodeCmd(n.node_id, 'start'), 'старт')}>Старт</Button>
+        )}
+        {mode === 'stop' && (
+          <Button onClick={() => void run(api.nodeCmd(n.node_id, 'stop'), 'стоп')}>Стоп</Button>
+        )}
+        {masterNodeId !== n.node_id && (
+          <Button disabled={!n.online} onClick={() => void transfer(n)}>Сделать мастером</Button>
+        )}
+      </>
+    )
+  }
 
   const marks = (n: NodeView) => (
     <>
@@ -567,6 +664,7 @@ export default function Nodes() {
   }
 
   const online = nodes.filter((n) => n.online).length
+  const presence = nodes.map((n) => ({ online: n.online, playing: isPlaying(n.telemetry) }))
 
   return (
     <main className="page">
@@ -576,106 +674,76 @@ export default function Nodes() {
           <p className="lede">{online} из {nodes.length} в сети</p>
         </div>
         <div className="toolbar">
-          <Button variant="primary" onClick={() => void run(fetch('/api/start-all', { method: 'POST' }), 'старт всех')}>
-            Старт всех
-          </Button>
-          <Button onClick={() => void run(fetch('/api/stop-all', { method: 'POST' }), 'стоп всех')}>
-            Стоп всех
-          </Button>
+          {showStartAll(presence) && (
+            <Button variant="primary" onClick={() => void run(fetch('/api/start-all', { method: 'POST' }), 'старт всех')}>
+              Старт всех
+            </Button>
+          )}
+          {showStopAll(presence) && (
+            <Button onClick={() => void run(fetch('/api/stop-all', { method: 'POST' }), 'стоп всех')}>
+              Стоп всех
+            </Button>
+          )}
           <Button onClick={() => void updateAll()}>Обновить все</Button>
         </div>
       </div>
 
       {setupBlock(nodes)}
 
-      <div className="table-wrap only-wide">
-        <table className="data">
-          <thead>
-            <tr>
-              <th>Имя</th>
-              <th>IP</th>
-              <th>Интерфейс</th>
-              <th>Роли</th>
-              <th>Статус</th>
-              <th>TX</th>
-              <th>RMS L/R, дБ</th>
-              <th>RX</th>
-              <th>Заикания</th>
-              <th>Rendered</th>
-              <th>Очередь</th>
-              <th>PTP, мкс</th>
-              <th>Uptime</th>
-              <th>Версия</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {nodes.map((n) => {
-              const row = facts(n)
-              return (
-                <tr key={`${n.node_id}@${n.ip}`} className={n.online ? '' : 'off'}>
-                  <td>
-                    {nodeTitle(n)}
-                    {' '}
-                    {marks(n)}
-                  </td>
-                  <td className="num">{n.ip || '—'}</td>
-                  <td>{linkLabel(n.link)}</td>
-                  <td>{rolesOf(n)}</td>
-                  <td>
-                    <span className={`dot ${n.online ? 'dot-on' : 'dot-off'}`} /> {n.online ? 'online' : 'offline'}
-                  </td>
-                  <td>{row[0][1]}</td>
-                  <td className="num">{row[1][1]}</td>
-                  <td>{row[2][1]}</td>
-                  <td className="num">{row[3][1]}</td>
-                  <td className="num">{row[4][1]}</td>
-                  <td className="num">{row[5][1]}</td>
-                  <td className="num">{row[6][1]}</td>
-                  <td className="num">{row[7][1]}</td>
-                  <td>{versionCell(n, true)}</td>
-                  <td className="row">{actions(n, true)}</td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="cards only-narrow">
-        {nodes.map((n) => (
-          <article key={`${n.node_id}@${n.ip}`} className={`card${n.online ? '' : ' off'}`}>
-            <div className="card-head">
-              <div className="card-title">
-                <span className={`dot ${n.online ? 'dot-on' : 'dot-off'}`} />
-                {nodeTitle(n)}
-                {marks(n)}
+      <div className="node-cards">
+        {nodes.map((n) => {
+          const inputs = n.roles.includes('tx') ? flowDevices(n.inputs ?? []) : []
+          const outputs = n.roles.includes('rx') ? flowDevices(n.outputs ?? []) : []
+          const state = presenceWord(n)
+          const meters = meterFacts(n)
+          const flagged = Boolean(n.virtual_output || n.spotify || n.sendspin)
+          return (
+            <article key={`${n.node_id}@${n.ip}`} className="node-card">
+              <header className="node-card-head">
+                <div className="node-card-title">
+                  {nodeTitle(n)}
+                  {rolesOf(n)}
+                  {marks(n)}
+                </div>
+                <div className="node-card-link">
+                  <span className="num">{n.ip || '—'}</span>
+                  <span>{linkLabel(n.link)}</span>
+                </div>
+              </header>
+              <div className="node-flow">
+                {inputs.length > 0 && <FlowSide kind="in" label="Входы" devices={inputs} />}
+                <div className={`node-board-wrap${n.online ? ' is-on' : ''}`}>
+                  <NodeBoard />
+                  <p className={`node-state is-${state.tone}`}>{state.text}</p>
+                </div>
+                {outputs.length > 0 && <FlowSide kind="out" label="Выходы" devices={outputs} />}
               </div>
-              <div className="row">{rolesOf(n)}</div>
-            </div>
-            <dl className="kv">
-              <span style={{ display: 'contents' }}>
-                <dt>IP</dt>
-                <dd className="num">{n.ip || '—'}</dd>
-              </span>
-              <span style={{ display: 'contents' }}>
-                <dt>Интерфейс</dt>
-                <dd>{linkLabel(n.link)}</dd>
-              </span>
-              <span style={{ display: 'contents' }}>
-                <dt>Версия</dt>
-                <dd>{versionCell(n)}</dd>
-              </span>
-              {facts(n).map(([k, v]) => (
-                <span key={k} style={{ display: 'contents' }}>
-                  <dt>{k}</dt>
-                  <dd className="num">{v}</dd>
-                </span>
-              ))}
-            </dl>
-            <div className="card-actions" style={{ marginTop: '0.75rem' }}>{actions(n)}</div>
-          </article>
-        ))}
+              <footer className="node-card-foot">
+                {meters.length > 0 && (
+                  <div className="node-meters">
+                    {meters.map((item) => (
+                      <span key={item.key} className="node-meter">
+                        <span className="node-meter-label">{item.label}</span>
+                        <span className="num">{item.value}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="node-card-bar">
+                  <div className="node-card-meta">
+                    {versionCell(n)}
+                    {flagged && (
+                      <span className="node-flags">
+                        <NodeFlags node={n} />
+                      </span>
+                    )}
+                  </div>
+                  <div className="card-actions">{actions(n)}</div>
+                </div>
+              </footer>
+            </article>
+          )
+        })}
       </div>
       {settingsNode && (
         <NodeSettings key={settingsNode.node_id} node={settingsNode} onClose={() => setSettingsId(null)} />
