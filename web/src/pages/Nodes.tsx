@@ -92,7 +92,7 @@ function setupBlock(nodes: NodeView[]) {
       })
     }
     if (rows.length === 0) return []
-    return [{ id: n.node_id, name: n.display_name ?? n.name, rows }]
+    return [{ id: `${n.node_id}@${n.ip}`, name: n.display_name ?? n.name, rows }]
   })
   if (groups.length === 0) return null
   return (
