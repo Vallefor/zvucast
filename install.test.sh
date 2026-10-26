@@ -86,6 +86,9 @@ EOF
 cat > "$bin/apt-get" <<EOF
 #!/bin/bash
 echo "\$*" >> "$work/apt.log"
+if [[ -n "\${APT_EXIT:-}" ]]; then
+  exit "\$APT_EXIT"
+fi
 exit 0
 EOF
 
@@ -340,5 +343,30 @@ run_install 0 \
   ZVUCAST_UID=1000
 grep -q pipewire "$work/pacman.log"
 [[ ! -s "$work/apt.log" ]]
+
+clean_logs
+set +e
+(
+  unset ZVUCAST_SPOTIFY ZVUCAST_CONTROLLER
+  export ZVUCAST_TEST_NOTTY=1 \
+    ZVUCAST_UNAME=x86_64 \
+    ZVUCAST_OS_RELEASE="$work/os-debian" \
+    ZVUCAST_ROOT="$work" \
+    ZVUCAST_USER=audio \
+    ZVUCAST_UID=1000
+  cat "$root/install.sh" | bash
+) >"$work/main.out" 2>"$work/main.err"
+code=$?
+set -e
+[[ "$code" -eq 2 ]]
+grep -q ZVUCAST_SPOTIFY "$work/main.err"
+grep -q ZVUCAST_CONTROLLER "$work/main.err"
+[[ ! -s "$work/apt.log" ]]
+
+run_install 1 \
+  "${base_env[@]}" \
+  ZVUCAST_SPOTIFY=0 \
+  ZVUCAST_CONTROLLER=0 \
+  APT_EXIT=100
 
 echo ok

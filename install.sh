@@ -297,12 +297,14 @@ install_packages() {
       pipewire pipewire-bin pipewire-pulse wireplumber \
       gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad gstreamer1.0-alsa gstreamer1.0-pipewire \
-      alsa-utils curl ca-certificates iw dbus-user-session rtkit python3
+      alsa-utils curl ca-certificates iw dbus-user-session rtkit python3 \
+      || exit 1
   else
     as_root pacman -S --needed --noconfirm \
       pipewire pipewire-alsa pipewire-pulse wireplumber \
       gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
-      gst-plugin-pipewire alsa-utils curl ca-certificates iw rtkit python
+      gst-plugin-pipewire alsa-utils curl ca-certificates iw rtkit python \
+      || exit 1
   fi
 }
 
@@ -659,6 +661,6 @@ main() {
   restart_units
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if ! (return 0 2>/dev/null); then
   main "$@"
 fi
