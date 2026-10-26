@@ -653,8 +653,8 @@ main() {
   install_session
   install_wifi
   install_binary
-  install_units
   install_toml
+  install_units
   install_soloist
   restart_units
 }
