@@ -52,6 +52,43 @@ export function mappingChoices(inputs: readonly MappingInput[]): MappingChoice[]
   return choices
 }
 
+/// Выход колонки, как его отдаёт список узлов. Для строк карты достаточно
+/// id, имени, включения и слота стерео.
+export type SpeakerOutput = {
+  id: string
+  name: string
+  enabled: boolean
+  stream: ChanSel | null
+}
+
+export type SpeakerOutputRow = {
+  id: string
+  side: 'out_l' | 'out_r'
+  label: string
+}
+
+/// Включённые выходы со слотом `l` или `r`. Пустой список — две строки
+/// по умолчанию, пока агент их не прислал. Id канала остаётся своим, чтобы
+/// две строки одной стороны не схлопнулись в одну.
+export function speakerOutputRows(outputs: readonly SpeakerOutput[]): SpeakerOutputRow[] {
+  if (outputs.length === 0) {
+    return [
+      { id: 'default-l', side: 'out_l', label: 'Левый выход' },
+      { id: 'default-r', side: 'out_r', label: 'Правый выход' },
+    ]
+  }
+  const rows: SpeakerOutputRow[] = []
+  for (const output of outputs) {
+    if (!output.enabled || (output.stream !== 'l' && output.stream !== 'r')) continue
+    rows.push({
+      id: output.id,
+      side: output.stream === 'l' ? 'out_l' : 'out_r',
+      label: output.name,
+    })
+  }
+  return rows
+}
+
 export interface ChannelMap {
   out_l: ChanSel | null
   out_r: ChanSel | null

@@ -6,6 +6,7 @@ import {
   canSendZoneMap,
   DEFAULT_ZONE_MAP,
   shouldSendZoneMap,
+  speakerOutputRows,
 } from './src/zoneMap.ts'
 
 test('вторая сторона не затирает первую, пока полл ещё со стерео', () => {
@@ -68,4 +69,19 @@ test('откат к поллу во время сохранения всё ра�
   // Без неподтверждённой другой карты совпадение с поллом — не слать.
   assert.equal(shouldSendZoneMap(reverted, polled, undefined), false)
   assert.equal(shouldSendZoneMap(reverted, polled, reverted), false)
+})
+
+test('два левых выхода остаются двумя строками', () => {
+  const rows = speakerOutputRows([
+    { id: 'jack:0', name: 'jack л', enabled: true, stream: 'l' },
+    { id: 'dac:0', name: 'цап л', enabled: true, stream: 'l' },
+    { id: 'jack:1', name: 'jack п', enabled: true, stream: 'r' },
+    { id: 'dac:1', name: 'цап п', enabled: true, stream: 'r' },
+    { id: 'off:0', name: 'выкл', enabled: false, stream: 'l' },
+    { id: 'silent:0', name: 'без слота', enabled: true, stream: null },
+  ])
+  assert.deepEqual(rows.map((r) => r.id), ['jack:0', 'dac:0', 'jack:1', 'dac:1'])
+  assert.deepEqual(rows.map((r) => r.side), ['out_l', 'out_l', 'out_r', 'out_r'])
+  assert.deepEqual(rows.map((r) => r.label), ['jack л', 'цап л', 'jack п', 'цап п'])
+  assert.deepEqual(speakerOutputRows([]).map((r) => r.id), ['default-l', 'default-r'])
 })
