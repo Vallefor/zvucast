@@ -64,15 +64,54 @@ pub fn capture_target(views: &[InputView]) -> Option<String> {
     Some(open_capture_name(key))
 }
 
-/// Ключ слота выхода. Правило то же, что у захвата, но виртуальный sink
-/// в слот не входит и целью воспроизведения не бывает.
-/// Заглушки `capture` и `playback` устройством не являются.
+/// Отсортированные уникальные ключи, у которых `stream` задан.
+/// Виртуальные ключи и заглушки `capture` / `playback` не входят.
+pub fn playback_targets(views: &[InputView]) -> Vec<String> {
+    let mut keys: Vec<String> = views
+        .iter()
+        .filter(|v| {
+            v.stream.is_some()
+                && !is_virtual_device_key(&v.device_key)
+                && v.device_key != "capture"
+                && v.device_key != "playback"
+        })
+        .map(|v| v.device_key.clone())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Первый ключ из [`playback_targets`].
 pub fn playback_target(views: &[InputView]) -> Option<String> {
-    let key = stereo_slot_key(views, false)?;
-    if key == "capture" || key == "playback" || is_virtual_device_key(&key) {
-        return None;
+    playback_targets(views).into_iter().next()
+}
+
+/// Куда играть выбранные выходы. `Fallback` — запасной sink.
+/// Пустой `Nodes` — выбранное не совпало с живыми узлами, запасной не подставлять.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybackRoute {
+    Fallback,
+    Nodes(Vec<String>),
+}
+
+/// Пустой выбор — запасной sink, даже если живых узлов нет.
+/// Снимка нет, а выбор непуст — пустой маршрут.
+/// Иначе выбранные имена, которые живы, в исходном порядке и без дублей.
+pub fn playback_route(selected: &[String], live: Option<&BTreeSet<String>>) -> PlaybackRoute {
+    if selected.is_empty() {
+        return PlaybackRoute::Fallback;
     }
-    Some(key)
+    let Some(live) = live else {
+        return PlaybackRoute::Nodes(Vec::new());
+    };
+    let mut nodes = Vec::new();
+    for key in selected {
+        if live.contains(key) && !nodes.iter().any(|seen| seen == key) {
+            nodes.push(key.clone());
+        }
+    }
+    PlaybackRoute::Nodes(nodes)
 }
 
 /// Зона кабеля `zvucast-{id}`, у которого все каналы index <= 1 выключены.
@@ -172,9 +211,35 @@ pub fn merge_inputs(discovered: &[CaptureChan], prefs: &[InputPref]) -> Vec<Inpu
     views
 }
 
+/// Сборка как у [`merge_inputs`], но стерео размечается на каждом включённом
+/// выходе, а не на одном слоте захвата.
+pub fn merge_outputs(discovered: &[CaptureChan], prefs: &[InputPref]) -> Vec<InputView> {
+    let mut views: Vec<InputView> = discovered
+        .iter()
+        .map(|ch| {
+            let pref = prefs.iter().find(|p| p.id == ch.id);
+            let name = pref
+                .map(|p| p.name.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| default_chan_name(ch.index));
+            InputView {
+                id: ch.id.clone(),
+                device_key: ch.device_key.clone(),
+                device_name: ch.device_name.clone(),
+                index: ch.index,
+                name,
+                enabled: pref.map(|p| p.enabled).unwrap_or(true),
+                stream: None,
+            }
+        })
+        .collect();
+    assign_playback_streams(&mut views);
+    views
+}
+
 /// Первое по алфавиту невиртуальное устройство с включённым каналом
 /// index <= 1. Такого нет и `allow_virtual` — первое виртуальное.
-/// Для выхода виртуальные ключи в слот не входят.
 fn stereo_slot_key(views: &[InputView], allow_virtual: bool) -> Option<String> {
     let mut hardware: Vec<&str> = views
         .iter()
@@ -217,28 +282,50 @@ fn assign_stream(views: &mut [InputView]) {
     }
 }
 
-/// Выключенный слот выхода в карту не попадает: этот выход молчит.
-/// Виртуальный sink слот выхода не занимает. Пустой список видов — агент
-/// ещё не прислал выходы, карту не трогаем.
+/// Для каждого невиртуального ключа, кроме заглушек `capture` и `playback`,
+/// если есть включённый канал с index <= 1: включённый 0 → `l`, включённый 1 → `r`.
+/// Виртуальные ключи не размечаются.
+fn assign_playback_streams(views: &mut [InputView]) {
+    let mut keys: Vec<String> = views
+        .iter()
+        .filter(|ch| {
+            ch.enabled
+                && ch.index <= 1
+                && !is_virtual_device_key(&ch.device_key)
+                && ch.device_key != "capture"
+                && ch.device_key != "playback"
+        })
+        .map(|ch| ch.device_key.clone())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    for ch in views.iter_mut() {
+        if !ch.enabled || !keys.iter().any(|key| key == &ch.device_key) {
+            continue;
+        }
+        ch.stream = match ch.index {
+            0 => Some("l".into()),
+            1 => Some("r".into()),
+            _ => None,
+        };
+    }
+}
+
+/// Сторона остаётся, если хотя бы у одного невиртуального включённого выхода
+/// есть этот index: 0 → `l`, 1 → `r`. Виртуальный ключ сторону не держит.
+/// Пустой список видов — агент ещё не прислал выходы, карту не трогаем.
 pub fn mask_disabled_outputs(map: zproto::ChannelMap, views: &[InputView]) -> zproto::ChannelMap {
     if views.is_empty() {
         return map;
     }
-    let key = stereo_slot_key(views, false);
-    let has = |slot: &str| {
-        let Some(key) = key.as_deref() else {
-            return false;
-        };
-        let index = match slot {
-            "l" => 0,
-            "r" => 1,
-            _ => return false,
-        };
-        views.iter().any(|v| v.device_key == key && v.enabled && v.index == index)
+    let has = |index: u16| {
+        views.iter().any(|v| {
+            !is_virtual_device_key(&v.device_key) && v.enabled && v.index == index
+        })
     };
     zproto::ChannelMap {
-        out_l: if has("l") { map.out_l } else { None },
-        out_r: if has("r") { map.out_r } else { None },
+        out_l: if has(0) { map.out_l } else { None },
+        out_r: if has(1) { map.out_r } else { None },
     }
 }
 
@@ -268,15 +355,81 @@ pub fn fallback_outputs(playback_device: Option<&str>) -> Vec<CaptureChan> {
 /// Устройства захвата через gst DeviceMonitor. Пустой список — вызывающий
 /// подставит `fallback_inputs`.
 pub fn discover_capture_channels() -> Vec<CaptureChan> {
-    discover_channels("Audio/Source")
+    discover_channels("Audio/Source", false)
 }
 
 /// Устройства воспроизведения. Пустой список — `fallback_outputs`.
 pub fn discover_playback_channels() -> Vec<CaptureChan> {
-    discover_channels("Audio/Sink")
+    let mut out = discover_channels("Audio/Sink", true);
+    if let Some(sinks) = live_sink_nodes() {
+        for chan in &mut out {
+            let device_key = resolve_playback_key(&chan.device_key, &chan.device_name, &sinks);
+            chan.id = format!("{device_key}:{}", chan.index);
+            chan.device_key = device_key;
+        }
+        sort_discovered(&mut out);
+    }
+    out
 }
 
-fn discover_channels(kind: &str) -> Vec<CaptureChan> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkNode {
+    pub node_name: String,
+    pub card_name: String,
+}
+
+pub fn sink_nodes_from_dump(json: &str) -> Vec<SinkNode> {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(props) = item.pointer("/info/props") else { continue };
+        if props.get("media.class").and_then(|v| v.as_str()) != Some("Audio/Sink") {
+            continue;
+        }
+        let Some(node_name) = props.get("node.name").and_then(|v| v.as_str()) else { continue };
+        if node_name.is_empty() {
+            continue;
+        }
+        let card_name = props
+            .get("alsa.card_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(SinkNode { node_name: node_name.to_string(), card_name });
+    }
+    out
+}
+
+pub fn resolve_playback_key(key: &str, device_name: &str, sinks: &[SinkNode]) -> String {
+    if sinks.iter().any(|s| s.node_name == key) {
+        return key.to_string();
+    }
+    let mut matches: Vec<&SinkNode> = sinks
+        .iter()
+        .filter(|s| !s.card_name.is_empty() && (s.card_name == key || s.card_name == device_name))
+        .collect();
+    matches.sort_by(|a, b| {
+        let rank = |n: &str| if n.contains("stereo-fallback") { 0 } else { 1 };
+        rank(&a.node_name).cmp(&rank(&b.node_name)).then(a.node_name.cmp(&b.node_name))
+    });
+    matches.first().map(|s| s.node_name.clone()).unwrap_or_else(|| key.to_string())
+}
+
+pub fn live_sink_nodes() -> Option<Vec<SinkNode>> {
+    let out = std::process::Command::new("timeout").args(["2", "pw-dump"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    if serde_json::from_str::<Vec<serde_json::Value>>(&text).is_err() {
+        return None;
+    }
+    Some(sink_nodes_from_dump(&text))
+}
+
+fn discover_channels(kind: &str, playback: bool) -> Vec<CaptureChan> {
     if gst::init().is_err() {
         return Vec::new();
     }
@@ -288,14 +441,7 @@ fn discover_channels(kind: &str) -> Vec<CaptureChan> {
     for dev in mon.devices() {
         let device_name = dev.display_name().to_string();
         let props = dev.properties();
-        let device_key = props
-            .as_ref()
-            .and_then(|p| {
-                ["device.string", "node.name", "object.path"]
-                    .into_iter()
-                    .find_map(|field| p.get::<String>(field).ok())
-            })
-            .filter(|s| !s.is_empty())
+        let device_key = device_key_from_props(props.as_ref(), playback)
             .unwrap_or_else(|| device_name.clone());
         let n = dev.caps().as_ref().map(channel_count).unwrap_or(2);
         for index in 0..n {
@@ -308,10 +454,28 @@ fn discover_channels(kind: &str) -> Vec<CaptureChan> {
         }
     }
     mon.stop();
+    sort_discovered(&mut out);
+    out
+}
+
+/// Воспроизведение: `node.name`, затем `device.string`, затем `object.path`.
+/// Захват: прежний порядок. Пустое свойство пропускается.
+fn device_key_from_props(props: Option<&gst::Structure>, playback: bool) -> Option<String> {
+    let props = props?;
+    let fields: &[&str] = if playback {
+        &["node.name", "device.string", "object.path"]
+    } else {
+        &["device.string", "node.name", "object.path"]
+    };
+    fields.iter().find_map(|field| {
+        props.get::<String>(*field).ok().filter(|value| !value.is_empty())
+    })
+}
+
+fn sort_discovered(out: &mut Vec<CaptureChan>) {
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
     out.sort_by(|a, b| a.device_name.cmp(&b.device_name).then(a.index.cmp(&b.index)));
-    out
 }
 
 fn channel_count(caps: &gst::Caps) -> u16 {
@@ -566,5 +730,174 @@ mod tests {
         assert!(!views[0].enabled);
         let gone = merge_inputs(&[], &prefs);
         assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn playback_key_resolves_card_name_to_node_name() {
+        let dump = r#"[
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-soc_sound.stereo-fallback",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}},
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-fe00b840.mailbox.stereo-fallback",
+        "alsa.card_name":"bcm2835 Headphones"
+      }}},
+      {"info":{"props":{
+        "media.class":"Audio/Source",
+        "node.name":"alsa_input.ignore",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}}
+    ]"#;
+        let sinks = sink_nodes_from_dump(dump);
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(
+            resolve_playback_key("snd_rpi_hifiberry_dac", "snd_rpi_hifiberry_dac", &sinks),
+            "alsa_output.platform-soc_sound.stereo-fallback"
+        );
+        assert_eq!(
+            resolve_playback_key("bcm2835 Headphones", "bcm2835 Headphones", &sinks),
+            "alsa_output.platform-fe00b840.mailbox.stereo-fallback"
+        );
+        let node = "alsa_output.platform-soc_sound.stereo-fallback";
+        assert_eq!(resolve_playback_key(node, "snd_rpi_hifiberry_dac", &sinks), node);
+        assert_eq!(
+            resolve_playback_key("нет такой карты", "нет такой карты", &sinks),
+            "нет такой карты"
+        );
+        assert!(sink_nodes_from_dump("не json").is_empty());
+    }
+
+    #[test]
+    fn playback_key_prefers_stereo_fallback_when_a_card_has_two_sinks() {
+        let dump = r#"[
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-soc_sound.pro-output-0",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}},
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-soc_sound.stereo-fallback",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}}
+    ]"#;
+        let sinks = sink_nodes_from_dump(dump);
+        assert_eq!(
+            resolve_playback_key("snd_rpi_hifiberry_dac", "snd_rpi_hifiberry_dac", &sinks),
+            "alsa_output.platform-soc_sound.stereo-fallback"
+        );
+    }
+
+    #[test]
+    fn every_enabled_output_is_in_the_stereo_map() {
+        let prefs = vec![
+            InputPref { id: "jack:0".into(), name: "jack л".into(), enabled: true },
+            InputPref { id: "jack:1".into(), name: "jack п".into(), enabled: true },
+            InputPref { id: "dac:0".into(), name: "цап л".into(), enabled: true },
+            InputPref { id: "dac:1".into(), name: "цап п".into(), enabled: true },
+        ];
+        let views = merge_outputs(
+            &[
+                ch("jack:0", "alsa_output.platform-fe00b840.mailbox.stereo-fallback", 0),
+                ch("jack:1", "alsa_output.platform-fe00b840.mailbox.stereo-fallback", 1),
+                ch("dac:0", "alsa_output.platform-soc_sound.stereo-fallback", 0),
+                ch("dac:1", "alsa_output.platform-soc_sound.stereo-fallback", 1),
+                ch("z:0", "zvucast-hall", 0),
+                ch("z:1", "zvucast-hall", 1),
+            ],
+            &prefs,
+        );
+        for id in ["jack:0", "dac:0"] {
+            assert_eq!(views.iter().find(|v| v.id == id).unwrap().stream.as_deref(), Some("l"), "{id}");
+        }
+        for id in ["jack:1", "dac:1"] {
+            assert_eq!(views.iter().find(|v| v.id == id).unwrap().stream.as_deref(), Some("r"), "{id}");
+        }
+        assert!(views.iter().filter(|v| v.device_key == "zvucast-hall").all(|v| v.stream.is_none()));
+        assert_eq!(
+            playback_targets(&views),
+            vec![
+                "alsa_output.platform-fe00b840.mailbox.stereo-fallback".to_string(),
+                "alsa_output.platform-soc_sound.stereo-fallback".to_string(),
+            ]
+        );
+        assert_eq!(
+            playback_target(&views).as_deref(),
+            Some("alsa_output.platform-fe00b840.mailbox.stereo-fallback")
+        );
+    }
+
+    #[test]
+    fn disabling_one_output_keeps_the_other_in_the_map() {
+        use zproto::{ChanSel, ChannelMap};
+        let prefs = vec![
+            InputPref { id: "jack:0".into(), name: "jack л".into(), enabled: false },
+            InputPref { id: "jack:1".into(), name: "jack п".into(), enabled: false },
+            InputPref { id: "dac:0".into(), name: "цап л".into(), enabled: true },
+            InputPref { id: "dac:1".into(), name: "цап п".into(), enabled: false },
+        ];
+        let views = merge_outputs(
+            &[
+                ch("jack:0", "jack-node", 0),
+                ch("jack:1", "jack-node", 1),
+                ch("dac:0", "dac-node", 0),
+                ch("dac:1", "dac-node", 1),
+            ],
+            &prefs,
+        );
+        assert!(views.iter().filter(|v| v.device_key == "jack-node").all(|v| v.stream.is_none()));
+        assert_eq!(views.iter().find(|v| v.id == "dac:0").unwrap().stream.as_deref(), Some("l"));
+        assert!(views.iter().find(|v| v.id == "dac:1").unwrap().stream.is_none());
+        assert_eq!(playback_targets(&views), vec!["dac-node".to_string()]);
+        let masked = mask_disabled_outputs(
+            ChannelMap { out_l: Some(ChanSel::L), out_r: Some(ChanSel::R) },
+            &views,
+        );
+        assert_eq!(masked.out_l, Some(ChanSel::L));
+        assert!(masked.out_r.is_none());
+    }
+
+    #[test]
+    fn playback_route_does_not_substitute_the_default_sink() {
+        use std::collections::BTreeSet;
+        let live = BTreeSet::from([
+            "alsa_output.platform-soc_sound.stereo-fallback".to_string(),
+            "alsa_output.platform-fe00b840.mailbox.stereo-fallback".to_string(),
+        ]);
+        assert_eq!(playback_route(&[], Some(&live)), PlaybackRoute::Fallback);
+        assert_eq!(playback_route(&[], None), PlaybackRoute::Fallback);
+        assert_eq!(
+            playback_route(
+                &["alsa_output.platform-soc_sound.stereo-fallback".into()],
+                Some(&live),
+            ),
+            PlaybackRoute::Nodes(vec!["alsa_output.platform-soc_sound.stereo-fallback".into()])
+        );
+        assert_eq!(
+            playback_route(&["snd_rpi_hifiberry_dac".into()], Some(&live)),
+            PlaybackRoute::Nodes(vec![])
+        );
+        assert_eq!(
+            playback_route(
+                &["alsa_output.platform-soc_sound.stereo-fallback".into()],
+                None,
+            ),
+            PlaybackRoute::Nodes(vec![])
+        );
+        let both = vec![
+            "alsa_output.platform-fe00b840.mailbox.stereo-fallback".to_string(),
+            "alsa_output.platform-soc_sound.stereo-fallback".to_string(),
+            "snd_rpi_hifiberry_dac".to_string(),
+        ];
+        assert_eq!(
+            playback_route(&both, Some(&live)),
+            PlaybackRoute::Nodes(vec![
+                "alsa_output.platform-fe00b840.mailbox.stereo-fallback".into(),
+                "alsa_output.platform-soc_sound.stereo-fallback".into(),
+            ])
+        );
     }
 }

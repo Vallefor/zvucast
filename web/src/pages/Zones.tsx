@@ -12,6 +12,7 @@ import {
   MappingChoice,
   sameChannelMap,
   shouldSendZoneMap,
+  speakerOutputRows,
 } from '../zoneMap'
 
 const POLL_MS = 2000
@@ -36,25 +37,6 @@ function splitMapKey(key: string): { member: string; sourceId: string | null } {
 function storedMap(zone: ZoneView, member: string, sourceId: string | null): ChannelMap | undefined {
   if (sourceId) return zone.source_maps?.[member]?.[sourceId] ?? zone.maps[member]
   return zone.maps[member]
-}
-
-type OutputRow = { side: 'out_l' | 'out_r'; label: string }
-
-/// Включённые выходы колонки со слотом стерео. Пустой список — два выхода
-/// по умолчанию, пока агент их не прислал.
-function outputRows(rx: NodeView | undefined): OutputRow[] {
-  const outputs = rx?.outputs ?? []
-  const slotted = outputs.filter((o) => o.enabled && (o.stream === 'l' || o.stream === 'r'))
-  if (outputs.length === 0) {
-    return [
-      { side: 'out_l', label: 'Левый выход' },
-      { side: 'out_r', label: 'Правый выход' },
-    ]
-  }
-  return slotted.map((o) => ({
-    side: o.stream === 'l' ? 'out_l' : 'out_r',
-    label: o.name,
-  }))
 }
 
 function ChanSelect({
@@ -375,7 +357,7 @@ function ZoneCard({
             {effective.map((id) => {
               const n = byId.get(id)
               const label = n ? nodeLabel(n) : id
-              const rows = outputRows(n)
+              const rows = speakerOutputRows(n?.outputs ?? [])
               const silentOut = (n?.outputs ?? []).filter((o) => o.enabled && o.stream == null)
               return (
                 <div key={id} className="stack" style={{ marginBottom: '0.8rem' }}>
@@ -393,10 +375,10 @@ function ZoneCard({
                       <div key={sourceId}>
                         {manySources && <div className="device-name">{srcName}</div>}
                         {rows.map((row) => (
-                          <div key={`${sourceId}-${row.side}`} className="stack" style={{ gap: '0.25rem', marginTop: '0.45rem' }}>
+                          <div key={`${sourceId}-${row.id}`} className="stack" style={{ gap: '0.25rem', marginTop: '0.45rem' }}>
                             <div>{row.label}</div>
                             <ChanSelect
-                              group={`${id}-${sourceId}-${row.side}`}
+                              group={`${id}-${sourceId}-${row.id}`}
                               label={`${row.label}, ${label}, ${srcName}`}
                               options={srcOptions}
                               value={row.side === 'out_l' ? map.out_l : map.out_r}

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -134,38 +135,40 @@ impl Drop for MonitorCapture {
     }
 }
 
-/// Воспроизведение зоны отдельным pw-play. pipewiresink в агенте этого не
-/// делает: в PAUSED он гасит поток, а ссылки на выход остаются active, и
-/// часы колонок встают, пока жив процесс.
+/// Воспроизведение отдельными pw-play: запасной sink или по процессу на узел.
+/// pipewiresink в агенте этого не делает: в PAUSED он гасит поток, а ссылки
+/// на выход остаются active, и часы колонок встают, пока жив процесс.
 struct DesktopPlay {
     stop: Arc<AtomicBool>,
-    child: Arc<Mutex<Option<Child>>>,
+    players: Vec<Arc<Mutex<Option<Child>>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DesktopPlay {
-    fn start(appsink: gst::Element, sink_node: Option<String>) -> Result<Self> {
+    fn start(appsink: gst::Element, route: crate::inputs::PlaybackRoute) -> Result<Self> {
         let appsink = appsink
             .dynamic_cast::<gst_app::AppSink>()
             .map_err(|_| anyhow::anyhow!("asink не appsink"))?;
         let stop = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(None));
+        let players = playback_slots(&route);
         let stop_thread = stop.clone();
-        let child_thread = child.clone();
+        let players_thread = players.clone();
         let thread = std::thread::Builder::new()
             .name("zvucast-play".into())
-            .spawn(move || play_desktop(appsink, child_thread, stop_thread, sink_node))
+            .spawn(move || play_desktop(appsink, players_thread, stop_thread, route))
             .context("поток воспроизведения")?;
         Ok(Self {
             stop,
-            child,
+            players,
             thread: Mutex::new(Some(thread)),
         })
     }
 
     fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        close_player(&self.child);
+        for slot in &self.players {
+            close_player(slot);
+        }
         if let Ok(mut slot) = self.thread.lock() {
             if let Some(thread) = slot.take() {
                 let _ = thread.join();
@@ -180,17 +183,32 @@ impl Drop for DesktopPlay {
     }
 }
 
+fn playback_slots(route: &crate::inputs::PlaybackRoute) -> Vec<Arc<Mutex<Option<Child>>>> {
+    let count = match route {
+        crate::inputs::PlaybackRoute::Fallback => 1,
+        crate::inputs::PlaybackRoute::Nodes(names) => names.len(),
+    };
+    (0..count).map(|_| Arc::new(Mutex::new(None))).collect()
+}
+
 fn play_desktop(
     appsink: gst_app::AppSink,
-    child: Arc<Mutex<Option<Child>>>,
+    players: Vec<Arc<Mutex<Option<Child>>>>,
     stop: Arc<AtomicBool>,
-    sink_node: Option<String>,
+    route: crate::inputs::PlaybackRoute,
 ) {
+    if let crate::inputs::PlaybackRoute::Nodes(names) = &route {
+        if names.is_empty() {
+            tracing::warn!("pw-play: выбранные выходы не совпали с живыми sink");
+        }
+    }
     while !stop.load(Ordering::Relaxed) {
         let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(200)) else {
             // Нет RTP — процесс не должен висеть suspended со ссылками.
             // В Null try_pull возвращается сразу, без паузы это был бы пустой цикл.
-            close_player(&child);
+            for slot in &players {
+                close_player(slot);
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
@@ -199,36 +217,109 @@ fn play_desktop(
         if map.is_empty() {
             continue;
         }
-        if !write_player(&child, map.as_slice(), sink_node.as_deref()) {
-            close_player(&child);
-        }
-    }
-    close_player(&child);
-}
-
-fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> bool {
-    let Ok(mut guard) = slot.lock() else { return false };
-    if guard.is_none() {
-        match spawn_player(sink_node) {
-            Ok(child) => *guard = Some(child),
-            Err(e) => {
-                tracing::warn!("pw-play: {e:#}");
-                return false;
+        let bytes = map.as_slice();
+        match &route {
+            crate::inputs::PlaybackRoute::Fallback => {
+                if let Some(slot) = players.first() {
+                    if !write_player(slot, bytes, None) {
+                        close_player(slot);
+                    }
+                }
+            }
+            crate::inputs::PlaybackRoute::Nodes(names) => {
+                for (slot, name) in players.iter().zip(names.iter()) {
+                    if !write_player(slot, bytes, Some(name.as_str())) {
+                        close_player(slot);
+                    }
+                }
             }
         }
     }
-    let Some(child) = guard.as_mut() else { return false };
-    let Some(stdin) = child.stdin.as_mut() else { return false };
-    stdin.write_all(bytes).and_then(|_| stdin.flush()).is_ok()
+    for slot in &players {
+        close_player(slot);
+    }
+}
+
+/// Пишет буфер в stdin pw-play.
+///
+/// Мьютекс слота держится только на spawn и на дублирование дескриптора.
+/// Запись идёт в клон, уже без guard: процесс, который перестал читать,
+/// не блокирует остальные слоты и не мешает `DesktopPlay::shutdown` убить
+/// его. `false` — слот надо закрыть и идти к следующему в том же буфере.
+fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> bool {
+    let owned = {
+        let Ok(mut guard) = slot.lock() else { return false };
+        if guard.is_none() {
+            match spawn_player(sink_node) {
+                Ok(child) => *guard = Some(child),
+                Err(e) => {
+                    tracing::warn!("pw-play: {e:#}");
+                    return false;
+                }
+            }
+        }
+        let Some(child) = guard.as_mut() else { return false };
+        let Some(stdin) = child.stdin.as_ref() else { return false };
+        match stdin.as_fd().try_clone_to_owned() {
+            Ok(owned) => owned,
+            Err(e) => {
+                tracing::warn!("pw-play: stdin: {e}");
+                return false;
+            }
+        }
+    };
+    if let Err(e) = set_fd_nonblocking(&owned, true) {
+        tracing::warn!("pw-play: stdin: {e}");
+        return false;
+    }
+    let mut pipe = std::fs::File::from(owned);
+    probe_stdin_unlocked(slot);
+    pipe.write_all(bytes).is_ok()
+}
+
+fn set_fd_nonblocking(fd: &impl std::os::fd::AsFd, nonblocking: bool) -> std::io::Result<()> {
+    socket2::SockRef::from(fd).set_nonblocking(nonblocking)
+}
+
+/// В тестах проверяет, что слот уже отпущен, и может поставить запись на паузу.
+fn probe_stdin_unlocked(_slot: &Mutex<Option<Child>>) {
+    #[cfg(test)]
+    {
+        if STDIN_PROBE.with(|probe| probe.get()) {
+            let _guard = _slot
+                .try_lock()
+                .expect("мьютекс слота занят на время записи в stdin");
+            drop(_guard);
+        }
+        if let Some(pause) = STDIN_PAUSE.with(|pause| pause.take()) {
+            let _ = pause.entered.send(());
+            let _ = pause.release.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+struct StdinPause {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STDIN_PROBE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static STDIN_PAUSE: std::cell::Cell<Option<StdinPause>> = std::cell::Cell::new(None);
 }
 
 fn spawn_player(sink_node: Option<&str>) -> Result<Child> {
-    let configured = sink_node
-        .filter(|name| !crate::inputs::is_virtual_sink_name(name))
-        .map(str::to_string);
-    let target = configured
-        .or_else(crate::pipeline::desktop_playback_target)
-        .context("нет sink кроме zvucast")?;
+    let target = match sink_node {
+        Some(name) => {
+            if crate::inputs::is_virtual_sink_name(name) {
+                anyhow::bail!("виртуальный sink не цель pw-play");
+            }
+            name.to_string()
+        }
+        None => crate::pipeline::desktop_playback_target().context("нет sink кроме zvucast")?,
+    };
     Command::new("pw-play")
         .args([
             "--raw",
@@ -392,7 +483,7 @@ impl Runner {
     pub fn new_rx_pw(
         pipeline_cfg: &crate::config::PipelineCfg,
         cm: &ChannelMap,
-        sink_node: Option<&str>,
+        route: crate::inputs::PlaybackRoute,
         ports: &[u16],
         branches: &[(u16, ChannelMap)],
         bind: &mut dyn crate::pipeline::LocalUdp,
@@ -400,7 +491,7 @@ impl Runner {
         let pipeline = crate::pipeline::build_rx_pw_ports(pipeline_cfg, cm, ports, branches, bind)?;
         let mut runner = Runner::from_pipeline_with_card(pipeline, None);
         let sink = runner.pipeline.by_name("asink").context("appsink asink")?;
-        runner.playback = Some(DesktopPlay::start(sink, sink_node.map(str::to_string))?);
+        runner.playback = Some(DesktopPlay::start(sink, route)?);
         Ok(runner)
     }
 
@@ -769,14 +860,14 @@ appl_ptr    : 313632\n";
     #[test]
     fn runner_new_rx_pw_builds() {
         gst::init().unwrap();
-        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), None, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), crate::inputs::PlaybackRoute::Fallback, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
         assert!(r.pipeline().by_name("asink").is_some());
     }
 
     #[test]
     fn stop_leaves_the_playback_thread_alive() {
         gst::init().unwrap();
-        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), None, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
+        let r = Runner::new_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), crate::inputs::PlaybackRoute::Fallback, &[5004], &[], &mut crate::pipeline::LoopbackUdp).unwrap();
         r.stop();
         let alive = std::fs::read_dir("/proc/self/task")
             .unwrap()
@@ -940,6 +1031,130 @@ appl_ptr    : 313632\n";
         let late = st.get::<u64>("num-late").expect("num-late это u64");
         let lost = st.get::<u64>("num-lost").expect("num-lost это u64");
         assert_eq!(rx.stats().dropped, stutter_count(0, late, lost));
+    }
+
+    /// Потолок, если запись так и не отпустила слот. Успешный путь от паузы
+    /// не зависит: канал открывается уже после try_lock внутри записи.
+    const STUCK_WRITE_BOUND: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn stuck_writer_does_not_keep_the_slot_mutex() {
+        let stuck = Arc::new(Mutex::new(Some(sleeper_with_full_stdin())));
+        let reap_stuck = Reap(Arc::clone(&stuck));
+        let (cat, mut cat_out) = echoing_reader();
+        let live = Arc::new(Mutex::new(Some(cat)));
+        let reap_live = Reap(Arc::clone(&live));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let stuck_write = Arc::clone(&stuck);
+        let live_write = Arc::clone(&live);
+        let worker = std::thread::spawn(move || {
+            STDIN_PROBE.with(|probe| probe.set(true));
+            STDIN_PAUSE.with(|pause| {
+                pause.set(Some(StdinPause {
+                    entered: entered_tx,
+                    release: release_rx,
+                }));
+            });
+            let wrote_stuck = write_player(&stuck_write, b"pcm!", None);
+            let wrote_live = write_player(&live_write, b"pcm!", None);
+            let _ = result_tx.send((wrote_stuck, wrote_live));
+        });
+
+        match entered_rx.recv_timeout(STUCK_WRITE_BOUND) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => join_writer(worker),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("запись не дошла до stdin без мьютекса слота");
+            }
+        }
+        {
+            let guard = stuck
+                .try_lock()
+                .expect("shutdown не может забрать слот, пока идёт запись");
+            assert!(guard.is_some(), "процесс ещё жив, пока слот не закрыли");
+        }
+
+        release_tx.send(()).expect("поток записи уже завершился");
+        let (wrote_stuck, wrote_live) = match result_rx.recv_timeout(STUCK_WRITE_BOUND) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => join_writer(worker),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                close_player(&stuck);
+                let _ = worker.join();
+                panic!("запись в полный stdin не вернулась");
+            }
+        };
+        worker.join().expect("поток записи");
+        assert!(!wrote_stuck, "полный stdin не принимает буфер");
+        assert!(wrote_live, "следующий слот того же буфера должен получить байты");
+
+        let mut got = [0u8; 4];
+        cat_out
+            .read_exact(&mut got)
+            .expect("второй слот должен отдать тот же буфер");
+        assert_eq!(&got, b"pcm!");
+
+        drop(reap_stuck);
+        drop(reap_live);
+        assert!(stuck.lock().expect("слот").is_none());
+        assert!(live.lock().expect("слот").is_none());
+    }
+
+    fn join_writer(worker: std::thread::JoinHandle<()>) -> ! {
+        match worker.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("поток записи завершился без результата"),
+        }
+    }
+
+    fn sleeper_with_full_stdin() -> Child {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep");
+        let stdin = child.stdin.as_mut().expect("stdin");
+        set_fd_nonblocking(stdin, true).expect("O_NONBLOCK");
+        let chunk = [0u8; 8192];
+        loop {
+            match stdin.write(&chunk) {
+                Ok(0) => panic!("stdin закрылся до заполнения"),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("заполнение stdin: {e}"),
+            }
+        }
+        // Дальше дескриптор снова блокирующий: запись обязана сама выставить
+        // O_NONBLOCK, иначе write_all встанет на полном пайпе.
+        set_fd_nonblocking(stdin, false).expect("блокирующий stdin");
+        child
+    }
+
+    fn echoing_reader() -> (Child, std::process::ChildStdout) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cat");
+        let stdout = child.stdout.take().expect("stdout");
+        (child, stdout)
+    }
+
+    struct Reap(Arc<Mutex<Option<Child>>>);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.0.try_lock().is_ok() {
+                close_player(&self.0);
+            }
+        }
     }
 
     #[test]

@@ -686,17 +686,27 @@ fn handle_set_capture_target(
     SetCaptureTargetOutcome::Changed
 }
 
-/// Виртуальный sink целью воспроизведения не бывает: команда считается None.
-fn playback_device_key(device_key: Option<String>) -> Option<String> {
-    device_key.filter(|key| !crate::inputs::is_virtual_sink_name(key))
+/// Виртуальные sink из вектора выкидываются до сравнения.
+fn playback_device_keys(device_keys: Vec<String>) -> Vec<String> {
+    device_keys
+        .into_iter()
+        .filter(|key| !crate::inputs::is_virtual_sink_name(key))
+        .collect()
 }
 
 fn handle_set_playback_target(
-    current: &RefCell<Option<String>>,
-    device_key: Option<String>,
+    current: &RefCell<Vec<String>>,
+    device_keys: Vec<String>,
     half: &mut RoleHalf,
 ) -> SetCaptureTargetOutcome {
-    handle_set_capture_target(current, playback_device_key(device_key), half)
+    let next = playback_device_keys(device_keys);
+    if *current.borrow() == next {
+        return SetCaptureTargetOutcome::Unchanged;
+    }
+    *current.borrow_mut() = next;
+    drop_runner(&mut half.runner);
+    half.gate.arm(&mut half.policy);
+    SetCaptureTargetOutcome::Changed
 }
 
 /// Mute меняет только `zone.source`. Тот же набор — no-op.
@@ -1190,7 +1200,7 @@ fn gst_domain(
     // Транспортное состояние (unicast-эндпоинты + dscp) — только tx-половина.
     let transport = RefCell::new(Transport::default());
     let capture_target: RefCell<Option<String>> = RefCell::new(None);
-    let playback_target: RefCell<Option<String>> = RefCell::new(None);
+    let playback_target: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let muted_zones: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
     let mut cables = crate::virtual_output::Cables::default();
     let virtual_zones: RefCell<Vec<VirtualZone>> = RefCell::new(Vec::new());
@@ -1317,7 +1327,8 @@ fn gst_domain(
         let mut bind = pipeline_bind(&link);
         let r = match cfg.playback_backend {
             crate::config::Backend::Alsa => {
-                let key = playback_target.borrow().clone();
+                // ALSA открывает одно устройство: первый ключ списка.
+                let key = playback_target.borrow().first().cloned();
                 let RxOpen::Alsa(device) = rx_open(cfg.playback_backend, key.as_deref()) else {
                     anyhow::bail!("rx: цель воспроизведения не задана");
                 };
@@ -1332,16 +1343,19 @@ fn gst_domain(
             }
             crate::config::Backend::PipeWire => {
                 pipewire_socket_ready()?;
-                let key = playback_target.borrow().clone();
-                // None — pw-play берёт запасной sink. Выбранный узел играем только в него.
-                let sink = match rx_open(cfg.playback_backend, key.as_deref()) {
-                    RxOpen::PipeWire(node) => node,
-                    _ => None,
+                let keys = playback_target.borrow().clone();
+                let route = match crate::inputs::live_sink_nodes() {
+                    Some(sinks) => {
+                        let live: BTreeSet<String> =
+                            sinks.into_iter().map(|sink| sink.node_name).collect();
+                        crate::inputs::playback_route(&keys, Some(&live))
+                    }
+                    None => crate::inputs::playback_route(&keys, None),
                 };
                 Runner::new_rx_pw(
                     &pipeline,
                     &chan_map.borrow(),
-                    sink.as_deref(),
+                    route,
                     ports,
                     &branches,
                     bind.as_mut(),
@@ -1575,10 +1589,10 @@ fn gst_domain(
                     }
                 }
             },
-            Ok(CtlMsg::SetPlaybackTarget { device_key }) => match rx_half.as_mut() {
+            Ok(CtlMsg::SetPlaybackTarget { device_keys }) => match rx_half.as_mut() {
                 None => tracing::debug!("SetPlaybackTarget: нет rx — игнорируем"),
                 Some(h) => {
-                    if handle_set_playback_target(&playback_target, device_key, h)
+                    if handle_set_playback_target(&playback_target, device_keys, h)
                         == SetCaptureTargetOutcome::Changed
                     {
                         tracing::info!("rx: цель воспроизведения изменилась, пересборка");
@@ -3209,38 +3223,41 @@ mod tests {
     #[test]
     fn playback_target_change_drops_the_runner_once() {
         gstreamer::init().unwrap();
-        let target = RefCell::new(None);
+        let target = RefCell::new(Vec::new());
         let mut half = RoleHalf::new();
         half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
         assert_eq!(
-            handle_set_playback_target(&target, None, &mut half),
+            handle_set_playback_target(&target, vec![], &mut half),
             SetCaptureTargetOutcome::Unchanged
         );
         assert!(half.runner.is_some());
         assert_eq!(
-            handle_set_playback_target(&target, Some("zvucast".into()), &mut half),
+            handle_set_playback_target(&target, vec!["zvucast".into()], &mut half),
             SetCaptureTargetOutcome::Unchanged,
             "виртуальный sink целью не считается"
         );
         assert!(half.runner.is_some());
-        assert_eq!(target.borrow().as_deref(), None);
+        assert!(target.borrow().is_empty());
 
         assert_eq!(
             handle_set_playback_target(
                 &target,
-                Some("alsa_output.pci.analog-stereo".into()),
+                vec!["alsa_output.pci.analog-stereo".into()],
                 &mut half,
             ),
             SetCaptureTargetOutcome::Changed
         );
         assert!(half.runner.is_none());
-        assert_eq!(target.borrow().as_deref(), Some("alsa_output.pci.analog-stereo"));
+        assert_eq!(
+            target.borrow().as_slice(),
+            ["alsa_output.pci.analog-stereo".to_string()]
+        );
 
         half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
         assert_eq!(
             handle_set_playback_target(
                 &target,
-                Some("alsa_output.pci.analog-stereo".into()),
+                vec!["alsa_output.pci.analog-stereo".into()],
                 &mut half,
             ),
             SetCaptureTargetOutcome::Unchanged
@@ -3248,10 +3265,10 @@ mod tests {
         assert!(half.runner.is_some());
 
         assert_eq!(
-            handle_set_playback_target(&target, Some("zvucast-hall".into()), &mut half),
+            handle_set_playback_target(&target, vec!["zvucast-hall".into()], &mut half),
             SetCaptureTargetOutcome::Changed
         );
         assert!(half.runner.is_none());
-        assert_eq!(target.borrow().as_deref(), None);
+        assert!(target.borrow().is_empty());
     }
 }

@@ -2017,7 +2017,7 @@ async fn old_hello_has_null_setup() {
     let mut pc = MockAgent { ws };
     assert_eq!(
         pc.recv_raw_within(2).await,
-        CtlMsg::SetPlaybackTarget { device_key: Some("test".into()) }
+        CtlMsg::SetPlaybackTarget { device_keys: vec!["test".into()] }
     );
 
     let (code, body) = http(port, "GET", "/api/nodes").await;
@@ -2034,7 +2034,7 @@ async fn spotify_appends_soloist_issue_on_the_node_json() {
     let mut pc = MockAgent::hello_soloist(open_ws(port, "127.0.0.1").await, "pc", "pc", vec![Role::Rx]).await;
     assert_eq!(
         pc.recv_raw_within(2).await,
-        CtlMsg::SetPlaybackTarget { device_key: Some("test".into()) }
+        CtlMsg::SetPlaybackTarget { device_keys: vec!["test".into()] }
     );
 
     let (status, patch_body) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":true}"#).await;
@@ -2182,7 +2182,7 @@ async fn ui_targets_follow_hello_and_prefs() {
     let mut spk = MockAgent::connect(port, "spk").await;
     assert_eq!(
         recv_raw(&mut spk).await,
-        CtlMsg::SetPlaybackTarget { device_key: Some("test".into()) }
+        CtlMsg::SetPlaybackTarget { device_keys: vec!["test".into()] }
     );
 
     let mut ws = open_ws(port, "127.0.0.1").await;
@@ -2214,7 +2214,7 @@ async fn ui_targets_follow_hello_and_prefs() {
     let mut col = MockAgent { ws };
     assert_eq!(
         recv_raw(&mut col).await,
-        CtlMsg::SetPlaybackTarget { device_key: Some("aaa".into()) }
+        CtlMsg::SetPlaybackTarget { device_keys: vec!["aaa".into(), "bbb".into()] }
     );
     let (status, _) = http_body(
         port,
@@ -2226,7 +2226,7 @@ async fn ui_targets_follow_hello_and_prefs() {
     assert_eq!(status, 200);
     assert_eq!(
         recv_raw(&mut col).await,
-        CtlMsg::SetPlaybackTarget { device_key: Some("bbb".into()) }
+        CtlMsg::SetPlaybackTarget { device_keys: vec!["bbb".into()] }
     );
 
     let mut pc = MockAgent::connect_virtual(port).await;

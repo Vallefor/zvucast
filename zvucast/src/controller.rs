@@ -487,7 +487,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 } else {
                     outs
                 };
-                crate::inputs::merge_inputs(&outs, out_prefs)
+                crate::inputs::merge_outputs(&outs, out_prefs)
             } else {
                 Vec::new()
             };
@@ -2013,7 +2013,7 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
                 } else {
                     found
                 };
-                let views = crate::inputs::merge_inputs(
+                let views = crate::inputs::merge_outputs(
                     &found,
                     output_prefs.get(id).map(|p| p.as_slice()).unwrap_or(&[]),
                 );
@@ -2233,9 +2233,9 @@ fn push_capture_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs
 
 fn push_playback_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref]) {
     let found = reg.playback_outputs(node_id);
-    let views = crate::inputs::merge_inputs(&found, prefs);
-    let device_key = crate::inputs::playback_target(&views);
-    let _ = reg.send_cmd(node_id, CtlMsg::SetPlaybackTarget { device_key });
+    let views = crate::inputs::merge_outputs(&found, prefs);
+    let device_keys = crate::inputs::playback_targets(&views);
+    let _ = reg.send_cmd(node_id, CtlMsg::SetPlaybackTarget { device_keys });
 }
 
 async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
@@ -2318,7 +2318,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
         (zone, prefs)
     };
     if let Some(zone) = owned.0 {
-        let views = crate::inputs::merge_inputs(&reported_out, &owned.1);
+        let views = crate::inputs::merge_outputs(&reported_out, &owned.1);
         let reg = st.reg.lock().await;
         let ports = mix_ports_for(&reg, &reg.online_tx());
         let cmd = zone_channel_cmd(&zone, &node_id, &ports, &views);
