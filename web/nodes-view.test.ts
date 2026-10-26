@@ -77,6 +77,22 @@ test('схема и добавление режут устройства по в
   assert.equal(enabled.find((r) => r.id === 'h0')?.enabled, true)
   assert.equal(enabled.find((r) => r.id === 'h1')?.enabled, true)
   assert.equal(rows.find((r) => r.id === 'h0')?.enabled, false)
+  const untouched = rows.find((r) => r.id === 'a0')
+  assert.equal(enabled.find((r) => r.id === 'a0'), untouched)
+  assert.equal(enabled.find((r) => r.id === 'l1')?.enabled, false)
   assert.deepEqual(addableDevices(enabled), [])
   assert.equal(flowDevices(enabled).find((d) => d.key === 'hdmi')?.count, 2)
+})
+
+test('имя устройства берётся из первой строки ключа', () => {
+  const mixed = [
+    chan({ id: 'h0', device_key: 'hdmi', device_name: 'sun9i HDMI Stereo', index: 0, enabled: true }),
+    chan({ id: 'h1', device_key: 'hdmi', device_name: 'позже другое', index: 1, enabled: true }),
+    chan({ id: 'x0', device_key: 'spare', device_name: 'первое имя', index: 0, enabled: false }),
+    chan({ id: 'x1', device_key: 'spare', device_name: 'второе имя', index: 1, enabled: false }),
+  ]
+  assert.equal(groupDevices(mixed).find((g) => g.key === 'hdmi')?.name, 'sun9i HDMI Stereo')
+  assert.equal(groupDevices(mixed).find((g) => g.key === 'spare')?.name, 'первое имя')
+  assert.equal(flowDevices(mixed).find((d) => d.key === 'hdmi')?.name, 'sun9i HDMI Stereo')
+  assert.deepEqual(addableDevices(mixed), [{ key: 'spare', name: 'первое имя' }])
 })

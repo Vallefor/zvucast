@@ -727,6 +727,9 @@ table.data tr:last-child td { border-bottom: 0; }
 
 .node-add-btn .flow-chip-name { flex: 1 1 auto; }
 
+/* Подпись колонки остаётся справа. У кнопки «Добавить» многоточие в конце. */
+.node-flow-in .node-add-btn .flow-chip-name { text-align: start; }
+
 @media (max-width: 420px) {
   .node-flow {
     grid-template-columns: minmax(0, 1fr) minmax(96px, 120px) minmax(0, 1fr);

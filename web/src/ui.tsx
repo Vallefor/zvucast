@@ -76,14 +76,16 @@ export function UiProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!dialog) return
+    // Фаза захвата: Escape отменяет только подтверждение. Иначе всплывающий
+    // слушатель Popup закроет настройки и сбросит несохранённые правки.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        dialogRef.current?.resolve(false)
-        setDialog(null)
-      }
+      if (e.key !== 'Escape') return
+      e.stopImmediatePropagation()
+      dialogRef.current?.resolve(false)
+      setDialog(null)
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [dialog])
 
   const close = (ok: boolean) => {
