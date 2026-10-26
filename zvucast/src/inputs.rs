@@ -268,15 +268,81 @@ pub fn fallback_outputs(playback_device: Option<&str>) -> Vec<CaptureChan> {
 /// Устройства захвата через gst DeviceMonitor. Пустой список — вызывающий
 /// подставит `fallback_inputs`.
 pub fn discover_capture_channels() -> Vec<CaptureChan> {
-    discover_channels("Audio/Source")
+    discover_channels("Audio/Source", false)
 }
 
 /// Устройства воспроизведения. Пустой список — `fallback_outputs`.
 pub fn discover_playback_channels() -> Vec<CaptureChan> {
-    discover_channels("Audio/Sink")
+    let mut out = discover_channels("Audio/Sink", true);
+    if let Some(sinks) = live_sink_nodes() {
+        for chan in &mut out {
+            let device_key = resolve_playback_key(&chan.device_key, &chan.device_name, &sinks);
+            chan.id = format!("{device_key}:{}", chan.index);
+            chan.device_key = device_key;
+        }
+        sort_discovered(&mut out);
+    }
+    out
 }
 
-fn discover_channels(kind: &str) -> Vec<CaptureChan> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkNode {
+    pub node_name: String,
+    pub card_name: String,
+}
+
+pub fn sink_nodes_from_dump(json: &str) -> Vec<SinkNode> {
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(props) = item.pointer("/info/props") else { continue };
+        if props.get("media.class").and_then(|v| v.as_str()) != Some("Audio/Sink") {
+            continue;
+        }
+        let Some(node_name) = props.get("node.name").and_then(|v| v.as_str()) else { continue };
+        if node_name.is_empty() {
+            continue;
+        }
+        let card_name = props
+            .get("alsa.card_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(SinkNode { node_name: node_name.to_string(), card_name });
+    }
+    out
+}
+
+pub fn resolve_playback_key(key: &str, device_name: &str, sinks: &[SinkNode]) -> String {
+    if sinks.iter().any(|s| s.node_name == key) {
+        return key.to_string();
+    }
+    let mut matches: Vec<&SinkNode> = sinks
+        .iter()
+        .filter(|s| !s.card_name.is_empty() && (s.card_name == key || s.card_name == device_name))
+        .collect();
+    matches.sort_by(|a, b| {
+        let rank = |n: &str| if n.contains("stereo-fallback") { 0 } else { 1 };
+        rank(&a.node_name).cmp(&rank(&b.node_name)).then(a.node_name.cmp(&b.node_name))
+    });
+    matches.first().map(|s| s.node_name.clone()).unwrap_or_else(|| key.to_string())
+}
+
+pub fn live_sink_nodes() -> Option<Vec<SinkNode>> {
+    let out = std::process::Command::new("timeout").args(["2", "pw-dump"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    if serde_json::from_str::<Vec<serde_json::Value>>(&text).is_err() {
+        return None;
+    }
+    Some(sink_nodes_from_dump(&text))
+}
+
+fn discover_channels(kind: &str, playback: bool) -> Vec<CaptureChan> {
     if gst::init().is_err() {
         return Vec::new();
     }
@@ -288,14 +354,7 @@ fn discover_channels(kind: &str) -> Vec<CaptureChan> {
     for dev in mon.devices() {
         let device_name = dev.display_name().to_string();
         let props = dev.properties();
-        let device_key = props
-            .as_ref()
-            .and_then(|p| {
-                ["device.string", "node.name", "object.path"]
-                    .into_iter()
-                    .find_map(|field| p.get::<String>(field).ok())
-            })
-            .filter(|s| !s.is_empty())
+        let device_key = device_key_from_props(props.as_ref(), playback)
             .unwrap_or_else(|| device_name.clone());
         let n = dev.caps().as_ref().map(channel_count).unwrap_or(2);
         for index in 0..n {
@@ -308,10 +367,28 @@ fn discover_channels(kind: &str) -> Vec<CaptureChan> {
         }
     }
     mon.stop();
+    sort_discovered(&mut out);
+    out
+}
+
+/// Воспроизведение: `node.name`, затем `device.string`, затем `object.path`.
+/// Захват: прежний порядок. Пустое свойство пропускается.
+fn device_key_from_props(props: Option<&gst::Structure>, playback: bool) -> Option<String> {
+    let props = props?;
+    let fields: &[&str] = if playback {
+        &["node.name", "device.string", "object.path"]
+    } else {
+        &["device.string", "node.name", "object.path"]
+    };
+    fields.iter().find_map(|field| {
+        props.get::<String>(*field).ok().filter(|value| !value.is_empty())
+    })
+}
+
+fn sort_discovered(out: &mut Vec<CaptureChan>) {
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out.dedup_by(|a, b| a.id == b.id);
     out.sort_by(|a, b| a.device_name.cmp(&b.device_name).then(a.index.cmp(&b.index)));
-    out
 }
 
 fn channel_count(caps: &gst::Caps) -> u16 {
@@ -566,5 +643,64 @@ mod tests {
         assert!(!views[0].enabled);
         let gone = merge_inputs(&[], &prefs);
         assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn playback_key_resolves_card_name_to_node_name() {
+        let dump = r#"[
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-soc_sound.stereo-fallback",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}},
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-fe00b840.mailbox.stereo-fallback",
+        "alsa.card_name":"bcm2835 Headphones"
+      }}},
+      {"info":{"props":{
+        "media.class":"Audio/Source",
+        "node.name":"alsa_input.ignore",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}}
+    ]"#;
+        let sinks = sink_nodes_from_dump(dump);
+        assert_eq!(sinks.len(), 2);
+        assert_eq!(
+            resolve_playback_key("snd_rpi_hifiberry_dac", "snd_rpi_hifiberry_dac", &sinks),
+            "alsa_output.platform-soc_sound.stereo-fallback"
+        );
+        assert_eq!(
+            resolve_playback_key("bcm2835 Headphones", "bcm2835 Headphones", &sinks),
+            "alsa_output.platform-fe00b840.mailbox.stereo-fallback"
+        );
+        let node = "alsa_output.platform-soc_sound.stereo-fallback";
+        assert_eq!(resolve_playback_key(node, "snd_rpi_hifiberry_dac", &sinks), node);
+        assert_eq!(
+            resolve_playback_key("нет такой карты", "нет такой карты", &sinks),
+            "нет такой карты"
+        );
+        assert!(sink_nodes_from_dump("не json").is_empty());
+    }
+
+    #[test]
+    fn playback_key_prefers_stereo_fallback_when_a_card_has_two_sinks() {
+        let dump = r#"[
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-soc_sound.pro-output-0",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}},
+      {"info":{"props":{
+        "media.class":"Audio/Sink",
+        "node.name":"alsa_output.platform-soc_sound.stereo-fallback",
+        "alsa.card_name":"snd_rpi_hifiberry_dac"
+      }}}
+    ]"#;
+        let sinks = sink_nodes_from_dump(dump);
+        assert_eq!(
+            resolve_playback_key("snd_rpi_hifiberry_dac", "snd_rpi_hifiberry_dac", &sinks),
+            "alsa_output.platform-soc_sound.stereo-fallback"
+        );
     }
 }
