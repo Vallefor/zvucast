@@ -4,6 +4,12 @@
 
 Сборка: `just check-all`, `just build-pc`.
 
+Установка на плату:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Vallefor/zvucast/main/install.sh | bash
+```
+
 Бинарники лежат в GitHub Releases, а не в git.
 
 Soloist ставится отдельно и в репозиторий не входит.
