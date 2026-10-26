@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
-import { chanWord, flowDevices, isPlaying, showStartAll, showStopAll, transport } from '../nodesView'
+import { addableDevices, chanWord, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, transport } from '../nodesView'
 import { offer, updateWait } from '../update'
 import { Badge, Button, Popup, useRun, useUi } from '../ui'
 
@@ -224,65 +224,85 @@ function setupBlock(nodes: NodeView[]) {
   )
 }
 
-function groupChans(rows: InputView[]) {
-  const order: string[] = []
-  const by = new Map<string, InputView[]>()
-  for (const row of rows) {
-    if (!by.has(row.device_key)) order.push(row.device_key)
-    const list = by.get(row.device_key) ?? []
-    list.push(row)
-    by.set(row.device_key, list)
-  }
-  return order.map((key) => ({ key, name: by.get(key)![0].device_name, rows: by.get(key)! }))
-}
-
 function ChanEditor({
+  kind,
   title,
   hint,
   empty,
   rows,
   onPatch,
+  onEnable,
 }: {
+  kind: 'in' | 'out'
   title: string
   hint: string
   empty: string
   rows: InputView[]
   onPatch: (id: string, next: Partial<InputView>) => void
+  onEnable: (key: string) => void
 }) {
-  const groups = useMemo(() => groupChans(rows), [rows])
+  const shown = useMemo(
+    () => groupDevices(rows).filter((group) => group.rows.some((row) => row.enabled)),
+    [rows],
+  )
+  const addable = useMemo(() => addableDevices(rows), [rows])
   return (
-    <div>
-      <div className="lede">{title}</div>
+    <div className={`node-flow-side node-flow-${kind}`}>
+      <div className="node-flow-label">{title}</div>
       <p className="hint">{hint}</p>
-      {groups.length === 0 && <p className="lede">{empty}</p>}
-      <div>
-        {groups.map((g) => (
-          <div key={g.key}>
-            <h3 className="device-name">{g.name}</h3>
-            {g.rows.map((row) => (
-              <label key={row.id} className="chan-row">
-                <input
-                  type="checkbox"
-                  checked={row.enabled}
-                  aria-label={`Использовать ${g.name} ${row.index + 1}`}
-                  onChange={(e) => onPatch(row.id, { enabled: e.target.checked })}
-                />
-                <input
-                  className="field"
-                  aria-label={`Имя канала ${g.name} ${row.index + 1}`}
-                  value={row.name}
-                  onChange={(e) => onPatch(row.id, { name: e.target.value })}
-                />
-              </label>
-            ))}
-          </div>
-        ))}
-      </div>
+      {rows.length === 0 && <p className="lede">{empty}</p>}
+      {shown.map((group) => (
+        <div key={group.key} className="node-device">
+          <h3 className="device-name">{group.name}</h3>
+          {group.rows.map((row) => (
+            <div key={row.id} className="chan-row">
+              <input
+                type="checkbox"
+                checked={row.enabled}
+                aria-label={`Использовать ${group.name} ${row.index + 1}`}
+                onChange={(e) => onPatch(row.id, { enabled: e.target.checked })}
+              />
+              <input
+                className="field"
+                aria-label={`Имя канала ${group.name} ${row.index + 1}`}
+                value={row.name}
+                onChange={(e) => onPatch(row.id, { name: e.target.value })}
+              />
+            </div>
+          ))}
+        </div>
+      ))}
+      {addable.length > 0 && (
+        <div className="node-add">
+          <div className="node-flow-label">Добавить</div>
+          {addable.map((device) => (
+            <Button
+              key={device.key}
+              type="button"
+              className="node-add-btn"
+              title={device.name}
+              onClick={() => onEnable(device.key)}
+            >
+              <span className="flow-chip-name">{device.name}</span>
+            </Button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
-function NodeSettings({ node, onClose }: { node: NodeView; onClose: () => void }) {
+function NodeSettings({
+  node,
+  master,
+  transfer,
+  onClose,
+}: {
+  node: NodeView
+  master: boolean
+  transfer: () => void
+  onClose: () => void
+}) {
   const run = useRun()
   const { toast } = useUi()
   const isTx = node.roles.includes('tx')
@@ -354,58 +374,71 @@ function NodeSettings({ node, onClose }: { node: NodeView; onClose: () => void }
           Имя
           <input className="field" aria-label="Имя узла" value={name} onChange={(e) => setName(e.target.value)} />
         </label>
-        {isTx && (
-          <>
-            <label className="inline">
-              DSCP
-              <input
-                className="field"
-                type="number"
-                min={0}
-                max={63}
-                aria-label="DSCP"
-                value={dscp}
-                onChange={(e) => setDscp(e.target.value)}
-              />
-            </label>
-            <div className="seg" role="group" aria-label="Пресеты DSCP">
-              {DSCP_PRESETS.map((p) => (
-                <button
-                  key={p.label}
-                  type="button"
-                  aria-pressed={Number(dscp) === p.value}
-                  onClick={() => setDscp(String(p.value))}
-                >
-                  {p.label}
-                </button>
-              ))}
+        <section>
+          <h3 className="device-name">Сеть</h3>
+          <div className="stack">
+            <div className="node-net">
+              <span className="num">{node.ip || '—'}</span>
+              <span className="node-net-link">{linkLabel(node.link)}</span>
             </div>
-            {node.supports_virtual_output && (
+            {isTx && (
               <>
                 <label className="inline">
+                  DSCP
                   <input
-                    type="checkbox"
-                    aria-label="Создать виртуальный звуковой выход"
-                    checked={virtualOn}
-                    onChange={(e) => setVirtualOn(e.target.checked)}
+                    className="field"
+                    type="number"
+                    min={0}
+                    max={63}
+                    aria-label="DSCP"
+                    value={dscp}
+                    onChange={(e) => setDscp(e.target.value)}
                   />
-                  Создать виртуальный звуковой выход
                 </label>
-                <label className="inline">
-                  Система
-                  <select className="field" aria-label="Система" value="stereo" onChange={() => {}}>
-                    <option value="stereo">Стерео</option>
-                  </select>
-                </label>
-                <label className="inline">
-                  <input
-                    type="checkbox"
-                    aria-label="Включить Spotify"
-                    checked={spotifyOn}
-                    onChange={(e) => setSpotifyOn(e.target.checked)}
-                  />
-                  Включить Spotify
-                </label>
+                <div className="seg" role="group" aria-label="Пресеты DSCP">
+                  {DSCP_PRESETS.map((p) => (
+                    <button
+                      key={p.label}
+                      type="button"
+                      aria-pressed={Number(dscp) === p.value}
+                      onClick={() => setDscp(String(p.value))}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+            {master ? (
+              <p className="hint">Этот узел ведёт панель</p>
+            ) : (
+              <Button type="button" disabled={!node.online} onClick={transfer}>Сделать мастером</Button>
+            )}
+          </div>
+        </section>
+        {isTx && node.supports_virtual_output && (
+          <section>
+            <h3 className="device-name">На узле</h3>
+            <div className="stack">
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  aria-label="Создать виртуальный звуковой выход"
+                  checked={virtualOn}
+                  onChange={(e) => setVirtualOn(e.target.checked)}
+                />
+                Создать виртуальный звуковой выход
+              </label>
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  aria-label="Включить Spotify"
+                  checked={spotifyOn}
+                  onChange={(e) => setSpotifyOn(e.target.checked)}
+                />
+                Включить Spotify
+              </label>
+              {spotifyOn && (
                 <label className="inline">
                   Ключ Spotify
                   <input
@@ -417,36 +450,46 @@ function NodeSettings({ node, onClose }: { node: NodeView; onClose: () => void }
                     onChange={(e) => setSoloistKey(e.target.value)}
                   />
                 </label>
-                <p className="hint">Приёмник Spotify поднимается только на этом передатчике, когда Spotify включён и ключ задан.</p>
-                <label className="inline">
-                  <input
-                    type="checkbox"
-                    aria-label="Включить Sendspin"
-                    checked={sendspinOn}
-                    onChange={(e) => setSendspinOn(e.target.checked)}
-                  />
-                  Включить Sendspin
-                </label>
-                <p className="hint">Колонки Sendspin поднимаются на зоны этого передатчика, только когда Sendspin включён.</p>
-              </>
-            )}
-            <ChanEditor
-              title="Входы"
-              hint="Отмеченные каналы входят в стереопоток. Виртуальный выход — такой же вход: он подмешивается в зону и раскладывается по выходам колонки в карте зоны."
-              empty="Агент ещё не прислал устройства захвата."
-              rows={rows}
-              onPatch={patchRow}
-            />
-          </>
+              )}
+              <p className="hint">Приёмник Spotify поднимается только на этом передатчике, когда Spotify включён и ключ задан.</p>
+              <label className="inline">
+                <input
+                  type="checkbox"
+                  aria-label="Включить Sendspin"
+                  checked={sendspinOn}
+                  onChange={(e) => setSendspinOn(e.target.checked)}
+                />
+                Включить Sendspin
+              </label>
+              <p className="hint">Колонки Sendspin поднимаются на зоны этого передатчика, только когда Sendspin включён.</p>
+            </div>
+          </section>
         )}
-        {isRx && (
-          <ChanEditor
-            title="Выходы"
-            hint="Отмеченные каналы — выходы колонки в карте зоны. Звук играет на устройство этих каналов."
-            empty="Агент ещё не прислал устройства воспроизведения."
-            rows={outRows}
-            onPatch={patchOut}
-          />
+        {(isTx || isRx) && (
+          <div className="node-flow">
+            {isTx && (
+              <ChanEditor
+                kind="in"
+                title="Входы"
+                hint="Отмеченные каналы входят в стереопоток. Виртуальный выход — такой же вход: он подмешивается в зону и раскладывается по выходам колонки в карте зоны."
+                empty="Агент ещё не прислал устройства захвата."
+                rows={rows}
+                onPatch={patchRow}
+                onEnable={(key) => setRows((list) => enableDevice(list, key))}
+              />
+            )}
+            {isRx && (
+              <ChanEditor
+                kind="out"
+                title="Выходы"
+                hint="Отмеченные каналы — выходы колонки в карте зоны. Звук играет на устройство этих каналов."
+                empty="Агент ещё не прислал устройства воспроизведения."
+                rows={outRows}
+                onPatch={patchOut}
+                onEnable={(key) => setOutRows((list) => enableDevice(list, key))}
+              />
+            )}
+          </div>
         )}
       </div>
     </Popup>
@@ -639,9 +682,6 @@ export default function Nodes() {
         {mode === 'stop' && (
           <Button onClick={() => void run(api.nodeCmd(n.node_id, 'stop'), 'стоп')}>Стоп</Button>
         )}
-        {masterNodeId !== n.node_id && (
-          <Button disabled={!n.online} onClick={() => void transfer(n)}>Сделать мастером</Button>
-        )}
       </>
     )
   }
@@ -746,7 +786,13 @@ export default function Nodes() {
         })}
       </div>
       {settingsNode && (
-        <NodeSettings key={settingsNode.node_id} node={settingsNode} onClose={() => setSettingsId(null)} />
+        <NodeSettings
+          key={settingsNode.node_id}
+          node={settingsNode}
+          master={masterNodeId === settingsNode.node_id}
+          transfer={() => void transfer(settingsNode)}
+          onClose={() => setSettingsId(null)}
+        />
       )}
     </main>
   )

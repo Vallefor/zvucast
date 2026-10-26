@@ -690,6 +690,43 @@ table.data tr:last-child td { border-bottom: 0; }
 .node-flag-spotify { color: var(--accent); }
 .node-flag-sendspin { color: var(--quiet); }
 
+.node-net {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.45rem 0.7rem;
+}
+
+.node-net-link { color: var(--text-dim); }
+
+.node-flow-side > .hint,
+.node-flow-side > .lede,
+.node-flow-side > .node-device,
+.node-flow-side > .node-add {
+  align-self: stretch;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.node-flow .chan-row { min-width: 0; }
+.node-flow .chan-row .field { min-width: 0; }
+
+.node-add {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.node-add-btn {
+  display: flex;
+  align-self: stretch;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.node-add-btn .flow-chip-name { flex: 1 1 auto; }
+
 @media (max-width: 420px) {
   .node-flow {
     grid-template-columns: minmax(0, 1fr) minmax(96px, 120px) minmax(0, 1fr);
