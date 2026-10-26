@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -239,20 +240,74 @@ fn play_desktop(
     }
 }
 
+/// Пишет буфер в stdin pw-play.
+///
+/// Мьютекс слота держится только на spawn и на дублирование дескриптора.
+/// Запись идёт в клон, уже без guard: процесс, который перестал читать,
+/// не блокирует остальные слоты и не мешает `DesktopPlay::shutdown` убить
+/// его. `false` — слот надо закрыть и идти к следующему в том же буфере.
 fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> bool {
-    let Ok(mut guard) = slot.lock() else { return false };
-    if guard.is_none() {
-        match spawn_player(sink_node) {
-            Ok(child) => *guard = Some(child),
+    let owned = {
+        let Ok(mut guard) = slot.lock() else { return false };
+        if guard.is_none() {
+            match spawn_player(sink_node) {
+                Ok(child) => *guard = Some(child),
+                Err(e) => {
+                    tracing::warn!("pw-play: {e:#}");
+                    return false;
+                }
+            }
+        }
+        let Some(child) = guard.as_mut() else { return false };
+        let Some(stdin) = child.stdin.as_ref() else { return false };
+        match stdin.as_fd().try_clone_to_owned() {
+            Ok(owned) => owned,
             Err(e) => {
-                tracing::warn!("pw-play: {e:#}");
+                tracing::warn!("pw-play: stdin: {e}");
                 return false;
             }
         }
+    };
+    if let Err(e) = set_fd_nonblocking(&owned, true) {
+        tracing::warn!("pw-play: stdin: {e}");
+        return false;
     }
-    let Some(child) = guard.as_mut() else { return false };
-    let Some(stdin) = child.stdin.as_mut() else { return false };
-    stdin.write_all(bytes).and_then(|_| stdin.flush()).is_ok()
+    let mut pipe = std::fs::File::from(owned);
+    probe_stdin_unlocked(slot);
+    pipe.write_all(bytes).is_ok()
+}
+
+fn set_fd_nonblocking(fd: &impl std::os::fd::AsFd, nonblocking: bool) -> std::io::Result<()> {
+    socket2::SockRef::from(fd).set_nonblocking(nonblocking)
+}
+
+/// В тестах проверяет, что слот уже отпущен, и может поставить запись на паузу.
+fn probe_stdin_unlocked(_slot: &Mutex<Option<Child>>) {
+    #[cfg(test)]
+    {
+        if STDIN_PROBE.with(|probe| probe.get()) {
+            let _guard = _slot
+                .try_lock()
+                .expect("мьютекс слота занят на время записи в stdin");
+            drop(_guard);
+        }
+        if let Some(pause) = STDIN_PAUSE.with(|pause| pause.take()) {
+            let _ = pause.entered.send(());
+            let _ = pause.release.recv();
+        }
+    }
+}
+
+#[cfg(test)]
+struct StdinPause {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STDIN_PROBE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static STDIN_PAUSE: std::cell::Cell<Option<StdinPause>> = std::cell::Cell::new(None);
 }
 
 fn spawn_player(sink_node: Option<&str>) -> Result<Child> {
@@ -976,6 +1031,130 @@ appl_ptr    : 313632\n";
         let late = st.get::<u64>("num-late").expect("num-late это u64");
         let lost = st.get::<u64>("num-lost").expect("num-lost это u64");
         assert_eq!(rx.stats().dropped, stutter_count(0, late, lost));
+    }
+
+    /// Потолок, если запись так и не отпустила слот. Успешный путь от паузы
+    /// не зависит: канал открывается уже после try_lock внутри записи.
+    const STUCK_WRITE_BOUND: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn stuck_writer_does_not_keep_the_slot_mutex() {
+        let stuck = Arc::new(Mutex::new(Some(sleeper_with_full_stdin())));
+        let reap_stuck = Reap(Arc::clone(&stuck));
+        let (cat, mut cat_out) = echoing_reader();
+        let live = Arc::new(Mutex::new(Some(cat)));
+        let reap_live = Reap(Arc::clone(&live));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let stuck_write = Arc::clone(&stuck);
+        let live_write = Arc::clone(&live);
+        let worker = std::thread::spawn(move || {
+            STDIN_PROBE.with(|probe| probe.set(true));
+            STDIN_PAUSE.with(|pause| {
+                pause.set(Some(StdinPause {
+                    entered: entered_tx,
+                    release: release_rx,
+                }));
+            });
+            let wrote_stuck = write_player(&stuck_write, b"pcm!", None);
+            let wrote_live = write_player(&live_write, b"pcm!", None);
+            let _ = result_tx.send((wrote_stuck, wrote_live));
+        });
+
+        match entered_rx.recv_timeout(STUCK_WRITE_BOUND) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => join_writer(worker),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("запись не дошла до stdin без мьютекса слота");
+            }
+        }
+        {
+            let guard = stuck
+                .try_lock()
+                .expect("shutdown не может забрать слот, пока идёт запись");
+            assert!(guard.is_some(), "процесс ещё жив, пока слот не закрыли");
+        }
+
+        release_tx.send(()).expect("поток записи уже завершился");
+        let (wrote_stuck, wrote_live) = match result_rx.recv_timeout(STUCK_WRITE_BOUND) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => join_writer(worker),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                close_player(&stuck);
+                let _ = worker.join();
+                panic!("запись в полный stdin не вернулась");
+            }
+        };
+        worker.join().expect("поток записи");
+        assert!(!wrote_stuck, "полный stdin не принимает буфер");
+        assert!(wrote_live, "следующий слот того же буфера должен получить байты");
+
+        let mut got = [0u8; 4];
+        cat_out
+            .read_exact(&mut got)
+            .expect("второй слот должен отдать тот же буфер");
+        assert_eq!(&got, b"pcm!");
+
+        drop(reap_stuck);
+        drop(reap_live);
+        assert!(stuck.lock().expect("слот").is_none());
+        assert!(live.lock().expect("слот").is_none());
+    }
+
+    fn join_writer(worker: std::thread::JoinHandle<()>) -> ! {
+        match worker.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("поток записи завершился без результата"),
+        }
+    }
+
+    fn sleeper_with_full_stdin() -> Child {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep");
+        let stdin = child.stdin.as_mut().expect("stdin");
+        set_fd_nonblocking(stdin, true).expect("O_NONBLOCK");
+        let chunk = [0u8; 8192];
+        loop {
+            match stdin.write(&chunk) {
+                Ok(0) => panic!("stdin закрылся до заполнения"),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("заполнение stdin: {e}"),
+            }
+        }
+        // Дальше дескриптор снова блокирующий: запись обязана сама выставить
+        // O_NONBLOCK, иначе write_all встанет на полном пайпе.
+        set_fd_nonblocking(stdin, false).expect("блокирующий stdin");
+        child
+    }
+
+    fn echoing_reader() -> (Child, std::process::ChildStdout) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cat");
+        let stdout = child.stdout.take().expect("stdout");
+        (child, stdout)
+    }
+
+    struct Reap(Arc<Mutex<Option<Child>>>);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if self.0.try_lock().is_ok() {
+                close_player(&self.0);
+            }
+        }
     }
 
     #[test]
