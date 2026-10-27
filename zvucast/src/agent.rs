@@ -1382,6 +1382,13 @@ fn gst_domain(
     }
 
     let mut next_telem = Instant::now();
+    let (vol_tx, vol_rx) = std::sync::mpsc::channel::<crate::volume::VolumeSample>();
+    let mut vol_pending = false;
+    let mut vols = crate::volume::VolumeSample {
+        capture: None,
+        playback: None,
+    };
+    let mut next_vol = std::time::Instant::now();
 
     loop {
         // Sup-события дрейним ДО команд: Stop в командной фазе того же тика
@@ -1599,8 +1606,31 @@ fn gst_domain(
                     }
                 }
             },
-            Ok(CtlMsg::SetVolume { .. }) => {
-                tracing::debug!("SetVolume: применение громкости ещё не подключено");
+            Ok(CtlMsg::SetVolume { capture, playback }) => {
+                if let Some(cubic) = capture {
+                    if let Some(name) = capture_target.borrow().clone() {
+                        if let Err(e) = crate::volume::set_cubic(&name, cubic) {
+                            tracing::warn!("громкость захвата: {e:#}");
+                        }
+                    }
+                }
+                if let Some(cubic) = playback {
+                    let names = playback_target.borrow().clone();
+                    let fallback;
+                    let names: &[String] = if names.is_empty() {
+                        fallback = crate::pipeline::desktop_playback_target()
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        &fallback
+                    } else {
+                        &names
+                    };
+                    for name in names {
+                        if let Err(e) = crate::volume::set_cubic(name, cubic) {
+                            tracing::warn!(node = %name, "громкость воспроизведения: {e:#}");
+                        }
+                    }
+                }
             }
             Ok(CtlMsg::SetMutedZones { zones }) => match tx_half.as_mut() {
                 None => tracing::debug!("SetMutedZones: нет tx — игнорируем"),
@@ -1816,6 +1846,26 @@ fn gst_domain(
             }
         }
 
+        while let Ok(sample) = vol_rx.try_recv() {
+            vols = sample;
+            vol_pending = false;
+        }
+        if !vol_pending && std::time::Instant::now() >= next_vol {
+            next_vol = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            vol_pending = true;
+            let capture = capture_target.borrow().clone();
+            let playback = playback_target.borrow().clone();
+            let previous = vols.clone();
+            let tx = vol_tx.clone();
+            std::thread::spawn(move || {
+                let sample = match crate::volume::read_dump() {
+                    Some(dump) => crate::volume::from_dump(&dump, capture.as_deref(), &playback),
+                    None => previous,
+                };
+                let _ = tx.send(sample);
+            });
+        }
+
         if Instant::now() >= next_telem {
             next_telem = Instant::now() + TELEM_PERIOD;
             let _ = telem_tx.send(Telemetry {
@@ -1823,8 +1873,8 @@ fn gst_domain(
                 rx: rx_half.as_ref().map(|h| rx_telemetry(&h.runner)),
                 ptp_offset_ns: *ptp_offset.borrow(),
                 uptime_s: started.elapsed().as_secs(),
-                capture_volume: None,
-                playback_volume: None,
+                capture_volume: vols.capture,
+                playback_volume: vols.playback,
             });
         }
     }
