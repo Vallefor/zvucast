@@ -262,6 +262,18 @@ impl MockAgent {
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }
 
+    async fn send_telemetry_volumes(&mut self, capture: f64, playback: f64) {
+        let t = AgentMsg::Telemetry(Telemetry {
+            tx: Some(RoleTx { state: PipelineState::Playing, rms_l: -20.0, rms_r: -20.0 }),
+            rx: Some(RoleRx { state: PipelineState::Playing, dropped: 0, rendered: 1, queue_ms: 5 }),
+            ptp_offset_ns: 0,
+            uptime_s: 3,
+            capture_volume: Some(capture),
+            playback_volume: Some(playback),
+        });
+        self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
+    }
+
     /// Следующий текстовый кадр, включая цели УИ.
     async fn recv_text_ctl(&mut self) -> CtlMsg {
         loop {
@@ -2282,4 +2294,42 @@ async fn ui_targets_follow_hello_and_prefs() {
         recv_raw(&mut pc).await,
         CtlMsg::SetMutedZones { zones: vec!["hall".into()] }
     );
+}
+
+#[tokio::test]
+async fn node_volume_patch_reaches_the_agent() {
+    let path = temp_state_path("node-volume");
+    let port = serve(AppState::with_state(&path)).await;
+    let mut pc = MockAgent::connect_mixed(port, "pi3").await;
+    for _ in 0..8 {
+        if tokio::time::timeout(Duration::from_millis(200), pc.recv_ctl()).await.is_err() {
+            break;
+        }
+    }
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        "/api/nodes/pi3",
+        r#"{"capture_volume":0.8,"playback_volume":1.2}"#,
+    ).await;
+    assert_eq!(status, 200, "{body}");
+    let mut got = None;
+    for _ in 0..8 {
+        let msg = pc.recv_ctl_within(2).await;
+        if let CtlMsg::SetVolume { capture, playback } = msg {
+            got = Some((capture, playback));
+            break;
+        }
+    }
+    assert_eq!(got, Some((Some(0.8), Some(1.2))));
+
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/pi3", r#"{"capture_volume":1.6}"#).await;
+    assert_eq!(status, 400, "{body}");
+
+    pc.send_telemetry_volumes(0.4, 1.0).await;
+    let nodes = wait_for(port, |nodes| {
+        node(nodes, "pi3")["telemetry"]["capture_volume"].as_f64() == Some(0.4)
+    }).await;
+    assert_eq!(node(&nodes, "pi3")["telemetry"]["playback_volume"].as_f64(), Some(1.0));
 }

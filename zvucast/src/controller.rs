@@ -1606,6 +1606,8 @@ struct PatchNode {
     /// None — не трогать.
     spotify: Option<bool>,
     sendspin: Option<bool>,
+    capture_volume: Option<f64>,
+    playback_volume: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1649,6 +1651,16 @@ async fn patch_node(
     body: Result<Json<PatchNode>, JsonRejection>,
 ) -> Result<Json<NodeView>, (StatusCode, String)> {
     let Json(b) = body.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if let Some(v) = b.capture_volume {
+        if !crate::volume::accepted(v) {
+            return Err((StatusCode::BAD_REQUEST, format!("capture_volume {v} вне 0..=1.5")));
+        }
+    }
+    if let Some(v) = b.playback_volume {
+        if !crate::volume::accepted(v) {
+            return Err((StatusCode::BAD_REQUEST, format!("playback_volume {v} вне 0..=1.5")));
+        }
+    }
     let node_id = {
         let reg = st.reg.lock().await;
         reg.resolve(&id_or_name).ok_or((
@@ -1745,6 +1757,15 @@ async fn patch_node(
         }
         if patched_outputs {
             push_playback_target(&mut reg, &node_id, &output_prefs);
+        }
+        if b.capture_volume.is_some() || b.playback_volume.is_some() {
+            let _ = reg.send_cmd(
+                &node_id,
+                CtlMsg::SetVolume {
+                    capture: b.capture_volume,
+                    playback: b.playback_volume,
+                },
+            );
         }
     }
     let reg = st.reg.lock().await;
