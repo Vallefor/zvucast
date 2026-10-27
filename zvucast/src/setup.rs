@@ -29,6 +29,8 @@ pub trait Host: Sync {
     fn run(&self, secs: u64, program: &str, args: &[String]) -> Cmd;
     fn uname_m(&self) -> String;
     fn wireless_ifaces(&self) -> Vec<String>;
+    /// `limits.conf` и `limits.d/*.conf` одним текстом. Каталога может не быть.
+    fn limits_text(&self) -> String;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,15 +75,6 @@ impl Host for SystemHost {
         let argv = timeout_argv(secs, program, &refs);
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
-        if program == "systemctl" && args.first().map(String::as_str) == Some("--user") {
-            let uid = audio_uid(&self.read_to_string(AGENT_UNIT).unwrap_or_default());
-            let runtime = format!("/run/user/{uid}");
-            command.env("XDG_RUNTIME_DIR", &runtime);
-            command.env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={runtime}/bus"),
-            );
-        }
         match command.output() {
             Ok(output) => cmd_from_output(output),
             Err(_) => Cmd {
@@ -110,6 +103,30 @@ impl Host for SystemHost {
         }
         names.sort();
         names
+    }
+
+    fn limits_text(&self) -> String {
+        let mut chunks = Vec::new();
+        if let Some(text) = self.read_to_string(LIMITS) {
+            chunks.push(text);
+        }
+        let Ok(entries) = std::fs::read_dir("/etc/security/limits.d") else {
+            return chunks.join("\n");
+        };
+        let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+                continue;
+            }
+            let Some(path) = path.to_str() else {
+                continue;
+            };
+            if let Some(text) = self.read_to_string(path) {
+                chunks.push(text);
+            }
+        }
+        chunks.join("\n")
     }
 }
 
@@ -271,9 +288,9 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
 
     let probed = std::thread::scope(|scope| {
         let passwd = scope.spawn(|| host.run(2, "getent", &owned(&["passwd", &uid.to_string()])));
-        let pipewire = scope.spawn(|| user_service(host, "pipewire"));
-        let wireplumber = scope.spawn(|| user_service(host, "wireplumber"));
-        let pulse = scope.spawn(|| user_service(host, "pipewire-pulse"));
+        let pipewire = scope.spawn(|| user_service(host, uid, "pipewire"));
+        let wireplumber = scope.spawn(|| user_service(host, uid, "wireplumber"));
+        let pulse = scope.spawn(|| user_service(host, uid, "pipewire-pulse"));
         let gst_pw = scope.spawn(|| host.run(2, "gst-inspect-1.0", &owned(&["pipewiresrc"])));
         let gst_alsa = scope.spawn(|| host.run(2, "gst-inspect-1.0", &owned(&["alsasrc"])));
         let linger = scope.spawn(|| {
@@ -287,7 +304,7 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
             host.read_to_string(&format!("/run/user/{uid}/pipewire-0"))
                 .is_some()
         });
-        let limits = scope.spawn(|| host.read_to_string(LIMITS).unwrap_or_default());
+        let limits = scope.spawn(|| host.limits_text());
         let enabled = scope.spawn(|| {
             host.run(
                 2,
@@ -356,7 +373,7 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
     if !probed.socket {
         setup.push(issue("pipewire-socket", packages));
     }
-    if !probed.limits.contains("@audio - rtprio 95") {
+    if !audio_rtprio_ok(&probed.limits) {
         setup.push(issue("rt-limits", limits_command(&user)));
     }
     for (iface, cmd) in probed.wifi {
@@ -412,8 +429,35 @@ fn owned(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
-fn user_service(host: &impl Host, service: &str) -> Cmd {
-    host.run(2, "systemctl", &owned(&["--user", "is-active", service]))
+/// С 257 systemd не пускает root в чужой user bus через `XDG_RUNTIME_DIR`:
+/// «Operation not permitted». Менеджер этого uid открывается как
+/// `systemctl --machine=<uid>@ --user`.
+fn user_service(host: &impl Host, uid: u32, service: &str) -> Cmd {
+    let machine = format!("--machine={uid}@");
+    host.run(
+        2,
+        "systemctl",
+        &owned(&[&machine, "--user", "is-active", service]),
+    )
+}
+
+/// `@audio` с rtprio не ниже 95. Строка может лежать в `limits.d`, значение
+/// может быть выше 95: на CachyOS это `@audio - rtprio 99`.
+fn audio_rtprio_ok(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 || parts[0] != "@audio" || parts[2] != "rtprio" {
+            return false;
+        }
+        if !matches!(parts[1], "-" | "hard" | "soft") {
+            return false;
+        }
+        parts[3].parse::<u32>().ok().is_some_and(|n| n >= 95)
+    })
 }
 
 fn user_name(listed: &Cmd, uid: u32) -> String {
@@ -523,6 +567,23 @@ mod tests {
         fn wireless_ifaces(&self) -> Vec<String> {
             self.wireless.clone()
         }
+
+        fn limits_text(&self) -> String {
+            let mut paths: Vec<&String> = self
+                .files
+                .keys()
+                .filter(|path| {
+                    path.as_str() == LIMITS || path.starts_with("/etc/security/limits.d/")
+                })
+                .collect();
+            paths.sort();
+            paths
+                .into_iter()
+                .filter_map(|path| self.files.get(path))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
 
     fn healthy_debian() -> Fake {
@@ -553,7 +614,7 @@ mod tests {
         for service in ["pipewire", "wireplumber", "pipewire-pulse"] {
             host.answer(
                 "systemctl",
-                &["--user", "is-active", service],
+                &["--machine=1000@", "--user", "is-active", service],
                 Cmd {
                     code: Some(0),
                     stdout: "active\n".into(),
@@ -590,11 +651,57 @@ mod tests {
     }
 
     #[test]
+    fn user_services_are_read_from_that_users_manager() {
+        let host = healthy_debian();
+        let snap = inspect(&host);
+        let starts = host.starts.lock().expect("starts");
+        for service in ["pipewire", "wireplumber", "pipewire-pulse"] {
+            assert!(
+                starts.iter().any(|(name, args, _)| {
+                    name == "systemctl"
+                        && args.as_slice() == ["--machine=1000@", "--user", "is-active", service]
+                }),
+                "no --machine query for {service}"
+            );
+        }
+        assert!(snap.setup.iter().all(|issue| {
+            !matches!(
+                issue.id.as_str(),
+                "pipewire" | "wireplumber" | "pipewire-pulse"
+            )
+        }));
+    }
+
+    #[test]
+    fn audio_rtprio_in_limits_d_is_enough() {
+        let mut host = healthy_debian();
+        host.files
+            .insert("/etc/security/limits.conf".into(), "# none\n".into());
+        host.files.insert(
+            "/etc/security/limits.d/20-audio.conf".into(),
+            "@audio - rtprio 99\n".into(),
+        );
+        assert!(!inspect(&host).setup.iter().any(|i| i.id == "rt-limits"));
+    }
+
+    #[test]
+    fn pipewire_group_rtprio_does_not_cover_audio() {
+        let mut host = healthy_debian();
+        host.files
+            .insert("/etc/security/limits.conf".into(), "# none\n".into());
+        host.files.insert(
+            "/etc/security/limits.d/25-pw-rlimits.conf".into(),
+            "@pipewire   - rtprio  95\n".into(),
+        );
+        assert!(inspect(&host).setup.iter().any(|i| i.id == "rt-limits"));
+    }
+
+    #[test]
     fn debian_inactive_pipewire_uses_apt_command() {
         let mut host = healthy_debian();
         host.answer(
             "systemctl",
-            &["--user", "is-active", "pipewire"],
+            &["--machine=1000@", "--user", "is-active", "pipewire"],
             Cmd {
                 code: Some(3),
                 stdout: "inactive\n".into(),
@@ -612,7 +719,7 @@ mod tests {
         host.set_os("ID=cachyos\nID_LIKE=arch\n");
         host.answer(
             "systemctl",
-            &["--user", "is-active", "pipewire"],
+            &["--machine=1000@", "--user", "is-active", "pipewire"],
             Cmd {
                 code: Some(3),
                 stdout: "inactive\n".into(),
@@ -821,7 +928,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("no start for {program} {args:?}"))
         };
         let getent = stamp("getent", &["passwd", "1000"]);
-        let pipewire = stamp("systemctl", &["--user", "is-active", "pipewire"]);
+        let pipewire = stamp(
+            "systemctl",
+            &["--machine=1000@", "--user", "is-active", "pipewire"],
+        );
         let gap =
             getent.saturating_duration_since(pipewire) + pipewire.saturating_duration_since(getent);
         assert!(
