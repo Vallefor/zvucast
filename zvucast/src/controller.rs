@@ -1608,6 +1608,7 @@ struct PatchNode {
     sendspin: Option<bool>,
     capture_volume: Option<f64>,
     playback_volume: Option<f64>,
+    device_volumes: Option<Vec<zproto::DeviceVolume>>,
 }
 
 #[derive(Deserialize)]
@@ -1659,6 +1660,16 @@ async fn patch_node(
     if let Some(v) = b.playback_volume {
         if !crate::volume::accepted(v) {
             return Err((StatusCode::BAD_REQUEST, format!("playback_volume {v} вне 0..=1.5")));
+        }
+    }
+    if let Some(list) = &b.device_volumes {
+        for item in list {
+            if !crate::volume::accepted(item.volume) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("громкость {} = {} вне 0..=1.5", item.device, item.volume),
+                ));
+            }
         }
     }
     let node_id = {
@@ -1758,12 +1769,13 @@ async fn patch_node(
         if patched_outputs {
             push_playback_target(&mut reg, &node_id, &output_prefs);
         }
-        if b.capture_volume.is_some() || b.playback_volume.is_some() {
+        if b.capture_volume.is_some() || b.playback_volume.is_some() || b.device_volumes.is_some() {
             let _ = reg.send_cmd(
                 &node_id,
                 CtlMsg::SetVolume {
                     capture: b.capture_volume,
                     playback: b.playback_volume,
+                    devices: b.device_volumes.unwrap_or_default(),
                 },
             );
         }

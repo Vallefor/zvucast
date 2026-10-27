@@ -28,6 +28,7 @@ export interface Telemetry {
   uptime_s: number
   capture_volume?: number | null
   playback_volume?: number | null
+  device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
 }
 
 export interface InputView {
@@ -119,6 +120,7 @@ export const api = {
     sendspin?: boolean
     capture_volume?: number
     playback_volume?: number
+    device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
   }) =>
     fetch(`/api/nodes/${id}`, {
       method: 'PATCH',

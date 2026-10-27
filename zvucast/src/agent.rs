@@ -1387,6 +1387,7 @@ fn gst_domain(
     let mut vols = crate::volume::VolumeSample {
         capture: None,
         playback: None,
+        devices: Vec::new(),
     };
     let mut next_vol = std::time::Instant::now();
 
@@ -1606,7 +1607,12 @@ fn gst_domain(
                     }
                 }
             },
-            Ok(CtlMsg::SetVolume { capture, playback }) => {
+            Ok(CtlMsg::SetVolume { capture, playback, devices }) => {
+                for item in devices {
+                    if let Err(e) = crate::volume::set_cubic(&item.device, item.volume) {
+                        tracing::warn!(device = %item.device, "громкость: {e:#}");
+                    }
+                }
                 if let Some(cubic) = capture {
                     if let Some(name) = capture_target.borrow().clone() {
                         if let Err(e) = crate::volume::set_cubic(&name, cubic) {
@@ -1854,12 +1860,20 @@ fn gst_domain(
             next_vol = std::time::Instant::now() + std::time::Duration::from_secs(2);
             vol_pending = true;
             let capture = capture_target.borrow().clone();
-            let playback = playback_target.borrow().clone();
+            let selected = playback_target.borrow().clone();
+            let playback = crate::volume::playback_sample_names(
+                &selected,
+                crate::pipeline::desktop_playback_target(),
+            );
             let previous = vols.clone();
             let tx = vol_tx.clone();
             std::thread::spawn(move || {
                 let sample = match crate::volume::read_dump() {
-                    Some(dump) => crate::volume::from_dump(&dump, capture.as_deref(), &playback),
+                    Some(dump) => {
+                        let mut sample = crate::volume::from_dump(&dump, capture.as_deref(), &playback);
+                        sample.devices = crate::volume::device_volumes(&dump);
+                        sample
+                    }
                     None => previous,
                 };
                 let _ = tx.send(sample);
@@ -1875,6 +1889,7 @@ fn gst_domain(
                 uptime_s: started.elapsed().as_secs(),
                 capture_volume: vols.capture,
                 playback_volume: vols.playback,
+                device_volumes: vols.devices.clone(),
             });
         }
     }
@@ -2015,6 +2030,7 @@ pub(crate) fn initial_telemetry(roles: &[Role]) -> Telemetry {
         uptime_s: 0,
         capture_volume: None,
         playback_volume: None,
+        device_volumes: Vec::new(),
     }
 }
 

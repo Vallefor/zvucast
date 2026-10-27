@@ -10,6 +10,7 @@ import {
   isPlaying,
   showStartAll,
   showStopAll,
+  deviceVolume,
   showVolumeSlider,
   transport,
   volumeFromPercent,
@@ -98,6 +99,14 @@ test('громкость в процентах кубической шкалы',
   assert.equal(showVolumeSlider(false, 0.4), false)
   assert.equal(showVolumeSlider(true, null), false)
   assert.equal(showVolumeSlider(true, undefined), false)
+  const vols = [
+    { device: 'alsa_output.usb', volume: 0.4, card: 'USB Audio CODEC', class: 'sink' },
+    { device: 'alsa_input.usb', volume: 1, card: 'USB Audio CODEC', class: 'source' },
+  ]
+  assert.equal(deviceVolume(vols, 'alsa_output.usb', 'PCM2902', 'out')?.volume, 0.4)
+  assert.equal(deviceVolume(vols, 'Burr-Brown from TI USB Audio CODEC at usb-1', 'Burr-Brown from TI USB Audio CODEC at usb-1', 'out')?.device, 'alsa_output.usb')
+  assert.equal(deviceVolume(vols, 'Burr-Brown from TI USB Audio CODEC at usb-1', 'Burr-Brown from TI USB Audio CODEC at usb-1', 'in')?.device, 'alsa_input.usb')
+  assert.equal(deviceVolume(vols, 'capture', 'Захват', 'in'), null)
 })
 
 test('имя устройства берётся из первой строки ключа', () => {

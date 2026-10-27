@@ -543,6 +543,7 @@ mod tests {
             uptime_s: 7,
             capture_volume: None,
             playback_volume: None,
+            device_volumes: Vec::new(),
         }
     }
 

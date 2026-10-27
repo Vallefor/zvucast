@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
-import { addableDevices, chanWord, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent } from '../nodesView'
+import { addableDevices, chanWord, deviceVolume, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent } from '../nodesView'
 import { offer, updateWait } from '../update'
 import { Badge, Button, useRun, useUi } from '../ui'
 
@@ -242,6 +242,9 @@ function ChanEditor({
   title,
   empty,
   rows,
+  volumes,
+  drafts,
+  onVolume,
   onPatch,
   onEnable,
 }: {
@@ -249,6 +252,9 @@ function ChanEditor({
   title: string
   empty: string
   rows: InputView[]
+  volumes: { device: string; volume: number; card?: string; class?: string }[] | null | undefined
+  drafts: Record<string, number>
+  onVolume: (key: string, percent: number) => void
   onPatch: (id: string, next: Partial<InputView>) => void
   onEnable: (key: string) => void
 }) {
@@ -268,6 +274,20 @@ function ChanEditor({
             {kind === 'out' && <span className="flow-stub" aria-hidden="true" />}
             <div className="chan-pick">
               <span className="chan-pick-name" title={group.name}>{group.name}</span>
+              {deviceVolume(volumes, group.key, group.name, kind) != null && (
+                <label className="chan-volume">
+                  <input
+                    type="range"
+                    min={0}
+                    max={150}
+                    step={1}
+                    aria-label={`Громкость ${group.name}`}
+                    value={drafts[`${kind}:${group.key}`] ?? volumePercent(deviceVolume(volumes, group.key, group.name, kind)?.volume ?? 0)}
+                    onChange={(e) => onVolume(`${kind}:${group.key}`, Number(e.target.value))}
+                  />
+                  <b className="num">{drafts[`${kind}:${group.key}`] ?? volumePercent(deviceVolume(volumes, group.key, group.name, kind)?.volume ?? 0)}%</b>
+                </label>
+              )}
               {group.rows.map((row) => (
                 <div key={row.id} className="chan-row">
                   <input
@@ -346,10 +366,12 @@ function NodeSettings({
   const [spotifyOn, setSpotifyOn] = useState(node.spotify ?? false)
   const [sendspinOn, setSendspinOn] = useState(node.sendspin ?? false)
   const [soloistKey, setSoloistKey] = useState(node.soloist_key ?? '')
+  const [volumeDraft, setVolumeDraft] = useState<Record<string, number>>({})
   const [captureDraft, setCaptureDraft] = useState<number | null>(null)
   const [playbackDraft, setPlaybackDraft] = useState<number | null>(null)
-  const captureShown = showVolumeSlider(isTx, node.telemetry?.capture_volume)
-  const playbackShown = showVolumeSlider(isRx, node.telemetry?.playback_volume)
+  const perDevice = (node.telemetry?.device_volumes?.length ?? 0) > 0
+  const captureShown = !perDevice && showVolumeSlider(isTx, node.telemetry?.capture_volume)
+  const playbackShown = !perDevice && showVolumeSlider(isRx, node.telemetry?.playback_volume)
   const capturePct = captureDraft ?? (typeof node.telemetry?.capture_volume === 'number' ? volumePercent(node.telemetry.capture_volume) : 0)
   const playbackPct = playbackDraft ?? (typeof node.telemetry?.playback_volume === 'number' ? volumePercent(node.telemetry.playback_volume) : 0)
 
@@ -372,6 +394,7 @@ function NodeSettings({
       sendspin?: boolean
       capture_volume?: number
       playback_volume?: number
+      device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
     } = { display_name: name.trim() || null }
     if (isTx) {
       const n = Number(dscp)
@@ -393,6 +416,21 @@ function NodeSettings({
     }
     if (captureShown) body.capture_volume = volumeFromPercent(capturePct)
     if (playbackShown) body.playback_volume = volumeFromPercent(playbackPct)
+    if (perDevice) {
+      const device_volumes: { device: string; volume: number; card?: string; class?: string }[] = []
+      const take = (kind: 'in' | 'out', list: InputView[]) => {
+        for (const group of groupDevices(list)) {
+          if (!group.rows.some((row) => row.enabled)) continue
+          const found = deviceVolume(node.telemetry?.device_volumes, group.key, group.name, kind)
+          if (!found) continue
+          const pct = volumeDraft[`${kind}:${group.key}`] ?? volumePercent(found.volume)
+          device_volumes.push({ device: found.device, volume: volumeFromPercent(pct) })
+        }
+      }
+      if (isTx) take('in', rows)
+      if (isRx) take('out', outRows)
+      if (device_volumes.length > 0) body.device_volumes = device_volumes
+    }
     void run(api.patchNode(node.node_id, body), 'настройки узла').then((ok) => {
       if (ok) onClose()
     })
@@ -546,6 +584,9 @@ function NodeSettings({
               title="Входы"
               empty="Агент ещё не прислал устройства захвата."
               rows={rows}
+              volumes={perDevice ? node.telemetry?.device_volumes : []}
+              drafts={volumeDraft}
+              onVolume={(key, percent) => setVolumeDraft((prev) => ({ ...prev, [key]: percent }))}
               onPatch={patchRow}
               onEnable={(key) => setRows((list) => enableDevice(list, key))}
             />
@@ -567,6 +608,9 @@ function NodeSettings({
               title="Выходы"
               empty="Агент ещё не прислал устройства воспроизведения."
               rows={outRows}
+              volumes={perDevice ? node.telemetry?.device_volumes : []}
+              drafts={volumeDraft}
+              onVolume={(key, percent) => setVolumeDraft((prev) => ({ ...prev, [key]: percent }))}
               onPatch={patchOut}
               onEnable={(key) => setOutRows((list) => enableDevice(list, key))}
             />

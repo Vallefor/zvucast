@@ -870,6 +870,17 @@ table.data tr:last-child td { border-bottom: 0; }
   margin-bottom: 0.15rem;
 }
 
+.chan-volume {
+  display: grid;
+  grid-template-columns: 1fr 2.75rem;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.2rem 0 0.35rem;
+}
+
+.chan-volume input[type="range"] { width: 100%; accent-color: var(--accent); }
+.chan-volume b { text-align: right; font-weight: 500; color: var(--text); }
+
 .node-flow .chan-row { min-width: 0; min-height: 2.25rem; }
 .node-flow .chan-row .field { min-width: 0; width: 8.5rem; max-width: 100%; min-height: 2rem; }
 

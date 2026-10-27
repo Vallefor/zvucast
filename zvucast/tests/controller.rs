@@ -243,6 +243,7 @@ impl MockAgent {
             uptime_s: 3,
             capture_volume: None,
             playback_volume: None,
+            device_volumes: Vec::new(),
         });
         self.ws
             .send(Message::Text(serde_json::to_string(&t).unwrap()))
@@ -258,6 +259,7 @@ impl MockAgent {
             uptime_s: 3,
             capture_volume: None,
             playback_volume: None,
+            device_volumes: Vec::new(),
         });
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }
@@ -270,6 +272,7 @@ impl MockAgent {
             uptime_s: 3,
             capture_volume: Some(capture),
             playback_volume: Some(playback),
+            device_volumes: Vec::new(),
         });
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }
@@ -2317,12 +2320,47 @@ async fn node_volume_patch_reaches_the_agent() {
     let mut got = None;
     for _ in 0..8 {
         let msg = pc.recv_ctl_within(2).await;
-        if let CtlMsg::SetVolume { capture, playback } = msg {
-            got = Some((capture, playback));
+        if let CtlMsg::SetVolume { capture, playback, devices } = msg {
+            got = Some((capture, playback, devices));
             break;
         }
     }
-    assert_eq!(got, Some((Some(0.8), Some(1.2))));
+    assert_eq!(got, Some((Some(0.8), Some(1.2), vec![])));
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        "/api/nodes/pi3",
+        r#"{"device_volumes":[{"device":"snd_rpi_hifiberry_dac","volume":0.5}]}"#,
+    ).await;
+    assert_eq!(status, 200, "{body}");
+    let mut named = None;
+    for _ in 0..8 {
+        let msg = pc.recv_ctl_within(2).await;
+        if let CtlMsg::SetVolume { devices, .. } = msg {
+            if !devices.is_empty() {
+                named = Some(devices);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        named,
+        Some(vec![zproto::DeviceVolume {
+            device: "snd_rpi_hifiberry_dac".into(),
+            volume: 0.5,
+            card: String::new(),
+            class: String::new(),
+        }])
+    );
+
+    let (status, _) = http_body(
+        port,
+        "PATCH",
+        "/api/nodes/pi3",
+        r#"{"device_volumes":[{"device":"snd_rpi_hifiberry_dac","volume":2}]}"#,
+    ).await;
+    assert_eq!(status, 400);
 
     let (status, body) = http_body(port, "PATCH", "/api/nodes/pi3", r#"{"capture_volume":1.6}"#).await;
     assert_eq!(status, 400, "{body}");

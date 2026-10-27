@@ -75,6 +75,23 @@ pub mod proto {
         /// Кубическая громкость воспроизведения, 0.0..=1.5. Старый агент поле не шлёт.
         #[serde(default)]
         pub playback_volume: Option<f64>,
+        /// Громкость каждого узла PipeWire и его однозначных имён (карта, описание).
+        /// Старый агент поле не шлёт.
+        #[serde(default)]
+        pub device_volumes: Vec<DeviceVolume>,
+    }
+
+    /// Кубическая громкость одного устройства, 0.0..=1.5.
+    /// `device` — `node.name`. `card` и `class` (`source` / `sink`) помогают
+    /// найти тот же узел, когда в настройках ключ — подпись ALSA, а не имя PipeWire.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct DeviceVolume {
+        pub device: String,
+        pub volume: f64,
+        #[serde(default)]
+        pub card: String,
+        #[serde(default)]
+        pub class: String,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,9 +268,12 @@ pub mod proto {
         /// Куда играет rx. Пустой вектор — запасной sink; непустой — играть только в эти узлы.
         SetPlaybackTarget { device_keys: Vec<String> },
         /// Кубическая громкость PipeWire. None — эту сторону не менять.
+        /// `devices` — громкость названных устройств; старый контроллер поле не шлёт.
         SetVolume {
             capture: Option<f64>,
             playback: Option<f64>,
+            #[serde(default)]
+            devices: Vec<DeviceVolume>,
         },
         /// Зоны, чей монитор не подмешивается: id в множестве → source зоны None.
         SetMutedZones { zones: Vec<String> },
@@ -385,6 +405,7 @@ mod tests {
             uptime_s: 61,
             capture_volume: None,
             playback_volume: None,
+            device_volumes: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"rx\":null"), "отсутствующая роль — null: {s}");
@@ -401,6 +422,7 @@ mod tests {
             uptime_s: 7,
             capture_volume: None,
             playback_volume: None,
+            device_volumes: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"queue_ms\":5"), "поля rx на месте: {s}");
@@ -638,6 +660,7 @@ mod tests {
         };
         assert_eq!(t.capture_volume, None);
         assert_eq!(t.playback_volume, None);
+        assert!(t.device_volumes.is_empty());
     }
 
     #[test]
@@ -649,13 +672,19 @@ mod tests {
             uptime_s: 1,
             capture_volume: Some(1.0),
             playback_volume: Some(0.4),
+            device_volumes: vec![DeviceVolume { device: "alsa_output.hifi".into(), volume: 0.4, card: String::new(), class: String::new() }],
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"capture_volume\":1.0"), "{s}");
         assert!(s.contains("\"playback_volume\":0.4"), "{s}");
+        assert!(s.contains("\"device_volumes\""), "{s}");
         assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
 
-        let set = CtlMsg::SetVolume { capture: Some(0.8), playback: None };
+        let set = CtlMsg::SetVolume {
+            capture: Some(0.8),
+            playback: None,
+            devices: vec![DeviceVolume { device: "alsa_output.hifi".into(), volume: 0.5, card: String::new(), class: String::new() }],
+        };
         let wire = serde_json::to_string(&set).unwrap();
         assert_eq!(serde_json::from_str::<CtlMsg>(&wire).unwrap(), set);
     }

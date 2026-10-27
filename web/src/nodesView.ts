@@ -99,3 +99,34 @@ export function volumeFromPercent(percent: number): number {
 export function showVolumeSlider(role: boolean, volume: number | null | undefined): boolean {
   return role && typeof volume === 'number' && Number.isFinite(volume)
 }
+
+export interface DeviceVolume {
+  device: string
+  volume: number
+  card?: string
+  class?: string
+}
+
+function finiteVolume(row: DeviceVolume | undefined): row is DeviceVolume {
+  return !!row && typeof row.volume === 'number' && Number.isFinite(row.volume)
+}
+
+/// Узел PipeWire для карточки устройства. Сначала точное имя, иначе единственная
+/// карта той же стороны, чьё имя входит в подпись.
+export function deviceVolume(
+  volumes: DeviceVolume[] | null | undefined,
+  key: string,
+  name: string,
+  kind: 'in' | 'out',
+): DeviceVolume | null {
+  const list = volumes ?? []
+  const exact = list.find((row) => row.device === key || row.device === name)
+  if (finiteVolume(exact)) return exact
+  const want = kind === 'in' ? 'source' : 'sink'
+  const hits = list.filter((row) => {
+    if (row.class !== want || !row.card) return false
+    return key.includes(row.card) || name.includes(row.card)
+  })
+  if (hits.length === 1 && finiteVolume(hits[0])) return hits[0]
+  return null
+}

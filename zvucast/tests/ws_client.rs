@@ -40,6 +40,7 @@ fn stopped_telemetry() -> Telemetry {
         uptime_s: 0,
         capture_volume: None,
         playback_volume: None,
+        device_volumes: Vec::new(),
     }
 }
 
