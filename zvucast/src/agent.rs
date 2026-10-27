@@ -1599,6 +1599,9 @@ fn gst_domain(
                     }
                 }
             },
+            Ok(CtlMsg::SetVolume { .. }) => {
+                tracing::debug!("SetVolume: применение громкости ещё не подключено");
+            }
             Ok(CtlMsg::SetMutedZones { zones }) => match tx_half.as_mut() {
                 None => tracing::debug!("SetMutedZones: нет tx — игнорируем"),
                 Some(h) => {
@@ -1820,6 +1823,8 @@ fn gst_domain(
                 rx: rx_half.as_ref().map(|h| rx_telemetry(&h.runner)),
                 ptp_offset_ns: *ptp_offset.borrow(),
                 uptime_s: started.elapsed().as_secs(),
+                capture_volume: None,
+                playback_volume: None,
             });
         }
     }
@@ -1958,6 +1963,8 @@ pub(crate) fn initial_telemetry(roles: &[Role]) -> Telemetry {
         }),
         ptp_offset_ns: i64::MAX,
         uptime_s: 0,
+        capture_volume: None,
+        playback_volume: None,
     }
 }
 

@@ -69,6 +69,12 @@ pub mod proto {
         pub rx: Option<RoleRx>,
         pub ptp_offset_ns: i64,
         pub uptime_s: u64,
+        /// Кубическая громкость захвата, 0.0..=1.5. Старый агент поле не шлёт.
+        #[serde(default)]
+        pub capture_volume: Option<f64>,
+        /// Кубическая громкость воспроизведения, 0.0..=1.5. Старый агент поле не шлёт.
+        #[serde(default)]
+        pub playback_volume: Option<f64>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,6 +250,11 @@ pub mod proto {
         SetCaptureTarget { device_key: Option<String> },
         /// Куда играет rx. Пустой вектор — запасной sink; непустой — играть только в эти узлы.
         SetPlaybackTarget { device_keys: Vec<String> },
+        /// Кубическая громкость PipeWire. None — эту сторону не менять.
+        SetVolume {
+            capture: Option<f64>,
+            playback: Option<f64>,
+        },
         /// Зоны, чей монитор не подмешивается: id в множестве → source зоны None.
         SetMutedZones { zones: Vec<String> },
         ApplyUpdate {
@@ -372,6 +383,8 @@ mod tests {
             rx: None,
             ptp_offset_ns: -15_000,
             uptime_s: 61,
+            capture_volume: None,
+            playback_volume: None,
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"rx\":null"), "отсутствующая роль — null: {s}");
@@ -386,6 +399,8 @@ mod tests {
             rx: Some(RoleRx { state: PipelineState::Playing, dropped: 0, rendered: 12345, queue_ms: 5 }),
             ptp_offset_ns: 100,
             uptime_s: 7,
+            capture_volume: None,
+            playback_volume: None,
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"queue_ms\":5"), "поля rx на месте: {s}");
@@ -613,5 +628,35 @@ mod tests {
         assert!(setup.is_empty());
         assert_eq!(soloist, SoloistState::Unknown);
         assert_eq!(soloist_command, "");
+    }
+
+    #[test]
+    fn telemetry_without_volumes_defaults_to_none() {
+        let raw = r#"{"type":"Telemetry","tx":null,"rx":null,"ptp_offset_ns":0,"uptime_s":1}"#;
+        let AgentMsg::Telemetry(t) = serde_json::from_str(raw).unwrap() else {
+            panic!("не телеметрия");
+        };
+        assert_eq!(t.capture_volume, None);
+        assert_eq!(t.playback_volume, None);
+    }
+
+    #[test]
+    fn volume_message_roundtrip() {
+        let m = AgentMsg::Telemetry(Telemetry {
+            tx: None,
+            rx: None,
+            ptp_offset_ns: 0,
+            uptime_s: 1,
+            capture_volume: Some(1.0),
+            playback_volume: Some(0.4),
+        });
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"capture_volume\":1.0"), "{s}");
+        assert!(s.contains("\"playback_volume\":0.4"), "{s}");
+        assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
+
+        let set = CtlMsg::SetVolume { capture: Some(0.8), playback: None };
+        let wire = serde_json::to_string(&set).unwrap();
+        assert_eq!(serde_json::from_str::<CtlMsg>(&wire).unwrap(), set);
     }
 }

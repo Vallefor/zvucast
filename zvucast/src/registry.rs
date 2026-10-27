@@ -541,6 +541,8 @@ mod tests {
             rx: Some(RoleRx { state: PipelineState::Playing, dropped: 0, rendered: 42, queue_ms: 5 }),
             ptp_offset_ns: 100,
             uptime_s: 7,
+            capture_volume: None,
+            playback_volume: None,
         }
     }
 

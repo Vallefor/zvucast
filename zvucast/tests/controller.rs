@@ -241,6 +241,8 @@ impl MockAgent {
             rx: Some(RoleRx { state: PipelineState::Playing, dropped: 0, rendered: 10, queue_ms: 5 }),
             ptp_offset_ns: 0,
             uptime_s: 3,
+            capture_volume: None,
+            playback_volume: None,
         });
         self.ws
             .send(Message::Text(serde_json::to_string(&t).unwrap()))
@@ -254,6 +256,8 @@ impl MockAgent {
             rx: None,
             ptp_offset_ns: 0,
             uptime_s: 3,
+            capture_volume: None,
+            playback_volume: None,
         });
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }

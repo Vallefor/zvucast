@@ -38,6 +38,8 @@ fn stopped_telemetry() -> Telemetry {
         }),
         ptp_offset_ns: 0,
         uptime_s: 0,
+        capture_volume: None,
+        playback_volume: None,
     }
 }
 
