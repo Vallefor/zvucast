@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
-import { addableDevices, chanWord, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, transport } from '../nodesView'
+import { addableDevices, chanWord, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent } from '../nodesView'
 import { offer, updateWait } from '../update'
 import { Badge, Button, useRun, useUi } from '../ui'
 
@@ -345,6 +345,12 @@ function NodeSettings({
   const [spotifyOn, setSpotifyOn] = useState(node.spotify ?? false)
   const [sendspinOn, setSendspinOn] = useState(node.sendspin ?? false)
   const [soloistKey, setSoloistKey] = useState(node.soloist_key ?? '')
+  const [captureDraft, setCaptureDraft] = useState<number | null>(null)
+  const [playbackDraft, setPlaybackDraft] = useState<number | null>(null)
+  const captureShown = showVolumeSlider(isTx, node.telemetry?.capture_volume)
+  const playbackShown = showVolumeSlider(isRx, node.telemetry?.playback_volume)
+  const capturePct = captureDraft ?? (typeof node.telemetry?.capture_volume === 'number' ? volumePercent(node.telemetry.capture_volume) : 0)
+  const playbackPct = playbackDraft ?? (typeof node.telemetry?.playback_volume === 'number' ? volumePercent(node.telemetry.playback_volume) : 0)
 
   const patchRow = (id: string, next: Partial<InputView>) => {
     setRows((list) => list.map((row) => (row.id === id ? { ...row, ...next } : row)))
@@ -363,6 +369,8 @@ function NodeSettings({
       soloist_key?: string
       spotify?: boolean
       sendspin?: boolean
+      capture_volume?: number
+      playback_volume?: number
     } = { display_name: name.trim() || null }
     if (isTx) {
       const n = Number(dscp)
@@ -382,6 +390,8 @@ function NodeSettings({
     if (isRx) {
       body.outputs = outRows.map((row) => ({ id: row.id, name: row.name.trim(), enabled: row.enabled }))
     }
+    if (captureShown) body.capture_volume = volumeFromPercent(capturePct)
+    if (playbackShown) body.playback_volume = volumeFromPercent(playbackPct)
     void run(api.patchNode(node.node_id, body), 'настройки узла').then((ok) => {
       if (ok) onClose()
     })
@@ -492,6 +502,41 @@ function NodeSettings({
           </section>
         )}
       </div>
+      {(captureShown || playbackShown) && (
+        <section className="node-group node-volume-group" aria-label="Громкость">
+          <h2>Громкость</h2>
+          {captureShown && (
+            <label className="node-volume">
+              <span>Захват</span>
+              <input
+                type="range"
+                min={0}
+                max={150}
+                step={1}
+                aria-label="Громкость захвата"
+                value={capturePct}
+                onChange={(e) => setCaptureDraft(Number(e.target.value))}
+              />
+              <b className="num">{capturePct}%</b>
+            </label>
+          )}
+          {playbackShown && (
+            <label className="node-volume">
+              <span>Воспроизведение</span>
+              <input
+                type="range"
+                min={0}
+                max={150}
+                step={1}
+                aria-label="Громкость воспроизведения"
+                value={playbackPct}
+                onChange={(e) => setPlaybackDraft(Number(e.target.value))}
+              />
+              <b className="num">{playbackPct}%</b>
+            </label>
+          )}
+        </section>
+      )}
       {(isTx || isRx) && (
         <div className="node-flow node-flow-edit">
           {isTx && (

@@ -810,6 +810,20 @@ table.data tr:last-child td { border-bottom: 0; }
 
 .node-dscp .field { width: 5.5rem; }
 
+.node-volume-group { margin-top: 0.85rem; }
+
+.node-volume {
+  display: grid;
+  grid-template-columns: 9.5rem 1fr 3.25rem;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.25rem;
+  color: var(--text-dim);
+}
+
+.node-volume input[type="range"] { width: 100%; accent-color: var(--accent); }
+.node-volume b { text-align: right; font-weight: 500; color: var(--text); }
+
 .node-group .seg { margin-top: 0.5rem; }
 
 .node-check {

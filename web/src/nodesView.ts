@@ -81,3 +81,21 @@ export function addableDevices(rows: InputView[]): { key: string; name: string }
 export function enableDevice(rows: InputView[], key: string): InputView[] {
   return rows.map((row) => (row.device_key === key ? { ...row, enabled: true } : row))
 }
+
+/// Проценты кубической громкости, уже зажатые в 0..150.
+export function volumePercent(cubic: number): number {
+  const pct = Math.round(cubic * 100)
+  if (pct < 0) return 0
+  if (pct > 150) return 150
+  return pct
+}
+
+/// Целое 0..150 обратно в кубическую шкалу 0..1.5.
+export function volumeFromPercent(percent: number): number {
+  return volumePercent(percent / 100) / 100
+}
+
+/// Ползунок есть только у роли, которая уже прислала конечное число.
+export function showVolumeSlider(role: boolean, volume: number | null | undefined): boolean {
+  return role && typeof volume === 'number' && Number.isFinite(volume)
+}

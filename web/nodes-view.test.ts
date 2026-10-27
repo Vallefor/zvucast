@@ -10,7 +10,10 @@ import {
   isPlaying,
   showStartAll,
   showStopAll,
+  showVolumeSlider,
   transport,
+  volumeFromPercent,
+  volumePercent,
 } from './src/nodesView.ts'
 
 function chan(part: Partial<InputView> & Pick<InputView, 'id' | 'device_key' | 'device_name'>): InputView {
@@ -82,6 +85,19 @@ test('схема и добавление режут устройства по в
   assert.equal(enabled.find((r) => r.id === 'l1')?.enabled, false)
   assert.deepEqual(addableDevices(enabled), [])
   assert.equal(flowDevices(enabled).find((d) => d.key === 'hdmi')?.count, 2)
+})
+
+test('громкость в процентах кубической шкалы', () => {
+  assert.equal(volumePercent(0.4), 40)
+  assert.equal(volumePercent(1), 100)
+  assert.equal(volumePercent(1.5), 150)
+  assert.equal(volumePercent(2), 150)
+  assert.equal(volumeFromPercent(80), 0.8)
+  assert.equal(showVolumeSlider(true, 0.4), true)
+  assert.equal(showVolumeSlider(true, 0), true)
+  assert.equal(showVolumeSlider(false, 0.4), false)
+  assert.equal(showVolumeSlider(true, null), false)
+  assert.equal(showVolumeSlider(true, undefined), false)
 })
 
 test('имя устройства берётся из первой строки ключа', () => {

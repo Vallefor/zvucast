@@ -26,6 +26,8 @@ export interface Telemetry {
   rx: RoleRx | null
   ptp_offset_ns: number
   uptime_s: number
+  capture_volume?: number | null
+  playback_volume?: number | null
 }
 
 export interface InputView {
@@ -115,6 +117,8 @@ export const api = {
     soloist_key?: string
     spotify?: boolean
     sendspin?: boolean
+    capture_volume?: number
+    playback_volume?: number
   }) =>
     fetch(`/api/nodes/${id}`, {
       method: 'PATCH',
