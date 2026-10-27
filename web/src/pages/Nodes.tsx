@@ -169,6 +169,7 @@ const SETUP_TITLE: Record<string, string> = {
   pipewire: 'Служба PipeWire не запущена',
   wireplumber: 'WirePlumber не запущен',
   'pipewire-pulse': 'PipeWire Pulse не запущен',
+  'pw-cat': 'Нет pw-record или pw-play',
   gstreamer: 'Нет плагинов GStreamer',
   linger: 'После перезагрузки PipeWire не поднимется',
   'pipewire-socket': 'Нет сокета PipeWire',

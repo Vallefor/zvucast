@@ -9,6 +9,8 @@ const OS_RELEASE: &str = "/etc/os-release";
 const AGENT_UNIT: &str = "/etc/systemd/system/zvucast-agent.service";
 const LIMITS: &str = "/etc/security/limits.conf";
 const SOLOIST_BIN: &str = "/usr/local/bin/soloist";
+const PW_RECORD: &str = "/usr/bin/pw-record";
+const PW_PLAY: &str = "/usr/bin/pw-play";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
@@ -224,8 +226,8 @@ pub fn pipewire_command(family: Family, user: &str, uid: u32) -> String {
 
 pub fn gstreamer_command(family: Family) -> String {
     match family {
-        Family::Apt => "sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-alsa gstreamer1.0-pipewire".to_string(),
-        Family::Pacman => "sudo pacman -S --needed --noconfirm gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-pipewire".to_string(),
+        Family::Apt => "sudo apt-get install -y gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad".to_string(),
+        Family::Pacman => "sudo pacman -S --needed --noconfirm gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad".to_string(),
         Family::Other => PKG_UNSUPPORTED.to_string(),
     }
 }
@@ -291,8 +293,9 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
         let pipewire = scope.spawn(|| user_service(host, uid, "pipewire"));
         let wireplumber = scope.spawn(|| user_service(host, uid, "wireplumber"));
         let pulse = scope.spawn(|| user_service(host, uid, "pipewire-pulse"));
-        let gst_pw = scope.spawn(|| host.run(2, "gst-inspect-1.0", &owned(&["pipewiresrc"])));
-        let gst_alsa = scope.spawn(|| host.run(2, "gst-inspect-1.0", &owned(&["alsasrc"])));
+        let pw_record = scope.spawn(|| host.executable(PW_RECORD));
+        let pw_play = scope.spawn(|| host.executable(PW_PLAY));
+        let appsrc = scope.spawn(|| host.run(2, "gst-inspect-1.0", &owned(&["appsrc"])));
         let linger = scope.spawn(|| {
             host.run(
                 2,
@@ -337,8 +340,8 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
             pipewire: pipewire.join().expect("pipewire"),
             wireplumber: wireplumber.join().expect("wireplumber"),
             pulse: pulse.join().expect("pipewire-pulse"),
-            gst_pw: gst_pw.join().expect("pipewiresrc"),
-            gst_alsa: gst_alsa.join().expect("alsasrc"),
+            pw_tools: pw_record.join().expect("pw-record") && pw_play.join().expect("pw-play"),
+            appsrc: appsrc.join().expect("appsrc"),
             linger: linger.join().expect("linger"),
             socket: socket.join().expect("socket"),
             limits: limits.join().expect("limits"),
@@ -364,7 +367,10 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
     if !is_running(&probed.pulse) {
         setup.push(issue("pipewire-pulse", packages.clone()));
     }
-    if probed.gst_pw.code != Some(0) || probed.gst_alsa.code != Some(0) {
+    if !probed.pw_tools {
+        setup.push(issue("pw-cat", packages.clone()));
+    }
+    if probed.appsrc.code != Some(0) {
         setup.push(issue("gstreamer", gstreamer_command(family)));
     }
     if !probed.linger.stdout.contains("Linger=yes") {
@@ -414,8 +420,8 @@ struct Probes {
     pipewire: Cmd,
     wireplumber: Cmd,
     pulse: Cmd,
-    gst_pw: Cmd,
-    gst_alsa: Cmd,
+    pw_tools: bool,
+    appsrc: Cmd,
     linger: Cmd,
     socket: bool,
     limits: String,
@@ -621,16 +627,16 @@ mod tests {
                 },
             );
         }
-        for plugin in ["pipewiresrc", "alsasrc"] {
-            host.answer(
-                "gst-inspect-1.0",
-                &[plugin],
-                Cmd {
-                    code: Some(0),
-                    stdout: String::new(),
-                },
-            );
-        }
+        host.make_exec(PW_RECORD);
+        host.make_exec(PW_PLAY);
+        host.answer(
+            "gst-inspect-1.0",
+            &["appsrc"],
+            Cmd {
+                code: Some(0),
+                stdout: String::new(),
+            },
+        );
         host.answer(
             "loginctl",
             &["show-user", "1000", "-p", "Linger"],
@@ -844,11 +850,38 @@ mod tests {
     }
 
     #[test]
+    fn alsa_and_pipewiresrc_are_not_required() {
+        let host = healthy_debian();
+        let snap = inspect(&host);
+        let starts = host.starts.lock().expect("starts");
+        assert!(!starts.iter().any(|(name, args, _)| {
+            name == "gst-inspect-1.0"
+                && matches!(
+                    args.first().map(String::as_str),
+                    Some("alsasrc" | "pipewiresrc")
+                )
+        }));
+        assert!(!snap.setup.iter().any(|issue| issue.id == "gstreamer"));
+    }
+
+    #[test]
+    fn missing_pw_tool_uses_the_pipewire_command() {
+        let mut host = healthy_debian();
+        host.unset_exec(PW_RECORD);
+        let snap = inspect(&host);
+        let issue = snap.setup.iter().find(|i| i.id == "pw-cat").unwrap();
+        assert_eq!(issue.command, pipewire_command(Family::Apt, "audio", 1000));
+        host.make_exec(PW_RECORD);
+        host.unset_exec(PW_PLAY);
+        assert!(inspect(&host).setup.iter().any(|i| i.id == "pw-cat"));
+    }
+
+    #[test]
     fn gstreamer_and_linger_commands_match_the_spec() {
         let mut host = healthy_debian();
         host.answer(
             "gst-inspect-1.0",
-            &["alsasrc"],
+            &["appsrc"],
             Cmd {
                 code: Some(1),
                 stdout: String::new(),
@@ -871,6 +904,20 @@ mod tests {
                 .command,
             gstreamer_command(Family::Apt)
         );
+        assert!(!snap
+            .setup
+            .iter()
+            .find(|i| i.id == "gstreamer")
+            .unwrap()
+            .command
+            .contains("alsa"));
+        assert!(!snap
+            .setup
+            .iter()
+            .find(|i| i.id == "gstreamer")
+            .unwrap()
+            .command
+            .contains("pipewire"));
         assert_eq!(
             snap.setup
                 .iter()
