@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
 import { addableDevices, chanWord, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, transport } from '../nodesView'
 import { offer, updateWait } from '../update'
-import { Badge, Button, Popup, useRun, useUi } from '../ui'
+import { Badge, Button, useRun, useUi } from '../ui'
 
 const POLL_MS = 2000
 /// Свой POST: «не вернулся», если за это время узел так и остался offline.
@@ -97,26 +97,32 @@ function NodeFlags({ node }: { node: NodeView }) {
   return (
     <>
       {node.virtual_output && (
-        <svg className="node-flag node-flag-virtual" width="18" height="18" viewBox="0 0 18 18" role="img" aria-label="Виртуальная колонка">
-          <path fill="currentColor" d="M2.6 6.5h2.5L8.6 3.5v11L5.1 11.5H2.6V6.5z" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M10.7 7a2.6 2.6 0 0 1 0 4" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M12.4 5.3a4.9 4.9 0 0 1 0 7.4" />
-        </svg>
+        <span className="node-flag node-flag-virtual" role="img" aria-label="Виртуальная колонка">
+          <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+            <path fill="currentColor" d="M2.6 6.5h2.5L8.6 3.5v11L5.1 11.5H2.6V6.5z" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M10.7 7a2.6 2.6 0 0 1 0 4" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M12.4 5.3a4.9 4.9 0 0 1 0 7.4" />
+          </svg>
+        </span>
       )}
       {node.spotify && (
-        <svg className="node-flag node-flag-spotify" width="18" height="18" viewBox="0 0 18 18" role="img" aria-label="Spotify">
-          <ellipse cx="6.5" cy="13.1" rx="2.5" ry="1.75" transform="rotate(-28 6.5 13.1)" fill="currentColor" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.5 12.2V3.6" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.5 3.8c2.5.55 4.3 1.45 4.3 1.45" />
-        </svg>
+        <span className="node-flag node-flag-spotify" role="img" aria-label="Spotify">
+          <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+            <ellipse cx="6.5" cy="13.1" rx="2.5" ry="1.75" transform="rotate(-28 6.5 13.1)" fill="currentColor" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.5 12.2V3.6" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.5 3.8c2.5.55 4.3 1.45 4.3 1.45" />
+          </svg>
+        </span>
       )}
       {node.sendspin && (
-        <svg className="node-flag node-flag-sendspin" width="18" height="18" viewBox="0 0 18 18" role="img" aria-label="Sendspin">
-          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M9.1 3.2a5.1 5.1 0 0 1 4.3 2.5" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M13.5 2.8v3.1h-3.1" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.9 14.8a5.1 5.1 0 0 1-4.3-2.5" />
-          <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M4.5 15.2V12.1h3.1" />
-        </svg>
+        <span className="node-flag node-flag-sendspin" role="img" aria-label="Sendspin">
+          <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+            <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M9.1 3.2a5.1 5.1 0 0 1 4.3 2.5" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M13.5 2.8v3.1h-3.1" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" d="M8.9 14.8a5.1 5.1 0 0 1-4.3-2.5" />
+            <path fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" d="M4.5 15.2V12.1h3.1" />
+          </svg>
+        </span>
       )}
     </>
   )
@@ -134,12 +140,18 @@ function FlowSide({
   return (
     <div className={`node-flow-side node-flow-${kind}`}>
       <div className="node-flow-label">{label}</div>
-      {devices.map((device) => (
-        <div key={device.key} className="flow-chip">
-          <span className="flow-chip-name" title={device.name}>{device.name}</span>
-          <span className="flow-count" aria-label={`${device.count} ${chanWord(device.count)}`}>{device.count}</span>
-        </div>
-      ))}
+      <div className="node-bus">
+        {devices.map((device) => (
+          <div key={device.key} className="flow-port">
+            {kind === 'out' && <span className="flow-stub" aria-hidden="true" />}
+            <div className="flow-chip">
+              <span className="flow-chip-name" title={device.name}>{device.name}</span>
+              <span className="flow-count" aria-label={`${device.count} ${chanWord(device.count)}`}>{device.count}</span>
+            </div>
+            {kind === 'in' && <span className="flow-stub" aria-hidden="true" />}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -227,7 +239,6 @@ function setupBlock(nodes: NodeView[]) {
 function ChanEditor({
   kind,
   title,
-  hint,
   empty,
   rows,
   onPatch,
@@ -235,12 +246,12 @@ function ChanEditor({
 }: {
   kind: 'in' | 'out'
   title: string
-  hint: string
   empty: string
   rows: InputView[]
   onPatch: (id: string, next: Partial<InputView>) => void
   onEnable: (key: string) => void
 }) {
+  const [adding, setAdding] = useState(false)
   const shown = useMemo(
     () => groupDevices(rows).filter((group) => group.rows.some((row) => row.enabled)),
     [rows],
@@ -249,44 +260,63 @@ function ChanEditor({
   return (
     <div className={`node-flow-side node-flow-${kind}`}>
       <div className="node-flow-label">{title}</div>
-      <p className="hint">{hint}</p>
       {rows.length === 0 && <p className="lede">{empty}</p>}
-      {shown.map((group) => (
-        <div key={group.key} className="node-device">
-          <h3 className="device-name">{group.name}</h3>
-          {group.rows.map((row) => (
-            <div key={row.id} className="chan-row">
-              <input
-                type="checkbox"
-                checked={row.enabled}
-                aria-label={`Использовать ${group.name} ${row.index + 1}`}
-                onChange={(e) => onPatch(row.id, { enabled: e.target.checked })}
-              />
-              <input
-                className="field"
-                aria-label={`Имя канала ${group.name} ${row.index + 1}`}
-                value={row.name}
-                onChange={(e) => onPatch(row.id, { name: e.target.value })}
-              />
+      <div className="node-bus">
+        {shown.map((group) => (
+          <div key={group.key} className="flow-port">
+            {kind === 'out' && <span className="flow-stub" aria-hidden="true" />}
+            <div className="chan-pick">
+              <span className="chan-pick-name" title={group.name}>{group.name}</span>
+              {group.rows.map((row) => (
+                <div key={row.id} className="chan-row">
+                  <input
+                    type="checkbox"
+                    checked={row.enabled}
+                    aria-label={`Использовать ${group.name} ${row.index + 1}`}
+                    onChange={(e) => onPatch(row.id, { enabled: e.target.checked })}
+                  />
+                  <input
+                    className="field"
+                    aria-label={`Имя канала ${group.name} ${row.index + 1}`}
+                    value={row.name}
+                    onChange={(e) => onPatch(row.id, { name: e.target.value })}
+                  />
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-      ))}
+            {kind === 'in' && <span className="flow-stub" aria-hidden="true" />}
+          </div>
+        ))}
+      </div>
       {addable.length > 0 && (
-        <div className="node-add">
-          <div className="node-flow-label">Добавить</div>
-          {addable.map((device) => (
-            <Button
-              key={device.key}
-              type="button"
-              className="node-add-btn"
-              title={device.name}
-              onClick={() => onEnable(device.key)}
-            >
-              <span className="flow-chip-name">{device.name}</span>
-            </Button>
-          ))}
-        </div>
+        <>
+          <button
+            type="button"
+            className="node-add-open"
+            aria-expanded={adding}
+            onClick={() => setAdding((open) => !open)}
+          >
+            Добавить
+          </button>
+          {adding && (
+            <div className="node-adder">
+              {addable.map((device) => (
+                <button
+                  key={device.key}
+                  type="button"
+                  className="node-choice"
+                  title={device.name}
+                  onClick={() => {
+                    onEnable(device.key)
+                    setAdding(false)
+                  }}
+                >
+                  {device.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   )
@@ -357,142 +387,157 @@ function NodeSettings({
     })
   }
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const state = presenceWord(node)
+  const features = isTx && node.supports_virtual_output
+
   return (
-    <Popup
-      title="Настройки узла"
-      wide
-      onClose={onClose}
-      footer={(
-        <div className="row">
-          <Button onClick={onClose}>Отмена</Button>
-          <Button variant="primary" onClick={save}>Сохранить</Button>
-        </div>
-      )}
-    >
-      <div className="stack">
-        <label className="inline">
-          Имя
-          <input className="field" aria-label="Имя узла" value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
-        <section>
-          <h3 className="device-name">Сеть</h3>
-          <div className="stack">
-            <div className="node-net">
-              <span className="num">{node.ip || '—'}</span>
-              <span className="node-net-link">{linkLabel(node.link)}</span>
-            </div>
-            {isTx && (
-              <>
-                <label className="inline">
-                  DSCP
-                  <input
-                    className="field"
-                    type="number"
-                    min={0}
-                    max={63}
-                    aria-label="DSCP"
-                    value={dscp}
-                    onChange={(e) => setDscp(e.target.value)}
-                  />
-                </label>
-                <div className="seg" role="group" aria-label="Пресеты DSCP">
-                  {DSCP_PRESETS.map((p) => (
-                    <button
-                      key={p.label}
-                      type="button"
-                      aria-pressed={Number(dscp) === p.value}
-                      onClick={() => setDscp(String(p.value))}
-                    >
-                      {p.label}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-            {master ? (
-              <p className="hint">Этот узел ведёт панель</p>
-            ) : (
-              <Button type="button" disabled={!node.online} onClick={transfer}>Сделать мастером</Button>
-            )}
-          </div>
+    <article className="node-sheet">
+      <button type="button" className="node-back" onClick={onClose}>К узлам</button>
+      <label className="node-name">
+        Имя
+        <input className="field" aria-label="Имя узла" value={name} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <p className="hint">Системное имя {node.name}</p>
+      <div className={`node-groups${features ? '' : ' is-single'}`}>
+        <section className="node-group" aria-label="Сеть">
+          <h2>Сеть</h2>
+          <div className="node-fact"><span>IP</span><b className="num">{node.ip || '—'}</b></div>
+          <div className="node-fact"><span>Связь</span><b>{linkLabel(node.link)}</b></div>
+          {isTx && (
+            <>
+              <label className="node-dscp">
+                <span>DSCP</span>
+                <input
+                  className="field"
+                  type="number"
+                  min={0}
+                  max={63}
+                  aria-label="DSCP"
+                  value={dscp}
+                  onChange={(e) => setDscp(e.target.value)}
+                />
+              </label>
+              <div className="seg" role="group" aria-label="Пресеты DSCP">
+                {DSCP_PRESETS.map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    aria-pressed={Number(dscp) === p.value}
+                    onClick={() => setDscp(String(p.value))}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+          {master ? (
+            <p className="hint">Этот узел ведёт панель</p>
+          ) : (
+            <Button type="button" className="node-master" disabled={!node.online} onClick={transfer}>Сделать мастером</Button>
+          )}
         </section>
-        {isTx && node.supports_virtual_output && (
-          <section>
-            <h3 className="device-name">На узле</h3>
-            <div className="stack">
-              <label className="inline">
+        {features && (
+          <section className="node-group" aria-label="На узле">
+            <h2>На узле</h2>
+            <label className="node-check">
+              <input
+                type="checkbox"
+                aria-label="Создать виртуальный звуковой выход"
+                checked={virtualOn}
+                onChange={(e) => setVirtualOn(e.target.checked)}
+              />
+              Виртуальная колонка
+            </label>
+            <label className="node-check">
+              <input
+                type="checkbox"
+                aria-label="Включить Spotify"
+                checked={spotifyOn}
+                onChange={(e) => setSpotifyOn(e.target.checked)}
+              />
+              Spotify
+            </label>
+            {spotifyOn && (
+              <label className="node-name">
+                Ключ Spotify
                 <input
-                  type="checkbox"
-                  aria-label="Создать виртуальный звуковой выход"
-                  checked={virtualOn}
-                  onChange={(e) => setVirtualOn(e.target.checked)}
+                  className="field"
+                  type="password"
+                  autoComplete="off"
+                  aria-label="Ключ Spotify"
+                  value={soloistKey}
+                  onChange={(e) => setSoloistKey(e.target.value)}
                 />
-                Создать виртуальный звуковой выход
               </label>
-              <label className="inline">
-                <input
-                  type="checkbox"
-                  aria-label="Включить Spotify"
-                  checked={spotifyOn}
-                  onChange={(e) => setSpotifyOn(e.target.checked)}
-                />
-                Включить Spotify
-              </label>
-              {spotifyOn && (
-                <label className="inline">
-                  Ключ Spotify
-                  <input
-                    className="field"
-                    type="password"
-                    autoComplete="off"
-                    aria-label="Ключ Spotify"
-                    value={soloistKey}
-                    onChange={(e) => setSoloistKey(e.target.value)}
-                  />
-                </label>
-              )}
-              <p className="hint">Приёмник Spotify поднимается только на этом передатчике, когда Spotify включён и ключ задан.</p>
-              <label className="inline">
-                <input
-                  type="checkbox"
-                  aria-label="Включить Sendspin"
-                  checked={sendspinOn}
-                  onChange={(e) => setSendspinOn(e.target.checked)}
-                />
-                Включить Sendspin
-              </label>
-              <p className="hint">Колонки Sendspin поднимаются на зоны этого передатчика, только когда Sendspin включён.</p>
-            </div>
+            )}
+            <label className="node-check">
+              <input
+                type="checkbox"
+                aria-label="Включить Sendspin"
+                checked={sendspinOn}
+                onChange={(e) => setSendspinOn(e.target.checked)}
+              />
+              Sendspin
+            </label>
+            <p className="hint">Spotify и Sendspin поднимаются на этом передатчике, только пока включены. Ключ нужен для Spotify.</p>
           </section>
         )}
-        {(isTx || isRx) && (
-          <div className="node-flow">
-            {isTx && (
-              <ChanEditor
-                kind="in"
-                title="Входы"
-                hint="Отмеченные каналы входят в стереопоток. Виртуальный выход — такой же вход: он подмешивается в зону и раскладывается по выходам колонки в карте зоны."
-                empty="Агент ещё не прислал устройства захвата."
-                rows={rows}
-                onPatch={patchRow}
-                onEnable={(key) => setRows((list) => enableDevice(list, key))}
-              />
-            )}
-            {isRx && (
-              <ChanEditor
-                kind="out"
-                title="Выходы"
-                hint="Отмеченные каналы — выходы колонки в карте зоны. Звук играет на устройство этих каналов."
-                empty="Агент ещё не прислал устройства воспроизведения."
-                rows={outRows}
-                onPatch={patchOut}
-                onEnable={(key) => setOutRows((list) => enableDevice(list, key))}
-              />
-            )}
-          </div>
-        )}
       </div>
-    </Popup>
+      {(isTx || isRx) && (
+        <div className="node-flow node-flow-edit">
+          {isTx && (
+            <ChanEditor
+              kind="in"
+              title="Входы"
+              empty="Агент ещё не прислал устройства захвата."
+              rows={rows}
+              onPatch={patchRow}
+              onEnable={(key) => setRows((list) => enableDevice(list, key))}
+            />
+          )}
+          <div className={`node-board-wrap${node.online ? ' is-on' : ''}`}>
+            <NodeBoard />
+            <div className="node-sheet-ident">
+              <div className="node-card-title">
+                <span>{name.trim() || node.name}</span>
+                {rolesOf(node)}
+                {master && <Badge tone="master">Мастер</Badge>}
+              </div>
+              <p className={`node-state is-${state.tone}`}>{state.text}</p>
+            </div>
+          </div>
+          {isRx && (
+            <ChanEditor
+              kind="out"
+              title="Выходы"
+              empty="Агент ещё не прислал устройства воспроизведения."
+              rows={outRows}
+              onPatch={patchOut}
+              onEnable={(key) => setOutRows((list) => enableDevice(list, key))}
+            />
+          )}
+        </div>
+      )}
+      {isTx && (
+        <p className="hint">Отмеченные каналы входят в стереопоток. Виртуальный выход — такой же вход: он подмешивается в зону и раскладывается по выходам колонки в карте зоны.</p>
+      )}
+      {isRx && (
+        <p className="hint">Отмеченные каналы — выходы колонки в карте зоны. Звук играет на устройство этих каналов.</p>
+      )}
+      <div className="node-sheet-foot">
+        <Button onClick={onClose}>Отмена</Button>
+        <Button variant="primary" onClick={save}>Сохранить</Button>
+      </div>
+    </article>
   )
 }
 
@@ -730,7 +775,17 @@ export default function Nodes() {
 
       {setupBlock(nodes)}
 
-      <div className="node-cards">
+      {settingsNode && (
+        <NodeSettings
+          key={settingsNode.node_id}
+          node={settingsNode}
+          master={masterNodeId === settingsNode.node_id}
+          transfer={() => void transfer(settingsNode)}
+          onClose={() => setSettingsId(null)}
+        />
+      )}
+
+      {!settingsNode && <div className="node-cards">
         {nodes.map((n) => {
           const inputs = n.roles.includes('tx') ? flowDevices(n.inputs ?? []) : []
           const outputs = n.roles.includes('rx') ? flowDevices(n.outputs ?? []) : []
@@ -758,6 +813,11 @@ export default function Nodes() {
                 </div>
                 {outputs.length > 0 && <FlowSide kind="out" label="Выходы" devices={outputs} />}
               </div>
+              {flagged && (
+                <div className="node-flags">
+                  <NodeFlags node={n} />
+                </div>
+              )}
               <footer className="node-card-foot">
                 {meters.length > 0 && (
                   <div className="node-meters">
@@ -772,11 +832,6 @@ export default function Nodes() {
                 <div className="node-card-bar">
                   <div className="node-card-meta">
                     {versionCell(n)}
-                    {flagged && (
-                      <span className="node-flags">
-                        <NodeFlags node={n} />
-                      </span>
-                    )}
                   </div>
                   <div className="card-actions">{actions(n)}</div>
                 </div>
@@ -784,16 +839,7 @@ export default function Nodes() {
             </article>
           )
         })}
-      </div>
-      {settingsNode && (
-        <NodeSettings
-          key={settingsNode.node_id}
-          node={settingsNode}
-          master={masterNodeId === settingsNode.node_id}
-          transfer={() => void transfer(settingsNode)}
-          onClose={() => setSettingsId(null)}
-        />
-      )}
+      </div>}
     </main>
   )
 }
