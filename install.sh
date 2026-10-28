@@ -201,8 +201,41 @@ ask() {
   done
 }
 
+# Пусто, 0 и 1 — пункт меню «никакого». 2 и pcm5102 — плата.
+resolve_dac() {
+  case "$1" in
+    ''|0|1|none|NONE|None)
+      printf 'none\n'
+      ;;
+    2|pcm5102|PCM5102)
+      printf 'pcm5102\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ask_playback() {
+  local reply
+  while true; do
+    printf '%s\n' \
+      'Какой модуль для воспроизведения звука подключен?' \
+      '  1. Никакого' \
+      '  2. Плата PCM5102' >/dev/tty
+    if ! read -r -p '[1] ' reply </dev/tty; then
+      printf '%s\n' ZVUCAST_SPOTIFY ZVUCAST_CONTROLLER ZVUCAST_DAC >&2
+      exit 2
+    fi
+    if dac=$(resolve_dac "$reply"); then
+      return 0
+    fi
+    printf '%s\n' 'ответь 1 или 2' >/dev/tty
+  done
+}
+
 print_plan() {
-  local ctrl solo
+  local ctrl solo board
   if [[ "$controller" == 1 ]]; then
     ctrl=да
   else
@@ -213,17 +246,34 @@ print_plan() {
   else
     solo=нет
   fi
+  if [[ "$dac" == pcm5102 ]]; then
+    board='плата PCM5102'
+  else
+    board=никакого
+  fi
   printf '%s\n' \
     'Будет установлено:' \
     "семейство пакетов: ${family}" \
     'PipeWire, WirePlumber, бинарник zvucast, агент' \
+    "модуль воспроизведения: ${board}" \
     "контроллер: ${ctrl}" \
     "Soloist: ${solo}"
 }
 
+# ZVUCAST_DAC необязателен. Нет переменной — «никакого».
+# Без терминала по-прежнему обязательны только ZVUCAST_SPOTIFY и ZVUCAST_CONTROLLER.
 choose_options() {
   local solo_answer ctrl_answer confirm_answer
+  if [[ -n "${ZVUCAST_DAC+x}" ]]; then
+    if ! dac=$(resolve_dac "$ZVUCAST_DAC"); then
+      printf '%s\n' ZVUCAST_DAC >&2
+      exit 2
+    fi
+  fi
   if valid_bit "${ZVUCAST_SPOTIFY:-}" && valid_bit "${ZVUCAST_CONTROLLER:-}"; then
+    if [[ -z "${ZVUCAST_DAC+x}" ]]; then
+      dac=none
+    fi
     spotify=$ZVUCAST_SPOTIFY
     controller=$ZVUCAST_CONTROLLER
     print_plan
@@ -232,6 +282,9 @@ choose_options() {
   if ! tty_ok; then
     printf '%s\n' ZVUCAST_SPOTIFY ZVUCAST_CONTROLLER >&2
     exit 2
+  fi
+  if [[ -z "${ZVUCAST_DAC+x}" ]]; then
+    ask_playback
   fi
   ask solo_answer 'Ставить Soloist? [n]' n
   ask ctrl_answer 'Эта машина — контроллер? [n]' n
@@ -293,6 +346,7 @@ pick_iface() {
 
 install_packages() {
   if [[ "$family" == apt ]]; then
+    as_root apt-get update || exit 1
     as_root apt-get install -y \
       pipewire pipewire-bin pipewire-pulse wireplumber \
       gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
@@ -300,12 +354,105 @@ install_packages() {
       alsa-utils curl ca-certificates iw dbus-user-session rtkit python3 \
       || exit 1
   else
+    as_root pacman -Sy --noconfirm || exit 1
     as_root pacman -S --needed --noconfirm \
       pipewire pipewire-alsa pipewire-pulse wireplumber \
       gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
       gst-plugin-pipewire alsa-utils curl ca-certificates iw rtkit python \
       || exit 1
   fi
+}
+
+trim_line() {
+  local value=$1
+  value=${value%$'\r'}
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
+
+# Bookworm: /boot/firmware/config.txt. Старее — /boot/config.txt.
+boot_config_path() {
+  local fw boot firmware bootdir
+  fw=$(root_path /boot/firmware/config.txt)
+  boot=$(root_path /boot/config.txt)
+  firmware=$(root_path /boot/firmware)
+  bootdir=$(root_path /boot)
+  if [[ -f "$fw" || -L "$fw" ]]; then
+    printf '%s\n' "$fw"
+    return 0
+  fi
+  if [[ -f "$boot" || -L "$boot" ]]; then
+    printf '%s\n' "$boot"
+    return 0
+  fi
+  if [[ -d "$firmware" ]]; then
+    printf '%s\n' "$fw"
+    return 0
+  fi
+  if [[ -d "$bootdir" ]]; then
+    printf '%s\n' "$boot"
+    return 0
+  fi
+  return 1
+}
+
+configure_overlay() {
+  [[ "$dac" == pcm5102 ]] || return 0
+  local path src dest line trimmed need_i2s=1 need_dac=1 found_all=0 inserted=0
+  if ! path=$(boot_config_path); then
+    printf '%s\n' 'нет config.txt: оверлей PCM5102 некуда записать' >&2
+    exit 1
+  fi
+  src=$(new_tmp)/config.txt
+  if [[ -f "$path" ]]; then
+    cat "$path" > "$src"
+  else
+    : > "$src"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed=$(trim_line "$line")
+    case "$trimmed" in
+      'dtparam=i2s=on') need_i2s=0 ;;
+      'dtoverlay=hifiberry-dac') need_dac=0 ;;
+      '[all]') found_all=1 ;;
+    esac
+  done < "$src"
+  if [[ "$need_i2s" -eq 0 && "$need_dac" -eq 0 ]]; then
+    printf '%s\n' 'Оверлей hifiberry-dac уже в config.txt. ЦАП появится после перезагрузки.'
+    return 0
+  fi
+  dest=$(new_tmp)/config.new
+  : > "$dest"
+  if [[ "$found_all" -eq 1 ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line=${line%$'\r'}
+      printf '%s\n' "$line" >> "$dest"
+      trimmed=$(trim_line "$line")
+      if [[ "$inserted" -eq 0 && "$trimmed" == '[all]' ]]; then
+        if [[ "$need_i2s" -eq 1 ]]; then
+          printf '%s\n' 'dtparam=i2s=on' >> "$dest"
+        fi
+        if [[ "$need_dac" -eq 1 ]]; then
+          printf '%s\n' 'dtoverlay=hifiberry-dac' >> "$dest"
+        fi
+        inserted=1
+      fi
+    done < "$src"
+  else
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      printf '%s\n' "${line%$'\r'}" >> "$dest"
+    done < "$src"
+    printf '%s\n' '[all]' >> "$dest"
+    if [[ "$need_i2s" -eq 1 ]]; then
+      printf '%s\n' 'dtparam=i2s=on' >> "$dest"
+    fi
+    if [[ "$need_dac" -eq 1 ]]; then
+      printf '%s\n' 'dtoverlay=hifiberry-dac' >> "$dest"
+    fi
+  fi
+  write_file "$path" < "$dest"
+  printf '%s\n' 'Оверлей hifiberry-dac записан в config.txt. ЦАП появится после перезагрузки.'
 }
 
 install_drops() {
@@ -366,6 +513,9 @@ install_session() {
 
 install_wifi() {
   local conf unit line name type
+  # Юнит выключит power save на следующей загрузке. Сейчас wlan0 ещё в нём,
+  # и PTP с RTP на этом интерфейсе рвутся до рестарта.
+  as_root iw dev wlan0 set power_save off || true
   conf=$(root_path /etc/NetworkManager/conf.d/wifi-powersave-off.conf)
   write_file "$conf" <<'EOF'
 [connection]
@@ -649,6 +799,7 @@ main() {
   if [[ "$(id -u)" -ne 0 ]]; then
     sudo -v
   fi
+  configure_overlay
   install_packages
   install_drops
   install_limits

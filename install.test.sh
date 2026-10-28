@@ -172,7 +172,7 @@ run_install() {
   set +e
   (
     set -euo pipefail
-    unset ZVUCAST_SPOTIFY ZVUCAST_CONTROLLER ZVUCAST_TEST_NOTTY ZVUCAST_MODEL \
+    unset ZVUCAST_SPOTIFY ZVUCAST_CONTROLLER ZVUCAST_DAC ZVUCAST_TEST_NOTTY ZVUCAST_MODEL \
       ZVUCAST_UNAME ZVUCAST_OS_RELEASE ZVUCAST_ROOT ZVUCAST_USER ZVUCAST_UID
     while [[ $# -gt 0 ]]; do
       export "$1"
@@ -274,7 +274,14 @@ run_install 0 \
   ZVUCAST_CONTROLLER=0
 [[ "$(cat "$work/usr/local/bin/zvucast")" == "$(cat "$work/payload")" ]]
 grep -q pipewire "$work/apt.log"
+upd=$(awk '/^update$/{print NR; exit}' "$work/apt.log")
+inst=$(awk '/^install /{print NR; exit}' "$work/apt.log")
+[[ -n "$upd" && -n "$inst" && "$upd" -lt "$inst" ]]
 [[ ! -s "$work/pacman.log" ]]
+grep -q 'iw dev wlan0 set power_save off' "$work/sudo.log"
+[[ ! -e "$work/boot/firmware/config.txt" ]]
+[[ ! -e "$work/boot/config.txt" ]]
+grep -q 'модуль воспроизведения: никакого' "$work/main.out"
 grep -q disable "$work/systemctl.log"
 grep -q zvucast-controller "$work/systemctl.log"
 grep -q 'controller = "ws://127.0.0.1:8080/ws"' "$work/etc/zvucast.toml"
@@ -342,7 +349,11 @@ run_install 0 \
   ZVUCAST_USER=audio \
   ZVUCAST_UID=1000
 grep -q pipewire "$work/pacman.log"
+sy=$(awk '/^-Sy /{print NR; exit}' "$work/pacman.log")
+inst=$(awk '/^-S /{print NR; exit}' "$work/pacman.log")
+[[ -n "$sy" && -n "$inst" && "$sy" -lt "$inst" ]]
 [[ ! -s "$work/apt.log" ]]
+grep -q 'iw dev wlan0 set power_save off' "$work/sudo.log"
 
 clean_logs
 set +e
@@ -368,5 +379,81 @@ run_install 1 \
   ZVUCAST_SPOTIFY=0 \
   ZVUCAST_CONTROLLER=0 \
   APT_EXIT=100
+
+[[ "$(resolve_dac '')" == none ]]
+[[ "$(resolve_dac 1)" == none ]]
+[[ "$(resolve_dac 2)" == pcm5102 ]]
+[[ "$(resolve_dac pcm5102)" == pcm5102 ]]
+set +e
+resolve_dac usb >/dev/null
+code=$?
+set -e
+[[ "$code" -eq 1 ]]
+
+mkdir -p "$work/boot/firmware"
+printf '%s\n' '[pi4]' 'dtoverlay=vc4-kms-v3d' '[all]' 'dtparam=audio=on' \
+  > "$work/boot/firmware/config.txt"
+run_install 0 \
+  "${base_env[@]}" \
+  ZVUCAST_SPOTIFY=0 \
+  ZVUCAST_CONTROLLER=0 \
+  ZVUCAST_DAC=pcm5102
+grep -q 'Оверлей hifiberry-dac записан' "$work/main.out"
+awk '
+  $0 == "[all]" { in_all = 1; next }
+  in_all && $0 == "dtparam=i2s=on" { got_i2s = 1 }
+  in_all && got_i2s && $0 == "dtoverlay=hifiberry-dac" { got_dac = 1 }
+  in_all && got_dac && $0 == "dtparam=audio=on" { ok = 1 }
+  END { exit ok ? 0 : 1 }
+' "$work/boot/firmware/config.txt"
+[[ "$(grep -c '^dtoverlay=hifiberry-dac$' "$work/boot/firmware/config.txt")" -eq 1 ]]
+[[ "$(grep -c '^dtparam=i2s=on$' "$work/boot/firmware/config.txt")" -eq 1 ]]
+run_install 0 \
+  "${base_env[@]}" \
+  ZVUCAST_SPOTIFY=0 \
+  ZVUCAST_CONTROLLER=0 \
+  ZVUCAST_DAC=2
+grep -q 'Оверлей hifiberry-dac уже в config.txt' "$work/main.out"
+[[ "$(grep -c '^dtoverlay=hifiberry-dac$' "$work/boot/firmware/config.txt")" -eq 1 ]]
+
+old=$work/oldroot
+mkdir -p "$old/boot"
+printf '%s\n' 'arm_64bit=1' > "$old/boot/config.txt"
+run_install 0 \
+  ZVUCAST_UNAME=x86_64 \
+  ZVUCAST_OS_RELEASE="$work/os-debian" \
+  ZVUCAST_ROOT="$old" \
+  ZVUCAST_USER=audio \
+  ZVUCAST_UID=1000 \
+  ZVUCAST_SPOTIFY=0 \
+  ZVUCAST_CONTROLLER=0 \
+  ZVUCAST_DAC=pcm5102
+grep -q '^arm_64bit=1$' "$old/boot/config.txt"
+grep -q '^\[all\]$' "$old/boot/config.txt"
+grep -q '^dtparam=i2s=on$' "$old/boot/config.txt"
+grep -q '^dtoverlay=hifiberry-dac$' "$old/boot/config.txt"
+[[ ! -e "$old/boot/firmware/config.txt" ]]
+
+empty=$work/emptyroot
+mkdir -p "$empty"
+run_install 1 \
+  ZVUCAST_UNAME=x86_64 \
+  ZVUCAST_OS_RELEASE="$work/os-debian" \
+  ZVUCAST_ROOT="$empty" \
+  ZVUCAST_USER=audio \
+  ZVUCAST_UID=1000 \
+  ZVUCAST_SPOTIFY=0 \
+  ZVUCAST_CONTROLLER=0 \
+  ZVUCAST_DAC=pcm5102
+[[ ! -s "$work/apt.log" ]]
+grep -q 'config.txt' "$work/main.err"
+
+run_install 2 \
+  "${base_env[@]}" \
+  ZVUCAST_SPOTIFY=0 \
+  ZVUCAST_CONTROLLER=0 \
+  ZVUCAST_DAC=usb
+[[ ! -s "$work/apt.log" ]]
+grep -q ZVUCAST_DAC "$work/main.err"
 
 echo ok
