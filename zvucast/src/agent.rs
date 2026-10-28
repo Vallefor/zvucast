@@ -950,6 +950,83 @@ fn handle_set_mix(
     SetMixOutcome::Rebuild
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetFeedsOutcome {
+    Unchanged,
+    Applied,
+    Rebuild,
+}
+
+/// Живой `SetFeeds`. Успех записывает набор в `applied`. Срыв reconcile
+/// оставляет `applied` прежним, кладёт желаемый список в `wanted` и,
+/// как mute, снимает runner и вооружает гейт: `make_tx` соберёт микрофон
+/// и хвосты заново. Пока `failed`, тот же вектор — не no-op.
+fn handle_set_feeds(
+    wanted: &RefCell<Vec<zproto::FeedSend>>,
+    applied: &RefCell<Vec<zproto::FeedSend>>,
+    failed: &RefCell<bool>,
+    next: Vec<zproto::FeedSend>,
+    half: &mut RoleHalf,
+    dscp: u8,
+    bind: Option<&mut dyn crate::pipeline::LocalUdp>,
+) -> SetFeedsOutcome {
+    let retry = *failed.borrow();
+    if !retry && applied.borrow().as_slice() == next.as_slice() {
+        tracing::debug!("SetFeeds: набор не изменился");
+        return SetFeedsOutcome::Unchanged;
+    }
+    let Some(bind) = bind else {
+        *wanted.borrow_mut() = next.clone();
+        *applied.borrow_mut() = next;
+        *failed.borrow_mut() = false;
+        tracing::info!("tx: хвосты видов запомнены, линка нет");
+        return SetFeedsOutcome::Applied;
+    };
+    if half.runner.is_some() {
+        let reconciled = half
+            .runner
+            .as_mut()
+            .unwrap()
+            .reconcile_feeds(&next, dscp, bind);
+        match reconciled {
+            Ok(()) => {
+                *wanted.borrow_mut() = next.clone();
+                *applied.borrow_mut() = next;
+                *failed.borrow_mut() = false;
+                tracing::info!("tx: хвосты видов обновлены, RTP микрофона на месте");
+                SetFeedsOutcome::Applied
+            }
+            Err(e) => {
+                tracing::warn!("tx: хвост вида не встал, пересобираем: {e:#}");
+                *wanted.borrow_mut() = next;
+                *failed.borrow_mut() = true;
+                drop_runner(&mut half.runner);
+                half.gate.arm(&mut half.policy);
+                SetFeedsOutcome::Rebuild
+            }
+        }
+    } else {
+        *wanted.borrow_mut() = next;
+        if retry {
+            SetFeedsOutcome::Rebuild
+        } else {
+            *applied.borrow_mut() = wanted.borrow().clone();
+            tracing::info!("tx: хвосты видов встанут при сборке");
+            SetFeedsOutcome::Applied
+        }
+    }
+}
+
+/// `make_tx` собрал хвосты. Набор считается применённым.
+fn feeds_built(
+    applied: &RefCell<Vec<zproto::FeedSend>>,
+    failed: &RefCell<bool>,
+    wanted: &[zproto::FeedSend],
+) {
+    *applied.borrow_mut() = wanted.to_vec();
+    *failed.borrow_mut() = false;
+}
+
 /// Боевой биндер, когда линк опубликован. Без линка в сборку уходит пустой
 /// набор: `tx`/`rx` не вызываются, `LoopbackUdp` только занимает аргумент.
 fn pipeline_bind(link: &Option<crate::uplink::ActiveLink>) -> Box<dyn crate::pipeline::LocalUdp> {
@@ -1188,6 +1265,10 @@ fn gst_domain(
     // Транспортное состояние (unicast-эндпоинты + dscp) — только tx-половина.
     let transport = RefCell::new(Transport::default());
     let feeds_cell: RefCell<Vec<zproto::FeedSend>> = RefCell::new(Vec::new());
+    // `applied` — последний успешный набор. `failed` — живой reconcile сорвался,
+    // тот же SetFeeds не no-op, пока `make_tx` не соберёт хвосты.
+    let feeds_applied: RefCell<Vec<zproto::FeedSend>> = RefCell::new(Vec::new());
+    let feeds_failed: RefCell<bool> = RefCell::new(false);
     let capture_target: RefCell<Option<String>> = RefCell::new(None);
     let playback_target: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let muted_zones: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
@@ -1250,6 +1331,7 @@ fn gst_domain(
                     if !silent {
                         let wanted = feeds_cell.borrow().clone();
                         runner.reconcile_feeds(&wanted, t.dscp, bind.as_mut())?;
+                        feeds_built(&feeds_applied, &feeds_failed, &wanted);
                     }
                     runner
                 }
@@ -1299,6 +1381,7 @@ fn gst_domain(
                         )?;
                         let wanted = feeds_cell.borrow().clone();
                         runner.reconcile_feeds(&wanted, t.dscp, bind.as_mut())?;
+                        feeds_built(&feeds_applied, &feeds_failed, &wanted);
                         *built_sources.borrow_mut() = sources;
                         runner
                     }
@@ -1569,27 +1652,30 @@ fn gst_domain(
             Ok(CtlMsg::SetFeeds { feeds: next }) => {
                 if tx_half.is_none() {
                     tracing::debug!("SetFeeds: нет tx — игнорируем");
-                } else if feeds_cell.borrow().as_slice() == next.as_slice() {
-                    tracing::debug!("SetFeeds: набор не изменился");
-                } else {
-                    *feeds_cell.borrow_mut() = next;
+                } else if let Some(h) = tx_half.as_mut() {
                     let link = link_cell.borrow().clone();
+                    let dscp = transport.borrow().dscp;
                     if link.is_none() {
-                        tracing::info!("tx: хвосты видов запомнены, линка нет");
-                    } else if let Some(h) = tx_half.as_mut() {
-                        if let Some(runner) = h.runner.as_mut() {
-                            let dscp = transport.borrow().dscp;
-                            let wanted = feeds_cell.borrow().clone();
-                            let mut bind = pipeline_bind(&link);
-                            match runner.reconcile_feeds(&wanted, dscp, bind.as_mut()) {
-                                Ok(()) => tracing::info!(
-                                    "tx: хвосты видов обновлены, RTP микрофона на месте"
-                                ),
-                                Err(e) => tracing::warn!("tx: хвост вида не встал: {e:#}"),
-                            }
-                        } else {
-                            tracing::info!("tx: хвосты видов встанут при сборке");
-                        }
+                        handle_set_feeds(
+                            &feeds_cell,
+                            &feeds_applied,
+                            &feeds_failed,
+                            next,
+                            h,
+                            dscp,
+                            None,
+                        );
+                    } else {
+                        let mut bind = pipeline_bind(&link);
+                        handle_set_feeds(
+                            &feeds_cell,
+                            &feeds_applied,
+                            &feeds_failed,
+                            next,
+                            h,
+                            dscp,
+                            Some(bind.as_mut()),
+                        );
                     }
                 }
             }
@@ -2179,6 +2265,115 @@ mod tests {
         assert_eq!(mic.rms_l, 0.0, "lev микрофона не берёт уровень фида");
         assert_eq!(mic.rms_r, 0.0);
         runner.stop();
+    }
+
+    /// Срыв живого reconcile не записывает набор как применённый: runner снят,
+    /// гейт вооружён, повтор того же списка не no-op.
+    #[test]
+    fn failed_feed_apply_does_not_stick_and_arms_the_gate() {
+        gstreamer::init().unwrap();
+        struct FailUdp;
+        impl crate::pipeline::LocalUdp for FailUdp {
+            fn tx(&mut self) -> anyhow::Result<std::net::UdpSocket> {
+                anyhow::bail!("сокет вида недоступен");
+            }
+            fn rx(&mut self, _port: u16) -> anyhow::Result<std::net::UdpSocket> {
+                anyhow::bail!("сокет вида недоступен");
+            }
+        }
+        let previous = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Sendspin,
+            monitor: "zvucast-sendspin-hall-monitor".into(),
+            endpoints: vec![],
+        }];
+        let next = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![Endpoint {
+                ip: "192.0.2.10".into(),
+                port: 5010,
+            }],
+        }];
+        let wanted = RefCell::new(previous.clone());
+        let applied = RefCell::new(previous.clone());
+        let failed = RefCell::new(false);
+        let mut half = RoleHalf::new();
+        half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
+
+        assert_eq!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                previous.clone(),
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Unchanged,
+            "применённый набор не открывает сокет"
+        );
+        assert!(half.runner.is_some());
+        assert!(half.gate.restart_at.is_none());
+
+        assert_eq!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                next.clone(),
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Rebuild
+        );
+        assert_eq!(
+            applied.borrow().as_slice(),
+            previous.as_slice(),
+            "срыв не делает новый набор применённым"
+        );
+        assert_eq!(
+            wanted.borrow().as_slice(),
+            next.as_slice(),
+            "make_tx собирает хвосты из нового списка"
+        );
+        assert!(*failed.borrow());
+        assert!(half.runner.is_none(), "runner снят");
+        assert!(half.gate.restart_at.is_some(), "гейт вооружён");
+
+        assert_ne!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                next.clone(),
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Unchanged,
+            "тот же SetFeeds не no-op, пока ошибка не залечена"
+        );
+        assert_eq!(applied.borrow().as_slice(), previous.as_slice());
+        assert!(half.runner.is_none());
+
+        feeds_built(&applied, &failed, &wanted.borrow());
+        assert_eq!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                next,
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Unchanged,
+            "после make_tx тот же набор уже применён"
+        );
     }
 
     #[test]
