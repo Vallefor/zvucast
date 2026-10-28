@@ -173,6 +173,7 @@ const SETUP_TITLE: Record<string, string> = {
   gstreamer: 'Нет плагинов GStreamer',
   linger: 'После перезагрузки PipeWire не поднимется',
   'pipewire-socket': 'Нет сокета PipeWire',
+  'pipewire-quantum': 'Квант PipeWire не тот, что ставит установщик',
   'rt-limits': 'Нет rtprio для группы audio',
   'wifi-powersave': 'На Wi-Fi включено энергосбережение',
   controller: 'Контроллер включён, но не работает',

@@ -473,6 +473,10 @@ ZVUCAST_QUANTUM
   write_file "$latency" <<'ZVUCAST_LATENCY'
 # USB (UCA202) в batch-режиме держит лишний период в headroom.
 # HiFiBerry по I2S этот же период 128 переваривает без запаса.
+# bcm2835 Headphones — ШИМ через mailbox VideoCore. Период 128 и
+# disable-batch оставляют в кольце доли кванта, прошивка забирает
+# звук пачками: delay уходит в минус, sink копит xrun. В наушниках
+# это сплошной хрип. Выход не для боя — буфер как у медленной карты.
 monitor.alsa.rules = [
   {
     matches = [
@@ -485,6 +489,22 @@ monitor.alsa.rules = [
         api.alsa.period-num = 4
         api.alsa.headroom = 0
         api.alsa.disable-batch = true
+      }
+    }
+  }
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.*"
+        alsa.card_name = "bcm2835 Headphones"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.period-size = 1024
+        api.alsa.period-num = 4
+        api.alsa.headroom = 2048
+        api.alsa.disable-batch = false
       }
     }
   }
@@ -505,10 +525,16 @@ install_limits() {
 install_session() {
   as_root loginctl enable-linger "$AUDIO_USER"
   as_root systemctl start "user@${AUDIO_UID}.service"
+  # enable --now не перечитывает уже запущенный граф. Рестарт нужен,
+  # чтобы квант 128 и период джека bcm2835 вступили сразу.
   sudo -u "$AUDIO_USER" \
     "XDG_RUNTIME_DIR=/run/user/${AUDIO_UID}" \
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${AUDIO_UID}/bus" \
     systemctl --user enable --now pipewire.service pipewire-pulse.service wireplumber.service
+  sudo -u "$AUDIO_USER" \
+    "XDG_RUNTIME_DIR=/run/user/${AUDIO_UID}" \
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${AUDIO_UID}/bus" \
+    systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 }
 
 install_wifi() {

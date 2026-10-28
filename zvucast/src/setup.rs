@@ -11,6 +11,24 @@ const LIMITS: &str = "/etc/security/limits.conf";
 const SOLOIST_BIN: &str = "/usr/local/bin/soloist";
 const PW_RECORD: &str = "/usr/bin/pw-record";
 const PW_PLAY: &str = "/usr/bin/pw-play";
+const QUANTUM_CONF: &str = "/etc/pipewire/pipewire.conf.d/99-zvucast-quantum.conf";
+const LATENCY_CONF: &str = "/etc/wireplumber/wireplumber.conf.d/99-zvucast-latency.conf";
+
+const QUANTUM_MARKS: &[&str] = &[
+    "default.clock.quantum = 128",
+    "default.clock.min-quantum = 32",
+    "default.clock.max-quantum = 128",
+];
+/// Общий период 128 и отдельное правило только для карты bcm2835 Headphones.
+const LATENCY_MARKS: &[&str] = &[
+    "api.alsa.period-size = 128",
+    "api.alsa.headroom = 0",
+    "api.alsa.disable-batch = true",
+    "alsa.card_name = \"bcm2835 Headphones\"",
+    "api.alsa.period-size = 1024",
+    "api.alsa.headroom = 2048",
+    "api.alsa.disable-batch = false",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
@@ -261,6 +279,25 @@ pub fn controller_command() -> &'static str {
     "sudo systemctl enable --now zvucast-controller"
 }
 
+pub fn quantum_command() -> &'static str {
+    "curl -fsSL https://raw.githubusercontent.com/Vallefor/zvucast/main/install.sh | bash"
+}
+
+fn marks_ok(text: &str, marks: &[&str]) -> bool {
+    marks.iter().all(|mark| text.contains(mark))
+}
+
+/// Дропы установщика на месте: квант 128 у всего графа, а большой буфер
+/// только у встроенного джека Pi. Старый файл без правила Headphones — нет.
+fn quanta_ok(quantum: Option<&str>, latency: Option<&str>) -> bool {
+    match (quantum, latency) {
+        (Some(quantum), Some(latency)) => {
+            marks_ok(quantum, QUANTUM_MARKS) && marks_ok(latency, LATENCY_MARKS)
+        }
+        _ => false,
+    }
+}
+
 pub fn timeout_argv(secs: u64, program: &str, args: &[&str]) -> Vec<String> {
     let mut argv = Vec::with_capacity(4 + args.len());
     argv.push("timeout".to_string());
@@ -307,6 +344,8 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
             host.read_to_string(&format!("/run/user/{uid}/pipewire-0"))
                 .is_some()
         });
+        let quantum = scope.spawn(|| host.read_to_string(QUANTUM_CONF));
+        let latency = scope.spawn(|| host.read_to_string(LATENCY_CONF));
         let limits = scope.spawn(|| host.limits_text());
         let enabled = scope.spawn(|| {
             host.run(
@@ -344,6 +383,8 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
             appsrc: appsrc.join().expect("appsrc"),
             linger: linger.join().expect("linger"),
             socket: socket.join().expect("socket"),
+            quantum: quantum.join().expect("quantum"),
+            latency: latency.join().expect("latency"),
             limits: limits.join().expect("limits"),
             enabled: enabled.join().expect("enabled"),
             active: active.join().expect("active"),
@@ -378,6 +419,9 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
     }
     if !probed.socket {
         setup.push(issue("pipewire-socket", packages));
+    }
+    if !quanta_ok(probed.quantum.as_deref(), probed.latency.as_deref()) {
+        setup.push(issue("pipewire-quantum", quantum_command().to_string()));
     }
     if !audio_rtprio_ok(&probed.limits) {
         setup.push(issue("rt-limits", limits_command(&user)));
@@ -424,6 +468,8 @@ struct Probes {
     appsrc: Cmd,
     linger: Cmd,
     socket: bool,
+    quantum: Option<String>,
+    latency: Option<String>,
     limits: String,
     enabled: Cmd,
     active: Cmd,
@@ -608,6 +654,10 @@ mod tests {
             "@audio - rtprio 95\n".into(),
         );
         host.files
+            .insert(QUANTUM_CONF.into(), QUANTUM_MARKS.join("\n"));
+        host.files
+            .insert(LATENCY_CONF.into(), LATENCY_MARKS.join("\n"));
+        host.files
             .insert("/run/user/1000/pipewire-0".into(), String::new());
         host.answer(
             "getent",
@@ -676,6 +726,41 @@ mod tests {
                 "pipewire" | "wireplumber" | "pipewire-pulse"
             )
         }));
+    }
+
+    #[test]
+    fn installed_quanta_are_not_a_problem() {
+        let host = healthy_debian();
+        assert!(inspect(&host)
+            .setup
+            .iter()
+            .all(|issue| issue.id != "pipewire-quantum"));
+    }
+
+    #[test]
+    fn latency_without_headphone_rule_is_reported() {
+        let mut host = healthy_debian();
+        host.files.insert(
+            LATENCY_CONF.into(),
+            "api.alsa.period-size = 128\napi.alsa.headroom = 0\napi.alsa.disable-batch = true\n"
+                .into(),
+        );
+        let issue = inspect(&host)
+            .setup
+            .into_iter()
+            .find(|issue| issue.id == "pipewire-quantum")
+            .expect("stale latency drop");
+        assert_eq!(issue.command, quantum_command());
+    }
+
+    #[test]
+    fn missing_quantum_drop_is_reported() {
+        let mut host = healthy_debian();
+        host.files.remove(QUANTUM_CONF);
+        assert!(inspect(&host)
+            .setup
+            .iter()
+            .any(|issue| issue.id == "pipewire-quantum"));
     }
 
     #[test]
