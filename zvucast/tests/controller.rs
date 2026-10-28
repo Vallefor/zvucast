@@ -28,6 +28,15 @@ fn mix_port(tx: &str) -> u16 {
         .1
 }
 
+/// Порт имени в том же наборе, который пушер отдаёт `assign_mix_ports`.
+fn assigned_port(names: &[String], name: &str) -> u16 {
+    zvucast::mix::assign_mix_ports(names)
+        .into_iter()
+        .find(|(got, _)| got == name)
+        .unwrap_or_else(|| panic!("нет порта для {name} среди {names:?}"))
+        .1
+}
+
 fn zone_stream(tx: &str, zone_id: &str, ips: &[&str], dscp: u8) -> CtlMsg {
     let port = mix_port(tx);
     let mut endpoints: Vec<Endpoint> = ips
@@ -1821,6 +1830,7 @@ async fn virtual_output_is_stored_and_pushed_only_to_a_capable_node() {
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"virtual_output":true}"#).await;
     assert_eq!(status, 200);
@@ -1828,6 +1838,7 @@ async fn virtual_output_is_stored_and_pushed_only_to_a_capable_node() {
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"display_name":"Комната"}"#).await;
     assert_eq!(status, 200);
@@ -1876,35 +1887,403 @@ async fn virtual_output_is_stored_and_pushed_only_to_a_capable_node() {
 
     let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":[]}"#).await;
     assert_eq!(status, 200, "{zone}");
-    let hall = zone["id"].as_str().unwrap();
+    let hall = zone["id"].as_str().unwrap().to_string();
+    // Микрофон без связи вида: устройства и потоки пустые.
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+    let (status, zone) = create_zone(port, r#"{"name":"Спальня","tx":"pc","members":[]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let (status, _) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{hall}"),
+        r#"{"sources":["pc",{"kind":"virtual","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
     assert_eq!(
         pc.recv_ctl_within(2).await,
         CtlMsg::SetVirtualZones {
-            zones: vec![zproto::VirtualZone { zone_id: hall.into(), name: "Зал".into() }],
+            zones: vec![zproto::VirtualZone { zone_id: hall.clone(), name: "Зал".into() }],
         }
     );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: hall.clone(),
+                kind: zproto::FeedKind::Virtual,
+                monitor: zvucast::virtual_output::monitor_name(&hall),
+                endpoints: vec![],
+            }],
+        }
+    );
+}
+
+/// Микрофон и virtual в одной зоне: SetEndpoints остаётся одной группой
+/// с `source: None`. Колонка смешивает порт микрофона и порт вида.
+#[tokio::test]
+async fn virtual_feed_does_not_duplicate_endpoints() {
+    let path = temp_state_path("virtual-feed");
+    let state = AppState::with_state(&path);
+    spawn_endpoint_pusher(state.clone());
+    let port = serve(state).await;
+
+    let mut pc = MockAgent::connect_virtual(port).await;
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
+    assert_eq!(
+        pc.recv_raw_within(2).await,
+        CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(5).await,
+        CtlMsg::SetEndpoints { zones: vec![], dscp: 40 }
+    );
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"virtual_output":true}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: true });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let mut s1 = MockAgent::connect_as_from(port, "s1", Role::Rx, "127.0.0.3").await;
+    wait_node(port, "s1").await;
+
+    let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let z1 = zone["id"].as_str().unwrap().to_string();
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let (status, _) = http(port, "POST", &format!("/api/zones/{z1}/start")).await;
+    assert_eq!(status, 200);
+    let endpoints = pc.recv_ctl_within(5).await;
+    assert_eq!(endpoints, zone_stream("pc", &z1, &["127.0.0.3"], 40));
+    match &endpoints {
+        CtlMsg::SetEndpoints { zones, .. } => {
+            assert_eq!(zones.len(), 1);
+            assert_eq!(zones[0].source, None);
+            assert_eq!(zones.iter().filter(|z| z.zone_id == z1).count(), 1);
+        }
+        other => panic!("ждали одну группу микрофона, пришло {other:?}"),
+    }
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetChannelMap { map: ChannelMap::default(), branches: vec![] }
+    );
+    assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::SetMix { ports: vec![mix_port("pc")], jb_ms: 2 });
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{z1}"),
+        r#"{"sources":["pc",{"kind":"virtual","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["sources"], serde_json::json!(["pc"]));
+    assert_eq!(view["source_maps"], serde_json::json!({}), "новый хозяин не получает карту по умолчанию");
+
+    let feed_name = zvucast::mix::feed_port_name(zproto::FeedKind::Virtual, "pc", &z1);
+    let names = vec!["pc".to_string(), feed_name.clone()];
+    let mic = assigned_port(&names, "pc");
+    let feed_port = assigned_port(&names, &feed_name);
+    assert_ne!(mic, feed_port);
+    let feed = zproto::FeedSend {
+        zone_id: z1.clone(),
+        kind: zproto::FeedKind::Virtual,
+        monitor: zvucast::virtual_output::monitor_name(&z1),
+        endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: feed_port }],
+    };
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetVirtualZones {
+            zones: vec![zproto::VirtualZone { zone_id: z1.clone(), name: "Зал".into() }],
+        }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![feed.clone()] });
+    // Пушер повторяет SetFeeds: немедленная отправка last_feeds не пишет.
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::SetFeeds { feeds: vec![feed] });
+
+    let mut branches = vec![
+        BranchChannelMap { port: mic, map: ChannelMap::default() },
+        BranchChannelMap { port: feed_port, map: ChannelMap::default() },
+    ];
+    branches.sort_by_key(|b| b.port);
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetChannelMap { map: ChannelMap::default(), branches }
+    );
+    let mut ports = vec![mic, feed_port];
+    ports.sort();
+    assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::SetMix { ports, jb_ms: 2 });
+
+    let (status, _) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{z1}"),
+        r#"{"sources":["pc"]}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::SetFeeds { feeds: vec![] });
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetChannelMap { map: ChannelMap::default(), branches: vec![] }
+    );
+    assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::SetMix { ports: vec![mix_port("pc")], jb_ms: 2 });
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"dscp":41}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(pc.recv_ctl_within(5).await, zone_stream("pc", &z1, &["127.0.0.3"], 41));
+}
+
+/// Один узел ведёт Spotify в двух зонах. У каждой свой монитор и свои колонки.
+/// Зона без микрофона стартует хозяина и шлёт SetFeeds.
+#[tokio::test]
+async fn spotify_feeds_stay_in_their_zones() {
+    let path = temp_state_path("spotify-feeds");
+    let state = AppState::with_state(&path);
+    spawn_endpoint_pusher(state.clone());
+    let port = serve(state).await;
+
+    let mut pc = MockAgent::connect_virtual(port).await;
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
+    assert_eq!(
+        pc.recv_raw_within(2).await,
+        CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(5).await,
+        CtlMsg::SetEndpoints { zones: vec![], dscp: 40 }
+    );
+
+    let (status, _) = http_body(
+        port,
+        "PATCH",
+        "/api/nodes/pc",
+        r#"{"soloist_key":"spot-key","spotify":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist { api_key: Some(SecretString("spot-key".into())), zones: vec![] }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let mut s1 = MockAgent::connect_as_from(port, "s1", Role::Rx, "127.0.0.3").await;
+    let mut s2 = MockAgent::connect_as_from(port, "s2", Role::Rx, "127.0.0.4").await;
+    wait_node(port, "s1").await;
+    wait_node(port, "s2").await;
+
+    let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let z1 = zone["id"].as_str().unwrap().to_string();
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist { api_key: Some(SecretString("spot-key".into())), zones: vec![] }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{z1}"),
+        r#"{"sources":[{"kind":"spotify","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["sources"], serde_json::json!([]));
+    assert_eq!(view["source_maps"], serde_json::json!({}));
+    let n1 = zvucast::mix::feed_port_name(zproto::FeedKind::Spotify, "pc", &z1);
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(
         pc.recv_ctl_within(2).await,
         CtlMsg::SetSoloist {
-            api_key: None,
-            zones: vec![zproto::VirtualZone { zone_id: hall.into(), name: "Зал".into() }],
+            api_key: Some(SecretString("spot-key".into())),
+            zones: vec![zproto::VirtualZone { zone_id: z1.clone(), name: "Зал".into() }],
         }
     );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
     assert_eq!(
         pc.recv_ctl_within(2).await,
-        CtlMsg::SetSendspin { zones: vec![] }
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: z1.clone(),
+                kind: zproto::FeedKind::Spotify,
+                monitor: zvucast::soloist::monitor_name(&z1),
+                endpoints: vec![],
+            }],
+        }
     );
-    let (status, zone) = create_zone(port, r#"{"name":"Спальня","tx":"pc","members":[]}"#).await;
+
+    let (status, _) = http(port, "POST", &format!("/api/zones/{z1}/start")).await;
+    assert_eq!(status, 200);
+    let p1_alone = assigned_port(&["pc".to_string(), n1.clone()], &n1);
+    assert_eq!(
+        pc.recv_ctl_within(5).await,
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: z1.clone(),
+                kind: zproto::FeedKind::Spotify,
+                monitor: zvucast::soloist::monitor_name(&z1),
+                endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: p1_alone }],
+            }],
+        }
+    );
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetChannelMap { map: ChannelMap::default(), branches: vec![] }
+    );
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetMix { ports: vec![p1_alone], jb_ms: 2 }
+    );
+
+    let (status, zone) = create_zone(port, r#"{"name":"Спальня","tx":"pc","members":["s2"]}"#).await;
     assert_eq!(status, 200, "{zone}");
-    let bed = zone["id"].as_str().unwrap();
-    let mut names = vec![
-        zproto::VirtualZone { zone_id: hall.into(), name: "Зал".into() },
-        zproto::VirtualZone { zone_id: bed.into(), name: "Спальня".into() },
-    ];
-    names.sort_by(|a, b| a.zone_id.cmp(&b.zone_id));
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: names.clone() });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: names.clone() });
+    let z2 = zone["id"].as_str().unwrap().to_string();
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist {
+            api_key: Some(SecretString("spot-key".into())),
+            zones: vec![zproto::VirtualZone { zone_id: z1.clone(), name: "Зал".into() }],
+        }
+    );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: z1.clone(),
+                kind: zproto::FeedKind::Spotify,
+                monitor: zvucast::soloist::monitor_name(&z1),
+                endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: p1_alone }],
+            }],
+        }
+    );
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{z2}"),
+        r#"{"sources":[{"kind":"spotify","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["source_maps"], serde_json::json!({}));
+    let mut soloist_zones = vec![
+        zproto::VirtualZone { zone_id: z1.clone(), name: "Зал".into() },
+        zproto::VirtualZone { zone_id: z2.clone(), name: "Спальня".into() },
+    ];
+    soloist_zones.sort_by(|a, b| a.zone_id.cmp(&b.zone_id));
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist {
+            api_key: Some(SecretString("spot-key".into())),
+            zones: soloist_zones,
+        }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    let mut inactive = vec![
+        zproto::FeedSend {
+            zone_id: z1.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z1),
+            endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: p1_alone }],
+        },
+        zproto::FeedSend {
+            zone_id: z2.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z2),
+            endpoints: vec![],
+        },
+    ];
+    inactive.sort_by(|a, b| a.zone_id.cmp(&b.zone_id).then(a.kind.as_str().cmp(b.kind.as_str())));
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: inactive });
+
+    let (status, _) = http(port, "POST", &format!("/api/zones/{z2}/start")).await;
+    assert_eq!(status, 200);
+    let n2 = zvucast::mix::feed_port_name(zproto::FeedKind::Spotify, "pc", &z2);
+    let names = vec!["pc".to_string(), n1.clone(), n2.clone()];
+    let p1 = assigned_port(&names, &n1);
+    let p2 = assigned_port(&names, &n2);
+    let mic = assigned_port(&names, "pc");
+    assert_ne!(p1, p2);
+    assert_ne!(p1, mic);
+    assert_ne!(p2, mic);
+    let mut live = vec![
+        zproto::FeedSend {
+            zone_id: z1.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z1),
+            endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: p1 }],
+        },
+        zproto::FeedSend {
+            zone_id: z2.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z2),
+            endpoints: vec![Endpoint { ip: "127.0.0.4".into(), port: p2 }],
+        },
+    ];
+    live.sort_by(|a, b| a.zone_id.cmp(&b.zone_id).then(a.kind.as_str().cmp(b.kind.as_str())));
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::SetFeeds { feeds: live });
+    assert_eq!(s2.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(
+        s2.recv_ctl_within(5).await,
+        CtlMsg::SetChannelMap { map: ChannelMap::default(), branches: vec![] }
+    );
+    assert_eq!(s2.recv_ctl_within(5).await, CtlMsg::SetMix { ports: vec![p2], jb_ms: 2 });
+    if p1 != p1_alone {
+        assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::SetMix { ports: vec![p1], jb_ms: 2 });
+    }
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"dscp":41}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        pc.recv_ctl_within(5).await,
+        CtlMsg::SetEndpoints { zones: vec![], dscp: 41 }
+    );
 }
 
 #[tokio::test]
@@ -1917,6 +2296,7 @@ async fn soloist_key_stays_on_the_transmitter_that_has_it() {
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"soloist_key":"  spot-key  ","spotify":true}"#).await;
     assert_eq!(status, 200);
@@ -1925,6 +2305,7 @@ async fn soloist_key_stays_on_the_transmitter_that_has_it() {
         CtlMsg::SetSoloist { api_key: Some(SecretString("spot-key".into())), zones: vec![] }
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let mut other = MockAgent::connect_virtual_named(port, "room").await;
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
@@ -1932,6 +2313,7 @@ async fn soloist_key_stays_on_the_transmitter_that_has_it() {
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (code, nodes) = http(port, "GET", "/api/nodes").await;
     assert_eq!(code, 200);
@@ -1943,22 +2325,22 @@ async fn soloist_key_stays_on_the_transmitter_that_has_it() {
 
     let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":[]}"#).await;
     assert_eq!(status, 200, "{zone}");
-    let hall = zone["id"].as_str().unwrap();
-    let hall_zone = vec![zproto::VirtualZone { zone_id: hall.into(), name: "Зал".into() }];
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(
         pc.recv_ctl_within(2).await,
-        CtlMsg::SetSoloist { api_key: Some(SecretString("spot-key".into())), zones: hall_zone.clone() }
+        CtlMsg::SetSoloist { api_key: Some(SecretString("spot-key".into())), zones: vec![] }
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"soloist_key":""}"#).await;
     assert_eq!(status, 200);
     assert_eq!(
         pc.recv_ctl_within(2).await,
-        CtlMsg::SetSoloist { api_key: None, zones: hall_zone.clone() }
+        CtlMsg::SetSoloist { api_key: None, zones: vec![] }
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 }
 
 #[tokio::test]
@@ -1971,6 +2353,7 @@ async fn spotify_checkbox_off_does_not_start_soloist_even_with_a_key() {
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"soloist_key":"spot-key"}"#).await;
     assert_eq!(status, 200);
@@ -1980,6 +2363,7 @@ async fn spotify_checkbox_off_does_not_start_soloist_even_with_a_key() {
         "ключ без галочки Spotify Soloist не поднимает"
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":true}"#).await;
     assert_eq!(status, 200);
@@ -1988,6 +2372,7 @@ async fn spotify_checkbox_off_does_not_start_soloist_even_with_a_key() {
         CtlMsg::SetSoloist { api_key: Some(SecretString("spot-key".into())), zones: vec![] }
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":false}"#).await;
     assert_eq!(status, 200);
@@ -1996,6 +2381,7 @@ async fn spotify_checkbox_off_does_not_start_soloist_even_with_a_key() {
         CtlMsg::SetSoloist { api_key: None, zones: vec![] }
     );
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (code, nodes) = http(port, "GET", "/api/nodes").await;
     assert_eq!(code, 200);
@@ -2078,28 +2464,30 @@ async fn sendspin_checkbox_off_does_not_start_clients() {
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":[]}"#).await;
     assert_eq!(status, 200, "{zone}");
-    let hall = zone["id"].as_str().unwrap();
-    let hall_zone = vec![zproto::VirtualZone { zone_id: hall.into(), name: "Зал".into() }];
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: hall_zone.clone() });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(
         pc.recv_ctl_within(2).await,
         CtlMsg::SetSendspin { zones: vec![] },
         "без галочки Sendspin зоны не поднимают клиентов"
     );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"sendspin":true}"#).await;
     assert_eq!(status, 200);
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: hall_zone.clone() });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: hall_zone.clone() });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"sendspin":false}"#).await;
     assert_eq!(status, 200);
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: hall_zone });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (code, nodes) = http(port, "GET", "/api/nodes").await;
     assert_eq!(code, 200);
@@ -2118,26 +2506,28 @@ async fn sendspin_follows_zones_when_enabled() {
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"sendspin":true}"#).await;
     assert_eq!(status, 200);
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":[]}"#).await;
     assert_eq!(status, 200, "{zone}");
     let hall = zone["id"].as_str().unwrap().to_string();
-    let hall_zone = vec![zproto::VirtualZone { zone_id: hall.clone(), name: "Зал".into() }];
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: hall_zone.clone() });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: hall_zone.clone() });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", &format!("/api/zones/{hall}"), r#"{"name":"Гостиная"}"#).await;
     assert_eq!(status, 200);
-    let renamed = vec![zproto::VirtualZone { zone_id: hall.clone(), name: "Гостиная".into() }];
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: renamed.clone() });
-    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: renamed });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let mut other = MockAgent::connect_virtual_named(port, "room").await;
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
@@ -2145,27 +2535,31 @@ async fn sendspin_follows_zones_when_enabled() {
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", "/api/nodes/room", r#"{"sendspin":true}"#).await;
     assert_eq!(status, 200);
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "PATCH", &format!("/api/zones/{hall}"), r#"{"tx":"room"}"#).await;
     assert_eq!(status, 200);
-    let moved = vec![zproto::VirtualZone { zone_id: hall.clone(), name: "Гостиная".into() }];
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
-    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: moved.clone() });
-    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: moved });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let (status, _) = http_body(port, "DELETE", &format!("/api/zones/{hall}"), "").await;
     assert_eq!(status, 200);
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(other.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
 }
 
 #[tokio::test]
@@ -2258,6 +2652,7 @@ async fn ui_targets_follow_hello_and_prefs() {
     assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetVirtualZones { zones: vec![] });
     assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
     assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(recv_raw(&mut pc).await, CtlMsg::SetFeeds { feeds: vec![] });
 
     let mut reported = vec![zproto::CaptureChan {
         id: "hw:0".into(),

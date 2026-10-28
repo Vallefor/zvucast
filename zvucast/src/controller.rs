@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Mutex};
 use zproto::{
-    AgentMsg, BranchChannelMap, ChannelMap, CtlMsg, Endpoint, FeedKind, Role, SecretString, SetupIssue,
-    SoloistState, VirtualZone, ZoneEndpoints,
+    AgentMsg, BranchChannelMap, ChannelMap, CtlMsg, Endpoint, FeedKind, FeedSend, Role, SecretString,
+    SetupIssue, SoloistState, VirtualZone, ZoneEndpoints,
 };
 
 use crate::agent::successor_marker_path;
@@ -40,7 +40,7 @@ use crate::update::{
 use crate::silence::{classify, fold_samples, Sample, SilenceBook, ZoneTick};
 use crate::state::{
     assignment, clear_feed, default_jb_ms, drop_missing_feed_keys, normalize_sources, owner_ids,
-    owner_maps, source_channel_maps, zone_groups, State as MasterState, StateStore, Zone, ZoneSource,
+    owner_maps, zone_groups, NodeMeta, State as MasterState, StateStore, Zone, ZoneSource,
 };
 
 /// Телеметрия старше этого таймаута → узел в offline по sweep.
@@ -1493,16 +1493,16 @@ async fn patch_zone(
     }
     let pushed: Vec<String> = match &new_sources {
         Some(next) => {
-            let mut ids = current.source_ids();
+            let mut ids = zone_push_ids(&current);
             for src in next {
-                let ZoneSource::Line(id) = src else { continue };
-                if !ids.contains(id) {
-                    ids.push(id.clone());
+                let id = src.node_id().to_string();
+                if !id.is_empty() && !ids.contains(&id) {
+                    ids.push(id);
                 }
             }
             ids
         }
-        None => current.source_ids(),
+        None => zone_push_ids(&current),
     };
     st.update_state(|s| {
         if let Some(z) = s.zones.iter_mut().find(|z| z.id == id) {
@@ -1559,7 +1559,7 @@ async fn delete_zone(Path(id): Path<String>, State(st): State<AppState>) -> CmdR
         let Some(zone) = store.state().zones.iter().find(|z| z.id == id) else {
             return Err((StatusCode::NOT_FOUND, format!("зона {id} не найдена")));
         };
-        zone.source_ids()
+        zone_push_ids(zone)
     };
     st.update_state(|s| s.zones.retain(|z| z.id != id)).await?;
     for source in tx {
@@ -1790,6 +1790,7 @@ async fn patch_node(
             b.virtual_output.is_some().then(|| virtual_zones_cmd(state, &node_id)),
             soloist_cmd(state, &node_id),
             sendspin_cmd(state, &node_id),
+            FeedSnap::from_state(state),
         ))
     } else {
         None
@@ -1801,13 +1802,15 @@ async fn patch_node(
                 let _ = reg.send_cmd(&node_id, CtlMsg::SetVirtualOutput { enabled });
             }
         }
-        if let Some((zones, soloist, sendspin)) = zones_cmd {
+        if let Some((zones, soloist, sendspin, snap)) = zones_cmd {
             if reg.supports_virtual_output(&node_id) {
                 if let Some(zones) = zones {
                     let _ = reg.send_cmd(&node_id, zones);
                 }
                 let _ = reg.send_cmd(&node_id, soloist);
                 let _ = reg.send_cmd(&node_id, sendspin);
+                let ports = stream_ports(&reg, &snap);
+                let _ = reg.send_cmd(&node_id, feeds_cmd(&snap, &reg, &ports, &node_id));
             }
         }
         if patched_inputs {
@@ -1928,6 +1931,9 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
         let mut st_rx = state.state_version.subscribe();
         // Последний отправленный каждому tx набор: node_id → (dscp, endpoints).
         let mut last_sent: HashMap<String, (u8, Vec<ZoneEndpoints>)> = HashMap::new();
+        // Последний непустой SetFeeds хозяину. Пустой уходит один раз, когда связи
+        // кончились, и сразу забывается. Offline тоже стирает запись: re-hello шлёт заново.
+        let mut last_feeds: HashMap<String, Vec<FeedSend>> = HashMap::new();
         // Последняя отправленная rx карта зоны-владельца. Выпавший из
         // owner_maps отсюда удаляется — следующий захват снова пушит.
         let mut last_maps: HashMap<String, (ChannelMap, Vec<BranchChannelMap>)> = HashMap::new();
@@ -1955,7 +1961,7 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
             }
             // Снапшот state → раскладка и владельцы. Замки по одному:
             // store, затем холды, затем reg — никогда вместе.
-            let (assign, groups_of, maps, owners, zones, dscp_of, output_prefs) = {
+            let (assign, groups_of, maps, owners, zones, dscp_of, output_prefs, feed_flags) = {
                 let store = state.store.lock().await;
                 let st = store.state();
                 let dscp_of: HashMap<String, u8> = st
@@ -1976,16 +1982,20 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
                     st.zones.clone(),
                     dscp_of,
                     output_prefs,
+                    feed_flags_of(st),
                 )
             };
             let held = state.silence_holds.lock().await.clone();
             let dscp_global = state.dscp.load(Ordering::Relaxed);
             let mut reg = state.reg.lock().await;
             let online_tx = reg.online_tx();
+            let online_rx = reg.online_rx();
             let hello_now = reg.hello_seqs();
-            let tx_port = mix_ports_for(&reg, &online_tx);
+            let feed_names = active_feed_names(&zones, &feed_flags, &online_tx, &online_rx);
+            let tx_port = mix_ports_for(&reg, &online_tx, &feed_names);
             // Ушедшие в offline забываем: re-hello должен получить форс-пуш.
             last_sent.retain(|id, _| online_tx.iter().any(|t| t == id));
+            last_feeds.retain(|id, _| node_online(&online_tx, &online_rx, id));
             // Играющее множество — по assign до холда: пустой endpoints_of
             // при живых слушателях это тишина, Stop не шлём.
             let mut playing: HashSet<String> = HashSet::new();
@@ -2038,6 +2048,84 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
                     Err(e) => {
                         tracing::warn!(tx = tx_id, "SetEndpoints не доставлен: {e}");
                     }
+                }
+            }
+            // Зона только из вида не имеет микрофонного assign, и без этого
+            // хозяин не получит Start, пока его не разбудит другая роль.
+            for zone in &zones {
+                if !zone.active {
+                    continue;
+                }
+                let mut listeners = Vec::new();
+                for member in &zone.members {
+                    if owners.get(member) == Some(&zone.id) && reg.rx_endpoint(member).is_some() {
+                        listeners.push(member.clone());
+                    }
+                }
+                if listeners.is_empty() {
+                    continue;
+                }
+                for src in zone.zone_sources() {
+                    let ZoneSource::Feed { kind, node_id } = src else { continue };
+                    if !feed_flag(&feed_flags, &node_id, kind) {
+                        continue;
+                    }
+                    if !node_online(&online_tx, &online_rx, &node_id) {
+                        continue;
+                    }
+                    playing.insert(node_id);
+                    for listener in &listeners {
+                        playing.insert(listener.clone());
+                    }
+                }
+            }
+            let snap = FeedSnap {
+                zones: zones.clone(),
+                flags: feed_flags.clone(),
+                owners: owners.clone(),
+            };
+            let mut feed_hosts: Vec<String> = last_feeds.keys().cloned().collect();
+            for zone in &zones {
+                for src in zone.zone_sources() {
+                    let ZoneSource::Feed { kind, node_id } = src else { continue };
+                    if !feed_flag(&feed_flags, &node_id, kind) {
+                        continue;
+                    }
+                    if !node_online(&online_tx, &online_rx, &node_id) {
+                        continue;
+                    }
+                    if !feed_hosts.iter().any(|id| id == &node_id) {
+                        feed_hosts.push(node_id);
+                    }
+                }
+            }
+            feed_hosts.sort();
+            for id in &feed_hosts {
+                if !reg.supports_virtual_output(id) && !last_feeds.contains_key(id) {
+                    continue;
+                }
+                let CtlMsg::SetFeeds { feeds } = feeds_cmd(&snap, &reg, &tx_port, id) else {
+                    continue;
+                };
+                let fresh_hello = prev_hello.get(id) != hello_now.get(id);
+                let known = last_feeds.get(id);
+                if feeds.is_empty() && known.is_none() {
+                    continue;
+                }
+                if known == Some(&feeds) && !fresh_hello {
+                    continue;
+                }
+                if feeds.is_empty() {
+                    last_feeds.remove(id);
+                } else {
+                    last_feeds.insert(id.clone(), feeds.clone());
+                }
+                match reg.send_cmd(id, CtlMsg::SetFeeds { feeds }) {
+                    Ok(()) => tracing::info!(node = id, "SetFeeds отправлен хозяину"),
+                    Err(RegistryError::Closed) => {
+                        reg.mark_offline(id);
+                    }
+                    Err(e) => tracing::warn!(node = id, "SetFeeds не доставлен: {e}"),
                 }
             }
             // Start/Stop по diff играющего множества — строго после SetEndpoints:
@@ -2137,6 +2225,28 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
                     }
                 }
             }
+            for zone in &zones {
+                if !zone.active {
+                    continue;
+                }
+                for src in zone.zone_sources() {
+                    let ZoneSource::Feed { kind, node_id } = &src else { continue };
+                    if !feed_flag(&feed_flags, node_id, *kind) {
+                        continue;
+                    }
+                    let name = crate::mix::feed_port_name(*kind, node_id, &zone.id);
+                    let Some(&port) = tx_port.get(&name) else { continue };
+                    for member in &zone.members {
+                        if owners.get(member) != Some(&zone.id) || reg.rx_endpoint(member).is_none() {
+                            continue;
+                        }
+                        let slots = heard.entry(member.clone()).or_default();
+                        if !slots.contains(&port) {
+                            slots.push(port);
+                        }
+                    }
+                }
+            }
             for slots in heard.values_mut() {
                 slots.sort();
             }
@@ -2170,23 +2280,39 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
 
 /// SetChannelMap колонки. Один источник — карта после микшера.
 /// Несколько — карта на порт каждого источника, выход микшера сквозной.
+/// Вид `source_channel_maps` не отдаёт: ключ карты — `ZoneSource::key()`,
+/// порт — имя `feed_port_name` в карте портов. Нет ключа у вида — прямое стерео.
 fn zone_channel_cmd(
     zone: &Zone,
     member: &str,
     port_of: &HashMap<String, u16>,
     views: &[crate::inputs::InputView],
 ) -> CtlMsg {
-    let per_source = source_channel_maps(zone, member);
-    if per_source.is_empty() {
+    let sources = zone.zone_sources();
+    if sources.len() < 2 {
         let map = zone.maps.get(member).copied().unwrap_or_default();
         return CtlMsg::SetChannelMap {
             map: crate::inputs::mask_disabled_outputs(map, views),
             branches: vec![],
         };
     }
+    let fallback = zone.maps.get(member).copied().unwrap_or_default();
     let mut branches = Vec::new();
-    for (src, map) in per_source {
-        let Some(&port) = port_of.get(&src) else { continue };
+    for src in sources {
+        let stored = zone
+            .source_maps
+            .get(member)
+            .and_then(|by| by.get(&src.key()))
+            .copied();
+        let map = match &src {
+            ZoneSource::Line(_) => stored.unwrap_or(fallback),
+            ZoneSource::Feed { .. } => stored.unwrap_or_default(),
+        };
+        let port_key = match &src {
+            ZoneSource::Line(id) => id.clone(),
+            ZoneSource::Feed { kind, node_id } => crate::mix::feed_port_name(*kind, node_id, &zone.id),
+        };
+        let Some(&port) = port_of.get(&port_key) else { continue };
         branches.push(BranchChannelMap {
             port,
             map: crate::inputs::mask_disabled_outputs(map, views),
@@ -2208,20 +2334,30 @@ fn speaker_jb_ms(owners: &HashMap<String, String>, zones: &[Zone], id: &str) -> 
         .unwrap_or_else(default_jb_ms)
 }
 
-fn mix_ports_for(reg: &Registry, online_tx: &[String]) -> HashMap<String, u16> {
-    let names: Vec<String> = online_tx.iter().filter_map(|id| reg.name_of(id)).collect();
+fn mix_ports_for(reg: &Registry, online_tx: &[String], feed_names: &[String]) -> HashMap<String, u16> {
+    let mut names: Vec<String> = online_tx.iter().filter_map(|id| reg.name_of(id)).collect();
+    names.extend(feed_names.iter().cloned());
     let assigned = crate::mix::assign_mix_ports(&names);
     let mut out = HashMap::new();
+    let mut mic_got = 0usize;
     for id in online_tx {
         let Some(name) = reg.name_of(id) else { continue };
         if let Some((_, port)) = assigned.iter().find(|(n, _)| n == &name) {
             out.insert(id.clone(), *port);
+            mic_got += 1;
         }
     }
-    if out.len() != online_tx.len() {
+    let mut feed_got = 0usize;
+    for name in feed_names {
+        if let Some((_, port)) = assigned.iter().find(|(n, _)| n == name) {
+            out.insert(name.clone(), *port);
+            feed_got += 1;
+        }
+    }
+    if mic_got != online_tx.len() || feed_got != feed_names.len() {
         tracing::warn!(
-            have = out.len(),
-            want = online_tx.len(),
+            have = mic_got + feed_got,
+            want = online_tx.len() + feed_names.len(),
             "слоты микса кончились — часть источников не получит порт"
         );
     }
@@ -2236,10 +2372,40 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, st, addr.ip().to_string()))
 }
 
-fn tx_zones(state: &MasterState, node_id: &str) -> Vec<VirtualZone> {
+/// Узлы, которым слать SetVirtualZones / SetSoloist / SetSendspin / SetFeeds:
+/// микрофоны и хозяева видов. Пустой `sources` при старом `tx` — как `source_ids`.
+fn zone_push_ids(zone: &Zone) -> Vec<String> {
+    let mut ids: Vec<String> = zone.zone_sources().iter().map(|src| src.node_id().to_string()).collect();
+    if ids.is_empty() {
+        ids = zone.source_ids();
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn feed_enabled(meta: &NodeMeta, kind: FeedKind) -> bool {
+    match kind {
+        FeedKind::Spotify => meta.spotify,
+        FeedKind::Sendspin => meta.sendspin,
+        FeedKind::Virtual => meta.virtual_output,
+    }
+}
+
+/// Зоны, где узел — хозяин этого вида и галочка включена. Микрофон сюда не входит.
+fn hosted_zones(state: &MasterState, node_id: &str, kind: FeedKind) -> Vec<VirtualZone> {
+    let Some(meta) = state.nodes.get(node_id) else {
+        return Vec::new();
+    };
+    if !feed_enabled(meta, kind) {
+        return Vec::new();
+    }
     let mut zones = Vec::new();
     for zone in &state.zones {
-        if zone.source_ids().iter().any(|id| id == node_id) {
+        let hosts = zone.zone_sources().iter().any(|src| {
+            matches!(src, ZoneSource::Feed { kind: got, node_id: id } if *got == kind && id == node_id)
+        });
+        if hosts {
             zones.push(VirtualZone {
                 zone_id: zone.id.clone(),
                 name: zone.name.clone(),
@@ -2262,36 +2428,31 @@ fn soloist_cmd(state: &MasterState, node_id: &str) -> CtlMsg {
         .and_then(|n| node_soloist_key_raw(n.soloist_key.as_deref()));
     CtlMsg::SetSoloist {
         api_key: key.map(SecretString),
-        zones: tx_zones(state, node_id),
+        zones: hosted_zones(state, node_id, FeedKind::Spotify),
     }
 }
 
 fn sendspin_cmd(state: &MasterState, node_id: &str) -> CtlMsg {
-    let zones = if state.nodes.get(node_id).is_some_and(|n| n.sendspin) {
-        tx_zones(state, node_id)
-    } else {
-        Vec::new()
-    };
-    CtlMsg::SetSendspin { zones }
+    CtlMsg::SetSendspin {
+        zones: hosted_zones(state, node_id, FeedKind::Sendspin),
+    }
 }
 
 fn virtual_zones_cmd(state: &MasterState, node_id: &str) -> CtlMsg {
-    let zones = if state.nodes.get(node_id).is_some_and(|n| n.virtual_output) {
-        tx_zones(state, node_id)
-    } else {
-        Vec::new()
-    };
-    CtlMsg::SetVirtualZones { zones }
+    CtlMsg::SetVirtualZones {
+        zones: hosted_zones(state, node_id, FeedKind::Virtual),
+    }
 }
 
 async fn push_virtual_zones(st: &AppState, node_id: &str) {
-    let (zones, soloist, sendspin) = {
+    let (zones, soloist, sendspin, snap) = {
         let store = st.store.lock().await;
         let state = store.state();
         (
             virtual_zones_cmd(state, node_id),
             soloist_cmd(state, node_id),
             sendspin_cmd(state, node_id),
+            FeedSnap::from_state(state),
         )
     };
     let reg = st.reg.lock().await;
@@ -2299,7 +2460,152 @@ async fn push_virtual_zones(st: &AppState, node_id: &str) {
         let _ = reg.send_cmd(node_id, zones);
         let _ = reg.send_cmd(node_id, soloist);
         let _ = reg.send_cmd(node_id, sendspin);
+        let ports = stream_ports(&reg, &snap);
+        let _ = reg.send_cmd(node_id, feeds_cmd(&snap, &reg, &ports, node_id));
     }
+}
+
+#[derive(Clone, Copy)]
+struct FeedFlags {
+    spotify: bool,
+    sendspin: bool,
+    virtual_output: bool,
+}
+
+struct FeedSnap {
+    zones: Vec<Zone>,
+    flags: HashMap<String, FeedFlags>,
+    owners: HashMap<String, String>,
+}
+
+impl FeedSnap {
+    fn from_state(state: &MasterState) -> Self {
+        Self {
+            zones: state.zones.clone(),
+            flags: feed_flags_of(state),
+            owners: owner_ids(state),
+        }
+    }
+}
+
+fn feed_flags_of(state: &MasterState) -> HashMap<String, FeedFlags> {
+    state
+        .nodes
+        .iter()
+        .map(|(id, meta)| {
+            (
+                id.clone(),
+                FeedFlags {
+                    spotify: meta.spotify,
+                    sendspin: meta.sendspin,
+                    virtual_output: meta.virtual_output,
+                },
+            )
+        })
+        .collect()
+}
+
+fn feed_flag(flags: &HashMap<String, FeedFlags>, node_id: &str, kind: FeedKind) -> bool {
+    let Some(flag) = flags.get(node_id) else {
+        return false;
+    };
+    match kind {
+        FeedKind::Spotify => flag.spotify,
+        FeedKind::Sendspin => flag.sendspin,
+        FeedKind::Virtual => flag.virtual_output,
+    }
+}
+
+fn node_online(online_tx: &[String], online_rx: &[String], id: &str) -> bool {
+    online_tx.iter().any(|node| node == id) || online_rx.iter().any(|node| node == id)
+}
+
+fn active_feed_names(
+    zones: &[Zone],
+    flags: &HashMap<String, FeedFlags>,
+    online_tx: &[String],
+    online_rx: &[String],
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for zone in zones {
+        if !zone.active {
+            continue;
+        }
+        for src in zone.zone_sources() {
+            let ZoneSource::Feed { kind, node_id } = src else { continue };
+            if !feed_flag(flags, &node_id, kind) || !node_online(online_tx, online_rx, &node_id) {
+                continue;
+            }
+            names.push(crate::mix::feed_port_name(kind, &node_id, &zone.id));
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn stream_ports(reg: &Registry, snap: &FeedSnap) -> HashMap<String, u16> {
+    let online_tx = reg.online_tx();
+    let online_rx = reg.online_rx();
+    let names = active_feed_names(&snap.zones, &snap.flags, &online_tx, &online_rx);
+    mix_ports_for(reg, &online_tx, &names)
+}
+
+fn feed_monitor(kind: FeedKind, zone_id: &str) -> String {
+    match kind {
+        FeedKind::Spotify => crate::soloist::monitor_name(zone_id),
+        FeedKind::Sendspin => crate::sendspin::monitor_name(zone_id),
+        FeedKind::Virtual => crate::virtual_output::monitor_name(zone_id),
+    }
+}
+
+fn listener_endpoints(
+    zone: &Zone,
+    owners: &HashMap<String, String>,
+    reg: &Registry,
+    port: u16,
+) -> Vec<Endpoint> {
+    let mut endpoints = Vec::new();
+    if !zone.active {
+        return endpoints;
+    }
+    for member in &zone.members {
+        if owners.get(member.as_str()) != Some(&zone.id) {
+            continue;
+        }
+        if let Some(mut ep) = reg.rx_endpoint(member) {
+            ep.port = port;
+            endpoints.push(ep);
+        }
+    }
+    endpoints.sort_by(|a, b| a.ip.cmp(&b.ip).then_with(|| a.port.cmp(&b.port)));
+    endpoints.dedup_by(|a, b| a.ip == b.ip && a.port == b.port);
+    endpoints
+}
+
+fn feeds_cmd(snap: &FeedSnap, reg: &Registry, ports: &HashMap<String, u16>, node_id: &str) -> CtlMsg {
+    let mut feeds = Vec::new();
+    for zone in &snap.zones {
+        for src in zone.zone_sources() {
+            let ZoneSource::Feed { kind, node_id: host } = src else { continue };
+            if host != node_id || !feed_flag(&snap.flags, node_id, kind) {
+                continue;
+            }
+            let name = crate::mix::feed_port_name(kind, node_id, &zone.id);
+            let endpoints = match ports.get(&name) {
+                Some(&port) if zone.active => listener_endpoints(zone, &snap.owners, reg, port),
+                _ => Vec::new(),
+            };
+            feeds.push(FeedSend {
+                zone_id: zone.id.clone(),
+                kind,
+                monitor: feed_monitor(kind, &zone.id),
+                endpoints,
+            });
+        }
+    }
+    feeds.sort_by(|a, b| a.zone_id.cmp(&b.zone_id).then(a.kind.as_str().cmp(b.kind.as_str())));
+    CtlMsg::SetFeeds { feeds }
 }
 
 fn push_capture_target(reg: &mut Registry, node_id: &str, prefs: &[crate::inputs::InputPref]) {
@@ -2395,12 +2701,12 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
             stt.zones.iter().find(|z| &z.id == zid).cloned()
         });
         let prefs = stt.nodes.get(&node_id).map(|n| n.outputs.clone()).unwrap_or_default();
-        (zone, prefs)
+        (zone, prefs, FeedSnap::from_state(stt))
     };
     if let Some(zone) = owned.0 {
         let views = crate::inputs::merge_outputs(&reported_out, &owned.1);
         let reg = st.reg.lock().await;
-        let ports = mix_ports_for(&reg, &reg.online_tx());
+        let ports = stream_ports(&reg, &owned.2);
         let cmd = zone_channel_cmd(&zone, &node_id, &ports, &views);
         if let Err(e) = reg.send_cmd(&node_id, cmd) {
             tracing::info!(node = name, %node_id, "SetChannelMap зоны на hello не доставлен: {e}");
@@ -2408,7 +2714,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     }
 
     if supports_virtual_output {
-        let (enabled, prefs, zones_cmd, soloist, sendspin) = {
+        let (enabled, prefs, zones_cmd, soloist, sendspin, snap) = {
             let store = st.store.lock().await;
             let state = store.state();
             let meta = state.nodes.get(&node_id);
@@ -2418,6 +2724,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                 virtual_zones_cmd(state, &node_id),
                 soloist_cmd(state, &node_id),
                 sendspin_cmd(state, &node_id),
+                FeedSnap::from_state(state),
             )
         };
         let mut reg = st.reg.lock().await;
@@ -2426,6 +2733,8 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
         let _ = reg.send_cmd(&node_id, zones_cmd);
         let _ = reg.send_cmd(&node_id, soloist);
         let _ = reg.send_cmd(&node_id, sendspin);
+        let ports = stream_ports(&reg, &snap);
+        let _ = reg.send_cmd(&node_id, feeds_cmd(&snap, &reg, &ports, &node_id));
     } else if roles.contains(&Role::Tx) {
         let prefs = {
             let store = st.store.lock().await;

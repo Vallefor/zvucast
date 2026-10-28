@@ -1569,6 +1569,10 @@ fn gst_domain(
                     soloist.sync(soloist_key.as_deref(), &zones);
                 }
             }
+            Ok(CtlMsg::SetFeeds { .. }) => {
+                // Отдельные RTP-хвосты видов собирает следующая задача.
+                tracing::debug!("SetFeeds: поток вида ещё не поднят");
+            }
             Ok(CtlMsg::SetSendspin { zones }) => {
                 if tx_half.is_none() {
                     tracing::debug!("SetSendspin: нет tx — игнорируем");

@@ -381,7 +381,8 @@ pub struct ZoneGroup {
     pub members: Vec<String>,
 }
 
-/// Активные зоны, сгруппированные по передатчику. Внутри — по `zone_id`.
+/// Активные зоны, сгруппированные по передатчику-микрофону (`source_ids`).
+/// Вид сюда не входит: у него свой порт и `SetFeeds`. Внутри — по `zone_id`.
 /// Колонка в нескольких зонах попадает только к владельцу (поздний `seq`).
 pub fn zone_groups(state: &State) -> HashMap<String, Vec<ZoneGroup>> {
     let owners = owner_ids(state);

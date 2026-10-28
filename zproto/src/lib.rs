@@ -221,6 +221,16 @@ pub mod proto {
         pub name: String,
     }
 
+    /// Поток одного вида в одну зону. Порт в `endpoints` — слот этого вида,
+    /// не порт микрофона. Пустой `SetFeeds` снимает все такие потоки.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct FeedSend {
+        pub zone_id: String,
+        pub kind: FeedKind,
+        pub monitor: String,
+        pub endpoints: Vec<Endpoint>,
+    }
+
     /// Секрет в сообщениях контроллера. В Debug не попадает.
     #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(transparent)]
@@ -280,6 +290,8 @@ pub mod proto {
         /// Sendspin-колонка на каждую зону передатчика. Пустой список гасит всех.
         /// Ключа нет: зоны и есть колонки.
         SetSendspin { zones: Vec<VirtualZone> },
+        /// Потоки видов хозяина. Пустой список снимает все. Одна запись — одна зона одного вида.
+        SetFeeds { feeds: Vec<FeedSend> },
         /// Создать или убрать виртуальный выход zvucast.
         SetVirtualOutput { enabled: bool },
         /// Куда смотрит захват. None — голова без цели (на PipeWire это тишина).
@@ -608,6 +620,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<CtlMsg>(r#"{"type":"SetSendspin","zones":[]}"#).unwrap(),
             CtlMsg::SetSendspin { zones: vec![] }
+        );
+        let feeds = CtlMsg::SetFeeds {
+            feeds: vec![FeedSend {
+                zone_id: "z1".into(),
+                kind: FeedKind::Spotify,
+                monitor: "zvucast-spotify-z1-monitor".into(),
+                endpoints: vec![Endpoint { ip: "192.0.2.36".into(), port: 5010 }],
+            }],
+        };
+        let feeds_json = serde_json::to_string(&feeds).unwrap();
+        assert!(feeds_json.contains("\"type\":\"SetFeeds\""));
+        assert!(feeds_json.contains("\"kind\":\"spotify\""));
+        assert_eq!(serde_json::from_str::<CtlMsg>(&feeds_json).unwrap(), feeds);
+        assert_eq!(
+            serde_json::from_str::<CtlMsg>(r#"{"type":"SetFeeds","feeds":[]}"#).unwrap(),
+            CtlMsg::SetFeeds { feeds: vec![] }
         );
         // совместимость: старые варианты не сломаны
         assert_eq!(serde_json::from_str::<CtlMsg>("{\"type\":\"Start\"}").unwrap(), CtlMsg::Start);
