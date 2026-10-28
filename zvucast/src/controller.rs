@@ -1535,7 +1535,7 @@ async fn patch_zone(
                     if !z.members.iter().any(|m| m == &member) {
                         continue;
                     }
-                    let known = z.source_ids();
+                    let known: Vec<String> = z.zone_sources().iter().map(ZoneSource::key).collect();
                     let slot = z.source_maps.entry(member).or_default();
                     for (source, map) in by_source {
                         if known.iter().any(|id| id == &source) {

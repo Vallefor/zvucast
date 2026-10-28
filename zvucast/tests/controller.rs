@@ -2286,6 +2286,45 @@ async fn spotify_feeds_stay_in_their_zones() {
     );
 }
 
+/// PATCH `source_maps` хранит ключ вида `spotify:{узел}` и ключ микрофона.
+/// Ключ вида, которого нет среди источников зоны, не остаётся.
+#[tokio::test]
+async fn feed_source_map_is_stored_under_the_source_key() {
+    let path = temp_state_path("feed-source-map");
+    let port = serve(AppState::with_state(&path)).await;
+    let pc = MockAgent::connect_as_from(port, "pc", Role::Tx, "127.0.0.2").await;
+    let s1 = MockAgent::connect_as_from(port, "s1", Role::Rx, "127.0.0.3").await;
+    wait_node(port, "pc").await;
+    wait_node(port, "s1").await;
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":true}"#).await;
+    assert_eq!(status, 200);
+    let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let id = zone["id"].as_str().unwrap();
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{id}"),
+        r#"{"sources":["pc",{"kind":"spotify","node_id":"pc"}],"source_maps":{"s1":{"pc":{"out_l":"r","out_r":null},"spotify:pc":{"out_l":"l","out_r":"l"},"sendspin:pc":{"out_l":"r","out_r":"r"}}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["sources"], serde_json::json!(["pc"]));
+    assert_eq!(
+        view["source_maps"]["s1"],
+        serde_json::json!({
+            "pc": {"out_l": "r", "out_r": null},
+            "spotify:pc": {"out_l": "l", "out_r": "l"}
+        })
+    );
+    assert!(view["source_maps"]["s1"].get("sendspin:pc").is_none());
+
+    drop((pc, s1));
+}
+
 #[tokio::test]
 async fn soloist_key_stays_on_the_transmitter_that_has_it() {
     let path = temp_state_path("soloist-key");
