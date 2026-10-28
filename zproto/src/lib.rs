@@ -185,6 +185,25 @@ pub mod proto {
         pub port: u16,
     }
 
+    /// Вид на узле-хозяине. Микрофон сюда не входит.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum FeedKind {
+        Spotify,
+        Sendspin,
+        Virtual,
+    }
+
+    impl FeedKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                FeedKind::Spotify => "spotify",
+                FeedKind::Sendspin => "sendspin",
+                FeedKind::Virtual => "virtual",
+            }
+        }
+    }
+
     /// Одна зона передатчика: свой RTP, свои слушатели.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ZoneEndpoints {
@@ -687,5 +706,14 @@ mod tests {
         };
         let wire = serde_json::to_string(&set).unwrap();
         assert_eq!(serde_json::from_str::<CtlMsg>(&wire).unwrap(), set);
+    }
+
+    #[test]
+    fn feed_kind_spotify_serializes_as_spotify() {
+        assert_eq!(serde_json::to_string(&FeedKind::Spotify).unwrap(), "\"spotify\"");
+        assert_eq!(serde_json::from_str::<FeedKind>("\"spotify\"").unwrap(), FeedKind::Spotify);
+        assert_eq!(FeedKind::Spotify.as_str(), "spotify");
+        assert_eq!(FeedKind::Sendspin.as_str(), "sendspin");
+        assert_eq!(FeedKind::Virtual.as_str(), "virtual");
     }
 }
