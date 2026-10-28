@@ -544,6 +544,7 @@ mod tests {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         }
     }
 

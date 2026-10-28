@@ -518,8 +518,7 @@ struct Transport {
     dscp: u8,
 }
 
-/// Источник зоны после оверлея. Mute и монитор, который уже открыла голова,
-/// дают None: второй pw-record того же узла не нужен.
+/// Источник, который таблица помнит. В RTP микрофона не копируется.
 fn effective_zone_source(
     zone_id: &str,
     linked: bool,
@@ -536,27 +535,15 @@ fn effective_zone_source(
     }
 }
 
+/// Хвост микрофона. Монитор вида в `zone.source` не пишется.
 fn overlay_sources(
     zones: &[ZoneEndpoints],
-    linked: &BTreeSet<String>,
-    table: &crate::sendspin::ZoneTable,
-    muted: &BTreeSet<String>,
-    capture_head: Option<&str>,
+    _linked: &BTreeSet<String>,
+    _table: &crate::sendspin::ZoneTable,
+    _muted: &BTreeSet<String>,
+    _capture_head: Option<&str>,
 ) -> Vec<ZoneEndpoints> {
-    zones
-        .iter()
-        .cloned()
-        .map(|mut zone| {
-            zone.source = effective_zone_source(
-                &zone.zone_id,
-                linked.contains(&zone.zone_id),
-                table,
-                muted,
-                capture_head,
-            );
-            zone
-        })
-        .collect()
+    zones.to_vec()
 }
 
 fn zone_sources(
@@ -709,7 +696,8 @@ fn handle_set_playback_target(
     SetCaptureTargetOutcome::Changed
 }
 
-/// Mute меняет только `zone.source`. Тот же набор — no-op.
+/// Mute помнит набор. Монитор вида в `zone.source` не пишется.
+/// Тот же набор — no-op.
 /// PipeWire: живой tx микширует на месте, RTP остаётся. Нет runner
 /// или монитор не встал — дроп и вооружение гейта.
 /// ALSA: микшера зоны нет, набор пишется, runner не рвём, RTP на месте.
@@ -771,7 +759,7 @@ fn handle_set_muted_zones(
         None => false,
     };
     if mixed {
-        tracing::info!("tx: монитор зоны в миксе с line-in, RTP на месте");
+        tracing::info!("tx: RTP микрофона на месте");
         SetCaptureTargetOutcome::Changed
     } else {
         tracing::info!("tx: заглушённые зоны изменились, пересборка");
@@ -1199,6 +1187,7 @@ fn gst_domain(
 
     // Транспортное состояние (unicast-эндпоинты + dscp) — только tx-половина.
     let transport = RefCell::new(Transport::default());
+    let feeds_cell: RefCell<Vec<zproto::FeedSend>> = RefCell::new(Vec::new());
     let capture_target: RefCell<Option<String>> = RefCell::new(None);
     let playback_target: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let muted_zones: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
@@ -1256,7 +1245,13 @@ fn gst_domain(
                     };
                     let zones: &[ZoneEndpoints] = if silent { &[] } else { &t.zones };
                     let mut bind = pipeline_bind(&link);
-                    Runner::new_tx(&cfg.pipeline, &device, zones, t.dscp, bind.as_mut())?
+                    let mut runner =
+                        Runner::new_tx(&cfg.pipeline, &device, zones, t.dscp, bind.as_mut())?;
+                    if !silent {
+                        let wanted = feeds_cell.borrow().clone();
+                        runner.reconcile_feeds(&wanted, t.dscp, bind.as_mut())?;
+                    }
+                    runner
                 }
                 // Тот же бэкенд, что у rx: PipeWire не отдаёт ALSA захвату от root.
                 // Строка ALSA целью не открывается: голова остаётся тишиной.
@@ -1295,13 +1290,15 @@ fn gst_domain(
                             &muted_now,
                             target.as_deref(),
                         );
-                        let runner = Runner::new_tx_pw(
+                        let mut runner = Runner::new_tx_pw(
                             &cfg.pipeline,
                             &zones,
                             t.dscp,
                             target.as_deref(),
                             bind.as_mut(),
                         )?;
+                        let wanted = feeds_cell.borrow().clone();
+                        runner.reconcile_feeds(&wanted, t.dscp, bind.as_mut())?;
                         *built_sources.borrow_mut() = sources;
                         runner
                     }
@@ -1569,9 +1566,32 @@ fn gst_domain(
                     soloist.sync(soloist_key.as_deref(), &zones);
                 }
             }
-            Ok(CtlMsg::SetFeeds { .. }) => {
-                // Отдельные RTP-хвосты видов собирает следующая задача.
-                tracing::debug!("SetFeeds: поток вида ещё не поднят");
+            Ok(CtlMsg::SetFeeds { feeds: next }) => {
+                if tx_half.is_none() {
+                    tracing::debug!("SetFeeds: нет tx — игнорируем");
+                } else if feeds_cell.borrow().as_slice() == next.as_slice() {
+                    tracing::debug!("SetFeeds: набор не изменился");
+                } else {
+                    *feeds_cell.borrow_mut() = next;
+                    let link = link_cell.borrow().clone();
+                    if link.is_none() {
+                        tracing::info!("tx: хвосты видов запомнены, линка нет");
+                    } else if let Some(h) = tx_half.as_mut() {
+                        if let Some(runner) = h.runner.as_mut() {
+                            let dscp = transport.borrow().dscp;
+                            let wanted = feeds_cell.borrow().clone();
+                            let mut bind = pipeline_bind(&link);
+                            match runner.reconcile_feeds(&wanted, dscp, bind.as_mut()) {
+                                Ok(()) => tracing::info!(
+                                    "tx: хвосты видов обновлены, RTP микрофона на месте"
+                                ),
+                                Err(e) => tracing::warn!("tx: хвост вида не встал: {e:#}"),
+                            }
+                        } else {
+                            tracing::info!("tx: хвосты видов встанут при сборке");
+                        }
+                    }
+                }
             }
             Ok(CtlMsg::SetSendspin { zones }) => {
                 if tx_half.is_none() {
@@ -1671,10 +1691,7 @@ fn gst_domain(
         }
 
         while let Ok(crate::sendspin::Note::Stream(zone_id, wire)) = notes_rx.try_recv() {
-            let effect = table.borrow_mut().on_wire(&zone_id, wire);
-            if effect.deactivate {
-                soloist.request_deactivate(&zone_id);
-            }
+            let _effect = table.borrow_mut().on_wire(&zone_id, wire);
         }
 
         let poll_links = cfg.playback_backend == crate::config::Backend::PipeWire
@@ -1699,19 +1716,6 @@ fn gst_domain(
                         let _ = external_tx
                             .try_send(crate::sendspin::External::Exit(effect.zone_id.clone()));
                     }
-                }
-                let deactivate: Vec<String> = {
-                    let t = table.borrow();
-                    t.zone_ids()
-                        .into_iter()
-                        .filter(|zone_id| {
-                            t.holder(zone_id) == crate::sendspin::Holder::Sendspin
-                                && active.contains(zone_id)
-                        })
-                        .collect()
-                };
-                for zone_id in deactivate {
-                    soloist.request_deactivate(&zone_id);
                 }
 
                 let source_map_changed = {
@@ -1763,7 +1767,7 @@ fn gst_domain(
                         None => false,
                     };
                     if mixed {
-                        tracing::info!("tx: монитор зоны в миксе с line-in, RTP на месте");
+                        tracing::info!("tx: RTP микрофона на месте");
                     } else {
                         tracing::info!("tx: источник зоны сменился, пересборка");
                         drop_runner(&mut h.runner);
@@ -1894,6 +1898,11 @@ fn gst_domain(
                 capture_volume: vols.capture,
                 playback_volume: vols.playback,
                 device_volumes: vols.devices.clone(),
+                feeds: tx_half
+                    .as_ref()
+                    .and_then(|h| h.runner.as_ref())
+                    .map(|runner| runner.feed_levels(&feeds_cell.borrow()))
+                    .unwrap_or_default(),
             });
         }
     }
@@ -2035,6 +2044,7 @@ pub(crate) fn initial_telemetry(roles: &[Role]) -> Telemetry {
         capture_volume: None,
         playback_volume: None,
         device_volumes: Vec::new(),
+        feeds: Vec::new(),
     }
 }
 
@@ -2045,7 +2055,7 @@ mod tests {
     use zproto::{ChanSel, Endpoint};
 
     #[test]
-    fn overlay_reads_the_zone_owner() {
+    fn overlay_does_not_write_the_feed_into_the_microphone() {
         let zones = vec![zproto::ZoneEndpoints {
             zone_id: "hall".into(),
             endpoints: vec![],
@@ -2059,52 +2069,116 @@ mod tests {
         table.on_wire("hall", crate::sendspin::Wire::StreamStart);
         let linked = BTreeSet::new();
         let out = overlay_sources(&zones, &linked, &table, &BTreeSet::new(), None);
+        assert_eq!(out[0].source, None, "Sendspin не пишется в RTP микрофона");
+
+        let preset = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![],
+            source: Some("line".into()),
+        }];
+        let muted = BTreeSet::from(["hall".to_string()]);
+        let out = overlay_sources(
+            &preset,
+            &BTreeSet::from(["hall".to_string()]),
+            &table,
+            &muted,
+            Some("zvucast-hall-monitor"),
+        );
         assert_eq!(
             out[0].source.as_deref(),
-            Some("zvucast-sendspin-hall-monitor")
+            Some("line"),
+            "оверлей не затирает source микрофона"
         );
     }
 
     #[test]
-    fn overlay_drops_muted_zone_and_the_head_monitor() {
+    fn feed_tail_stays_quiet_and_plays_only_when_built() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
         let zones = vec![zproto::ZoneEndpoints {
             zone_id: "hall".into(),
             endpoints: vec![],
-            source: Some("zvucast-hall-monitor".into()),
+            source: None,
         }];
-        let linked = BTreeSet::from(["hall".to_string()]);
-        let table = crate::sendspin::ZoneTable::new();
-        let muted = BTreeSet::from(["hall".to_string()]);
-        let out = overlay_sources(&zones, &linked, &table, &muted, None);
-        assert_eq!(out[0].source, None, "mute hall гасит монитор зоны");
-
-        let out = overlay_sources(
+        let pipe = crate::pipeline::build_tx_unicast_pw(
+            &cfg,
             &zones,
-            &linked,
-            &table,
-            &BTreeSet::new(),
-            Some("zvucast-hall-monitor"),
-        );
-        assert_eq!(out[0].source, None, "голова уже открыла этот монитор");
-
-        let mut foreign = crate::sendspin::ZoneTable::new();
-        foreign.sync(&[zproto::VirtualZone {
+            0,
+            Some("mic"),
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let feeds = vec![zproto::FeedSend {
             zone_id: "hall".into(),
-            name: "Зал".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![Endpoint {
+                ip: "192.0.2.10".into(),
+                port: 5010,
+            }],
+        }];
+        crate::pipeline::reconcile_feed_tails(&pipe, &feeds, 0, &mut crate::pipeline::LoopbackUdp)
+            .unwrap();
+        let runner = Runner::from_pipeline_for_test(pipe);
+        let missing = runner.feed_levels(&[zproto::FeedSend {
+            zone_id: "bed".into(),
+            kind: zproto::FeedKind::Sendspin,
+            monitor: "absent".into(),
+            endpoints: vec![],
         }]);
-        foreign.on_wire("hall", crate::sendspin::Wire::StreamStart);
-        let out = overlay_sources(
-            &zones,
-            &BTreeSet::new(),
-            &foreign,
-            &BTreeSet::new(),
-            Some("alsa_input.usb-mic"),
-        );
-        assert_eq!(
-            out[0].source.as_deref(),
-            Some("zvucast-sendspin-hall-monitor"),
-            "чужой источник при голове line-in остаётся"
-        );
+        assert!(missing.is_empty(), "несобранной ветки в feeds нет");
+        let before = runner.feed_levels(&feeds);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].zone_id, "hall");
+        assert_eq!(before[0].kind, zproto::FeedKind::Spotify);
+        assert_eq!(before[0].state, PipelineState::Stopped);
+        assert_eq!(before[0].rms_l, 0.0);
+        assert_eq!(before[0].rms_r, 0.0);
+        runner.start().unwrap();
+        let _ = runner.pipeline().state(gstreamer::ClockTime::from_seconds(2));
+        let after = runner.feed_levels(&feeds);
+        assert_eq!(after[0].state, PipelineState::Playing, "ветка собрана и играет");
+        assert_eq!(after[0].rms_l, 0.0, "нет сигнала — rms остаётся 0");
+        assert_eq!(after[0].rms_r, 0.0);
+        let (bus_tx, _bus_rx) = std::sync::mpsc::channel();
+        runner.spawn_bus_watch(bus_tx);
+        let feed_src = runner
+            .pipeline()
+            .by_name("feed-spotify-hall")
+            .unwrap()
+            .dynamic_cast::<gstreamer_app::AppSrc>()
+            .unwrap();
+        let frame = {
+            let mut bytes = vec![0u8; 1920];
+            for chunk in bytes.chunks_exact_mut(4) {
+                chunk[..2].copy_from_slice(&16_000i16.to_le_bytes());
+                chunk[2..].copy_from_slice(&16_000i16.to_le_bytes());
+            }
+            bytes
+        };
+        for _ in 0..20 {
+            let mut buf = gstreamer::Buffer::from_slice(frame.clone());
+            {
+                let b = buf.get_mut().unwrap();
+                b.set_duration(gstreamer::ClockTime::from_mseconds(10));
+            }
+            feed_src.push_buffer(buf).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut feed_rms = 0.0;
+        while std::time::Instant::now() < deadline {
+            feed_rms = runner.feed_levels(&feeds)[0].rms_l;
+            if feed_rms != 0.0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_ne!(feed_rms, 0.0, "сигнал фида виден на его level");
+        let mic = runner.stats();
+        assert_eq!(mic.rms_l, 0.0, "lev микрофона не берёт уровень фида");
+        assert_eq!(mic.rms_r, 0.0);
+        runner.stop();
     }
 
     #[test]

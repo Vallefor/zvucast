@@ -79,6 +79,19 @@ pub mod proto {
         /// Старый агент поле не шлёт.
         #[serde(default)]
         pub device_volumes: Vec<DeviceVolume>,
+        /// Уровни живых хвостов видов. Старый JSON без поля — пустой вектор.
+        #[serde(default)]
+        pub feeds: Vec<FeedLevel>,
+    }
+
+    /// Уровень одного хвоста вида. Нет сигнала — `rms_l` и `rms_r` остаются 0.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct FeedLevel {
+        pub zone_id: String,
+        pub kind: FeedKind,
+        pub state: PipelineState,
+        pub rms_l: f64,
+        pub rms_r: f64,
     }
 
     /// Кубическая громкость одного устройства, 0.0..=1.5.
@@ -437,6 +450,7 @@ mod tests {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"rx\":null"), "отсутствующая роль — null: {s}");
@@ -454,6 +468,7 @@ mod tests {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"queue_ms\":5"), "поля rx на месте: {s}");
@@ -711,6 +726,36 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_without_feeds_defaults_to_empty() {
+        let raw = r#"{"type":"Telemetry","tx":null,"rx":null,"ptp_offset_ns":0,"uptime_s":1}"#;
+        let AgentMsg::Telemetry(t) = serde_json::from_str(raw).unwrap() else {
+            panic!("не телеметрия");
+        };
+        assert!(t.feeds.is_empty(), "старый JSON без feeds — пустой вектор");
+
+        let with = AgentMsg::Telemetry(Telemetry {
+            tx: None,
+            rx: None,
+            ptp_offset_ns: 0,
+            uptime_s: 1,
+            capture_volume: None,
+            playback_volume: None,
+            device_volumes: Vec::new(),
+            feeds: vec![FeedLevel {
+                zone_id: "hall".into(),
+                kind: FeedKind::Sendspin,
+                state: PipelineState::Playing,
+                rms_l: 0.0,
+                rms_r: 0.0,
+            }],
+        });
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(s.contains("\"feeds\""));
+        assert!(s.contains("\"kind\":\"sendspin\""));
+        assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), with);
+    }
+
+    #[test]
     fn volume_message_roundtrip() {
         let m = AgentMsg::Telemetry(Telemetry {
             tx: None,
@@ -720,6 +765,7 @@ mod tests {
             capture_volume: Some(1.0),
             playback_volume: Some(0.4),
             device_volumes: vec![DeviceVolume { device: "alsa_output.hifi".into(), volume: 0.4, card: String::new(), class: String::new() }],
+            feeds: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"capture_volume\":1.0"), "{s}");

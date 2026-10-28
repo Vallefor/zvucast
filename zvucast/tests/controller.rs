@@ -253,6 +253,7 @@ impl MockAgent {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         self.ws
             .send(Message::Text(serde_json::to_string(&t).unwrap()))
@@ -269,6 +270,7 @@ impl MockAgent {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }
@@ -282,6 +284,7 @@ impl MockAgent {
             capture_volume: Some(capture),
             playback_volume: Some(playback),
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         self.ws.send(Message::Text(serde_json::to_string(&t).unwrap())).await.unwrap();
     }

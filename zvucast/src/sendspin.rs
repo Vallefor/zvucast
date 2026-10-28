@@ -173,11 +173,10 @@ impl ZoneTable {
         };
         match wire {
             Wire::StreamStart => {
-                let deactivate = entry.spotify_active;
                 entry.holder = Holder::Sendspin;
                 ZoneEffect {
                     zone_id: zone_id.to_string(),
-                    deactivate,
+                    deactivate: false,
                     enter_external: false,
                     exit_external: false,
                 }
@@ -1378,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_start_while_spotify_is_active_takes_the_zone_and_asks_to_deactivate() {
+    fn stream_start_while_spotify_is_active_does_not_deactivate_spotify() {
         let mut table = ZoneTable::new();
         table.sync(&[zone("hall", "Зал"), zone("bed", "Спальня")]);
         let active = BTreeSet::from(["hall".to_string()]);
@@ -1387,8 +1386,16 @@ mod tests {
         assert_eq!(table.holder("hall"), Holder::Spotify);
 
         let step = table.on_wire("hall", Wire::StreamStart);
-        assert_eq!(step, effect("hall", true, false, false));
-        assert_eq!(table.holder("hall"), Holder::Sendspin);
+        assert!(
+            !step.deactivate,
+            "после старта флаг деактивации Spotify остаётся ложным"
+        );
+        assert_eq!(step, effect("hall", false, false, false));
+        assert_eq!(table.holder("hall"), Holder::Sendspin, "держатель может помнить Sendspin");
+        assert!(
+            !step.enter_external && !step.exit_external,
+            "наружу это не команда Spotify"
+        );
         assert_eq!(
             table.source("hall", true).as_deref(),
             Some("zvucast-sendspin-hall-monitor")

@@ -1,4 +1,5 @@
 use gstreamer as gst;
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::str::FromStr;
@@ -635,8 +636,7 @@ pub fn build_tx_unicast_pw(
     let chain = [&src, &hold, &conv, &res, &caps_rate, &lev];
     pipe.add_many(chain)?;
     gst::Element::link_many(chain)?;
-    // Монитор зоны мешается с line-in в уже существующий RTP. Новый
-    // пейлоадер сбросил бы метки, и колонка потеряла бы остальные источники.
+    // Хвост зоны — только голова захвата. Вид идёт своим хвостом, не в этот микшер.
     attach_pw_zone_tails(&pipe, &lev, zones, dscp, bind)?;
     Ok(pipe)
 }
@@ -668,8 +668,8 @@ fn element_token(zone_id: &str) -> String {
         .collect()
 }
 
-/// Каждая зона PipeWire: line-in и, если он есть, монитор → один микшер →
-/// один `rtpL16pay`. Появление монитора не создаёт второй поток.
+/// Каждая зона PipeWire: line-in → микшер → один `rtpL16pay`.
+/// Монитор вида в этот микшер не входит.
 fn attach_pw_zone_tails(
     pipe: &gst::Pipeline,
     from: &gst::Element,
@@ -717,8 +717,7 @@ fn attach_pw_zone(
         .build()?;
     pipe.add_many([&mix, &lin])?;
     tee.link(&lin)?;
-    let inputs = if zone.source.is_some() { 2.0 } else { 1.0 };
-    link_queue_to_mixer(&lin, &mix, 1.0 / inputs)?;
+    link_queue_to_mixer(&lin, &mix, 1.0)?;
 
     let pay_conv = gst::ElementFactory::make("audioconvert").build()?;
     let caps = gst::ElementFactory::make("capsfilter")
@@ -735,9 +734,6 @@ fn attach_pw_zone(
     pipe.add_many([&pay_conv, &caps, &pay])?;
     gst::Element::link_many([&mix, &pay_conv, &caps, &pay])?;
     attach_pay_tail(pipe, &pay, &zone.endpoints, dscp, bind)?;
-    if zone.source.is_some() {
-        add_monitor_branch(pipe, &mix, &token)?;
-    }
     Ok(())
 }
 
@@ -750,59 +746,6 @@ fn monitor_queue(name: String) -> Result<gst::Element> {
         .property("max-size-bytes", 0u32)
         .property("max-size-time", 0u64)
         .build()?)
-}
-
-/// Ветка монитора в живой микшер зоны. Пейлоадер и line-in не трогает.
-fn add_monitor_branch(pipe: &gst::Pipeline, mix: &gst::Element, token: &str) -> Result<()> {
-    let src = live_appsrc(&format!("cap-{token}"))?;
-    let hold = monitor_queue(format!("mhold-{token}"))?;
-    let conv = gst::ElementFactory::make("audioconvert")
-        .property("name", format!("mconv-{token}"))
-        .build()?;
-    let res = gst::ElementFactory::make("audioresample")
-        .property("name", format!("mres-{token}"))
-        .property("quality", 4i32)
-        .build()?;
-    let caps = gst::ElementFactory::make("capsfilter")
-        .property("name", format!("mcaps-{token}"))
-        .property("caps", gst::Caps::from_str("audio/x-raw,format=F32LE,rate=48000,channels=2")?)
-        .build()?;
-    let tee = gst::ElementFactory::make("tee")
-        .property("name", format!("vtee-{token}"))
-        .build()?;
-    let head = [&src, &hold, &conv, &res, &caps, &tee];
-    pipe.add_many(head)?;
-    gst::Element::link_many(head)?;
-
-    let mq = monitor_queue(format!("mq-{token}"))?;
-    pipe.add(&mq)?;
-    tee.link(&mq)?;
-    link_queue_to_mixer(&mq, mix, 0.5)?;
-
-    let mlq = monitor_queue(format!("mlq-{token}"))?;
-    let lev = gst::ElementFactory::make("level")
-        .property("name", format!("lev-{token}"))
-        .build()?;
-    let sink = gst::ElementFactory::make("fakesink")
-        .property("name", format!("mlsink-{token}"))
-        .property("sync", false)
-        .property("async", false)
-        .build()?;
-    let level = [&mlq, &lev, &sink];
-    pipe.add_many(level)?;
-    tee.link(&mlq)?;
-    gst::Element::link_many(level)?;
-
-    if matches!(pipe.current_state(), gst::State::Playing | gst::State::Paused) {
-        for el in level.iter().rev() {
-            el.sync_state_with_parent()?;
-        }
-        mq.sync_state_with_parent()?;
-        for el in head.iter().rev() {
-            el.sync_state_with_parent()?;
-        }
-    }
-    Ok(())
 }
 
 fn remove_monitor_branch(pipe: &gst::Pipeline, mix: &gst::Element, token: &str) -> Result<()> {
@@ -842,8 +785,9 @@ fn remove_monitor_branch(pipe: &gst::Pipeline, mix: &gst::Element, token: &str) 
     Ok(())
 }
 
-/// Добавляет или снимает монитор зоны, не трогая пейлоадер и line-in.
-/// Другой набор зон — ошибка: это уже смена маршрута, её собирают заново.
+/// Снимает ветку монитора из микшера микрофона, если она ещё стоит.
+/// Новую не добавляет: вид играет своим хвостом. Другой набор зон —
+/// ошибка, это уже смена маршрута.
 pub fn reconcile_pw_monitors(pipe: &gst::Pipeline, zones: &[zproto::ZoneEndpoints]) -> Result<()> {
     let mut have = std::collections::BTreeSet::new();
     for child in pipe.children() {
@@ -860,22 +804,233 @@ pub fn reconcile_pw_monitors(pipe: &gst::Pipeline, zones: &[zproto::ZoneEndpoint
         let mix = pipe
             .by_name(&format!("zmix-{token}"))
             .with_context(|| format!("нет микшера зоны {token}"))?;
-        let present = pipe.by_name(&format!("cap-{token}")).is_some();
-        match (zone.source.is_some(), present) {
-            (true, false) => {
-                add_monitor_branch(pipe, &mix, &token)?;
-                if let Some(lin) = pipe.by_name(&format!("lin-{token}")) {
-                    set_queue_volume(&lin, 0.5);
-                }
+        if pipe.by_name(&format!("cap-{token}")).is_some() {
+            remove_monitor_branch(pipe, &mix, &token)?;
+            if let Some(lin) = pipe.by_name(&format!("lin-{token}")) {
+                set_queue_volume(&lin, 1.0);
             }
-            (false, true) => {
-                remove_monitor_branch(pipe, &mix, &token)?;
-                if let Some(lin) = pipe.by_name(&format!("lin-{token}")) {
-                    set_queue_volume(&lin, 1.0);
-                }
-            }
-            _ => {}
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn feed_appsrc_name(kind: &str, zone_id: &str) -> String {
+    format!("feed-{kind}-{}", element_token(zone_id))
+}
+
+pub(crate) fn feed_level_name(kind: &str, zone_id: &str) -> String {
+    format!("lev-feed-{kind}-{}", element_token(zone_id))
+}
+
+fn feed_tag(kind: &str, zone_id: &str) -> String {
+    format!("{kind}-{}", element_token(zone_id))
+}
+
+/// Хвост каждого вида: appsrc монитора, свой level, свой rtpL16pay, свои udpsink.
+/// Голова захвата в этот хвост не входит. Пустой список снимает хвосты.
+/// Повторный вызов собирает набор заново.
+pub fn reconcile_feed_tails(
+    pipe: &gst::Pipeline,
+    feeds: &[zproto::FeedSend],
+    dscp: u8,
+    bind: &mut dyn LocalUdp,
+) -> Result<()> {
+    for name in feed_root_names(pipe) {
+        remove_downstream(pipe, &name)?;
+    }
+    let mut seen = BTreeSet::new();
+    for feed in feeds {
+        let name = feed_appsrc_name(feed.kind.as_str(), &feed.zone_id);
+        if !seen.insert(name) {
+            continue;
+        }
+        attach_feed_tail(pipe, feed, dscp, bind)?;
+    }
+    Ok(())
+}
+
+fn feed_root_names(pipe: &gst::Pipeline) -> Vec<String> {
+    let mut names = Vec::new();
+    for child in pipe.children() {
+        let name = child.name().to_string();
+        let appsrc = child
+            .factory()
+            .is_some_and(|factory| factory.name() == "appsrc");
+        if appsrc && name.starts_with("feed-") {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn attach_feed_tail(
+    pipe: &gst::Pipeline,
+    feed: &zproto::FeedSend,
+    dscp: u8,
+    bind: &mut dyn LocalUdp,
+) -> Result<()> {
+    let kind = feed.kind.as_str();
+    let tag = feed_tag(kind, &feed.zone_id);
+    let src = live_appsrc(&feed_appsrc_name(kind, &feed.zone_id))?;
+    let hold = monitor_queue(format!("fhold-{tag}"))?;
+    let conv = gst::ElementFactory::make("audioconvert")
+        .property("name", format!("fconv-{tag}"))
+        .build()?;
+    let res = gst::ElementFactory::make("audioresample")
+        .property("name", format!("fres-{tag}"))
+        .property("quality", 4i32)
+        .build()?;
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property("name", format!("fcaps-{tag}"))
+        .property(
+            "caps",
+            gst::Caps::from_str("audio/x-raw,format=F32LE,rate=48000,channels=2")?,
+        )
+        .build()?;
+    let tee = gst::ElementFactory::make("tee")
+        .property("name", format!("fmtee-{tag}"))
+        .build()?;
+    let chain = [&src, &hold, &conv, &res, &caps, &tee];
+    pipe.add_many(chain)?;
+    gst::Element::link_many(chain)?;
+
+    // Level в стороне: сеть не должна глушить замер, и замер не должен держать RTP.
+    let mlq = monitor_queue(format!("fmlq-{tag}"))?;
+    let lev = gst::ElementFactory::make("level")
+        .property("name", feed_level_name(kind, &feed.zone_id))
+        .build()?;
+    let meter_sink = gst::ElementFactory::make("fakesink")
+        .property("name", format!("fmsink-{tag}"))
+        .property("sync", false)
+        .property("async", false)
+        .build()?;
+    pipe.add_many([&mlq, &lev, &meter_sink])?;
+    tee.link(&mlq)?;
+    gst::Element::link_many([&mlq, &lev, &meter_sink])?;
+
+    let pay_conv = gst::ElementFactory::make("audioconvert")
+        .property("name", format!("fpayconv-{tag}"))
+        .build()?;
+    let pay_caps = gst::ElementFactory::make("capsfilter")
+        .property("name", format!("fpaycaps-{tag}"))
+        .property(
+            "caps",
+            gst::Caps::from_str("audio/x-raw,format=S16BE,rate=48000,channels=2")?,
+        )
+        .build()?;
+    let pay = gst::ElementFactory::make("rtpL16pay")
+        .property("name", format!("fpay-{tag}"))
+        .property("pt", 96u32)
+        .property("mtu", 1400u32)
+        .build()?;
+    pipe.add_many([&pay_conv, &pay_caps, &pay])?;
+    tee.link(&pay_conv)?;
+    gst::Element::link_many([&pay_conv, &pay_caps, &pay])?;
+    attach_named_pay_tail(pipe, &pay, &feed.endpoints, dscp, bind, &tag)?;
+    sync_added_tail(pipe, &src)?;
+    Ok(())
+}
+
+fn attach_named_pay_tail(
+    pipe: &gst::Pipeline,
+    pay: &gst::Element,
+    endpoints: &[zproto::Endpoint],
+    dscp: u8,
+    bind: &mut dyn LocalUdp,
+    tag: &str,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("name", format!("fsink-{tag}"))
+            .property("sync", false)
+            .property("async", false)
+            .build()?;
+        pipe.add(&sink)?;
+        pay.link(&sink)?;
+        return Ok(());
+    }
+    let tee = gst::ElementFactory::make("tee")
+        .property("name", format!("ftee-{tag}"))
+        .build()?;
+    pipe.add(&tee)?;
+    pay.link(&tee)?;
+    for (index, ep) in endpoints.iter().enumerate() {
+        let sock = bind
+            .tx()
+            .with_context(|| format!("udpsink {}:{}", ep.ip, ep.port))?;
+        let gio_socket = gio_from_udp(sock)?;
+        let queue = gst::ElementFactory::make("queue")
+            .property("name", format!("fsinkq-{tag}-{index}"))
+            .build()?;
+        let sink = gst::ElementFactory::make("udpsink")
+            .property("name", format!("fsink-{tag}-{index}"))
+            .property("host", &ep.ip)
+            .property("port", ep.port as i32)
+            .property("qos-dscp", dscp as i32)
+            .property("sync", true)
+            .property("socket", &gio_socket)
+            .build()?;
+        pipe.add_many([&queue, &sink])?;
+        tee.link(&queue)?;
+        queue.link(&sink)?;
+    }
+    Ok(())
+}
+
+/// Сначала стоки, потом источник: живой пайплайн иначе не переводит хвост в Playing.
+fn sync_added_tail(pipe: &gst::Pipeline, root: &gst::Element) -> Result<()> {
+    if !matches!(pipe.current_state(), gst::State::Playing | gst::State::Paused) {
+        return Ok(());
+    }
+    for el in downstream_postorder(root) {
+        el.sync_state_with_parent()?;
+    }
+    Ok(())
+}
+
+fn downstream_postorder(root: &gst::Element) -> Vec<gst::Element> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    fn walk(el: &gst::Element, seen: &mut BTreeSet<String>, out: &mut Vec<gst::Element>) {
+        if !seen.insert(el.name().to_string()) {
+            return;
+        }
+        let kids: Vec<gst::Element> = el
+            .pads()
+            .into_iter()
+            .filter(|pad| pad.direction() == gst::PadDirection::Src)
+            .filter_map(|pad| pad.peer().and_then(|peer| peer.parent_element()))
+            .collect();
+        for kid in kids {
+            walk(&kid, seen, out);
+        }
+        out.push(el.clone());
+    }
+    walk(root, &mut seen, &mut out);
+    out
+}
+
+fn remove_downstream(pipe: &gst::Pipeline, root_name: &str) -> Result<()> {
+    let Some(root) = pipe.by_name(root_name) else {
+        return Ok(());
+    };
+    let order = downstream_postorder(&root);
+    for el in &order {
+        for pad in el.pads() {
+            let Some(peer) = pad.peer() else { continue };
+            if pad.direction() == gst::PadDirection::Src {
+                let _ = pad.unlink(&peer);
+            }
+        }
+        if el.factory().is_some_and(|factory| factory.name() == "tee") {
+            for pad in el.src_pads() {
+                el.release_request_pad(&pad);
+            }
+        }
+    }
+    for el in &order {
+        el.set_state(gst::State::Null)?;
+        pipe.remove(el)?;
     }
     Ok(())
 }
@@ -1455,43 +1610,6 @@ mod tests {
     }
 
     #[test]
-    fn monitor_branch_queues_hold_two_buffers() {
-        gstreamer::init().unwrap();
-        let cfg = crate::config::PipelineCfg::default_tx();
-        let zones = vec![zproto::ZoneEndpoints {
-            zone_id: "hall".into(),
-            endpoints: vec![zproto::Endpoint {
-                ip: "192.0.2.36".into(),
-                port: 5004,
-            }],
-            source: Some("zvucast-hall-monitor".into()),
-        }];
-        let pipe = build_tx_unicast_pw(&cfg, &zones, 0, Some("line"), &mut LoopbackUdp).unwrap();
-        let head = pipe
-            .by_name("cap")
-            .unwrap()
-            .static_pad("src")
-            .unwrap()
-            .peer()
-            .unwrap()
-            .parent_element()
-            .unwrap();
-        assert_eq!(
-            head.property::<u32>("max-size-buffers"),
-            8,
-            "голова line-in остаётся на восьми буферах"
-        );
-        for name in ["mhold-hall", "mq-hall", "mlq-hall"] {
-            let queue = pipe.by_name(name).unwrap_or_else(|| panic!("нет {name}"));
-            assert_eq!(queue.property::<u32>("max-size-buffers"), 2, "{name}");
-            assert_eq!(queue.property::<u32>("max-size-bytes"), 0, "{name}");
-            assert_eq!(queue.property::<u64>("max-size-time"), 0, "{name}");
-            let leaky = queue.property_value("leaky").serialize().expect("leaky");
-            assert_eq!(leaky.as_str(), "downstream", "{name}: {leaky}");
-        }
-    }
-
-    #[test]
     fn unicast_pw_targets_zvucast_only_when_asked() {
         gstreamer::init().unwrap();
         let cfg = crate::config::PipelineCfg::default_tx();
@@ -1533,14 +1651,14 @@ mod tests {
             },
         ];
         let split = build_tx_unicast_pw(&cfg, &zones, 0, None, &mut LoopbackUdp).unwrap();
-        assert!(split.by_name("cap-hall").is_some(), "у зоны со своим источником свой appsrc");
+        assert!(split.by_name("cap-hall").is_none(), "монитор не подмешивается в микрофон");
         assert!(split.by_name("cap-bed").is_none(), "line-in остаётся на общей голове");
-        assert!(split.by_name("lev-hall").is_some());
+        assert!(split.by_name("lev-hall").is_none());
         let hall_mix = split.by_name("zmix-hall").expect("микшер зоны");
         assert_eq!(
             hall_mix.sink_pads().len(),
-            2,
-            "line-in и монитор складываются, монитор не подменяет микрофон"
+            1,
+            "в микшер зоны входит только line-in"
         );
         assert_eq!(
             split.children().iter().filter(|e| e.factory().unwrap().name() == "rtpL16pay").count(),
@@ -1548,8 +1666,112 @@ mod tests {
         );
     }
 
+    /// Монитор не входит в RTP микрофона. `source: None` не создаёт
+    /// `cap-{token}` / `lev-{token}`. Заданный source тоже не подмешивается:
+    /// у вида свой хвост, не ветка `zmix`.
     #[test]
-    fn monitor_joins_the_zone_mix_without_a_new_payloader() {
+    fn monitor_is_not_in_the_microphone_tail() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
+        let line = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![zproto::Endpoint {
+                ip: "192.0.2.36".into(),
+                port: 5004,
+            }],
+            source: None,
+        }];
+        let pipe = build_tx_unicast_pw(&cfg, &line, 0, Some("line"), &mut LoopbackUdp).unwrap();
+        assert!(pipe.by_name("cap-hall").is_none(), "source: None не создаёт cap-hall");
+        assert!(pipe.by_name("lev-hall").is_none(), "source: None не создаёт lev-hall");
+        assert!(pipe.by_name("lev").is_some(), "lev головы захвата на месте");
+        assert_eq!(pipe.by_name("zmix-hall").unwrap().sink_pads().len(), 1);
+        let head = pipe
+            .by_name("cap")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .peer()
+            .unwrap()
+            .parent_element()
+            .unwrap();
+        assert_eq!(head.property::<u32>("max-size-buffers"), 8, "голова line-in на восьми буферах");
+
+        let sourced = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![zproto::Endpoint {
+                ip: "192.0.2.36".into(),
+                port: 5004,
+            }],
+            source: Some("zvucast-hall-monitor".into()),
+        }];
+        let mixed = build_tx_unicast_pw(&cfg, &sourced, 0, Some("line"), &mut LoopbackUdp).unwrap();
+        assert!(
+            mixed.by_name("cap-hall").is_none(),
+            "монитор не в хвосте микрофона"
+        );
+        assert!(mixed.by_name("lev-hall").is_none(), "lev монитора не в хвосте микрофона");
+        assert_eq!(
+            mixed.by_name("zmix-hall").unwrap().sink_pads().len(),
+            1,
+            "в микшер зоны входит только line-in"
+        );
+    }
+
+    /// Микрофон и Spotify одной зоны — разные `level`. Голова захвата в хвост вида не входит.
+    #[test]
+    fn microphone_and_spotify_feed_use_different_levels() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
+        let zones = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![zproto::Endpoint {
+                ip: "192.0.2.36".into(),
+                port: 5004,
+            }],
+            source: None,
+        }];
+        let pipe = build_tx_unicast_pw(&cfg, &zones, 0, Some("mic"), &mut LoopbackUdp).unwrap();
+        let feeds = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![zproto::Endpoint {
+                ip: "192.0.2.36".into(),
+                port: 5010,
+            }],
+        }];
+        reconcile_feed_tails(&pipe, &feeds, 0, &mut LoopbackUdp).unwrap();
+        let mic = pipe.by_name("lev").expect("lev микрофона");
+        let feed = pipe.by_name("lev-feed-spotify-hall").expect("lev фида");
+        assert_ne!(mic.name(), feed.name(), "микрофонный lev не является lev фида");
+        assert!(pipe.by_name("feed-spotify-hall").is_some(), "appsrc хвоста вида");
+        assert!(pipe.by_name("cap-hall").is_none());
+        assert_eq!(pipe.by_name("zmix-hall").unwrap().sink_pads().len(), 1);
+        let sinks: Vec<_> = pipe
+            .children()
+            .into_iter()
+            .filter(|e| e.factory().unwrap().name() == "udpsink")
+            .collect();
+        assert_eq!(sinks.len(), 2, "у микрофона и фида свои udpsink");
+        let mut ports: Vec<i32> = sinks.iter().map(|s| s.property::<i32>("port")).collect();
+        ports.sort();
+        assert_eq!(ports, vec![5004, 5010]);
+        let hold = pipe.by_name("fhold-spotify-hall").expect("очередь хвоста");
+        assert_eq!(hold.property::<u32>("max-size-buffers"), 2);
+        let leaky = hold.property_value("leaky").serialize().expect("leaky");
+        assert_eq!(leaky.as_str(), "downstream");
+
+        reconcile_feed_tails(&pipe, &[], 0, &mut LoopbackUdp).unwrap();
+        assert!(pipe.by_name("feed-spotify-hall").is_none(), "пустой SetFeeds снимает хвост");
+        assert!(pipe.by_name("lev-feed-spotify-hall").is_none());
+        assert!(pipe.by_name("lev").is_some(), "голова захвата остаётся");
+        assert!(pipe.by_name("pay-hall").is_some(), "пейлоадер микрофона остаётся");
+    }
+
+    /// Живой пейлоадер микрофона не получает ветку монитора, даже если source задан.
+    #[test]
+    fn monitor_does_not_join_the_microphone_payloader() {
         gstreamer::init().unwrap();
         let cfg = crate::config::PipelineCfg::default_tx();
         let mut zone = zproto::ZoneEndpoints {
@@ -1561,124 +1783,19 @@ mod tests {
         let pay = pipe.by_name("pay-hall").expect("пейлоадер зоны");
         let pay_ptr = pay.as_ptr();
         assert_eq!(pipe.by_name("zmix-hall").unwrap().sink_pads().len(), 1);
-        pipe.set_state(gst::State::Playing).unwrap();
-        let line = pipe
-            .by_name("cap")
-            .unwrap()
-            .dynamic_cast::<gstreamer_app::AppSrc>()
-            .unwrap();
-        for i in 0..20 {
-            let mut buf = gst::Buffer::with_size(480 * 4).unwrap();
-            {
-                let b = buf.get_mut().unwrap();
-                b.set_pts(gst::ClockTime::from_mseconds(i * 10));
-                b.set_duration(gst::ClockTime::from_mseconds(10));
-            }
-            line.push_buffer(buf).unwrap();
-        }
-        assert_eq!(
-            pipe.state(gst::ClockTime::from_seconds(2)).0.unwrap(),
-            gst::StateChangeSuccess::Success
-        );
 
         zone.source = Some("zvucast-hall-monitor".into());
         reconcile_pw_monitors(&pipe, &[zone.clone()]).unwrap();
         assert_eq!(pipe.by_name("pay-hall").unwrap().as_ptr(), pay_ptr, "RTP-пейлоадер тот же");
-        assert_eq!(pipe.by_name("zmix-hall").unwrap().sink_pads().len(), 2);
-        let monitor = pipe.by_name("cap-hall").unwrap();
-        assert_eq!(monitor.current_state(), gst::State::Playing);
+        assert!(pipe.by_name("cap-hall").is_none(), "монитор не в хвосте микрофона");
+        assert!(pipe.by_name("lev-hall").is_none());
+        assert_eq!(pipe.by_name("zmix-hall").unwrap().sink_pads().len(), 1);
 
         zone.source = None;
         reconcile_pw_monitors(&pipe, &[zone]).unwrap();
         assert_eq!(pipe.by_name("pay-hall").unwrap().as_ptr(), pay_ptr);
         assert!(pipe.by_name("cap-hall").is_none());
         assert_eq!(pipe.by_name("zmix-hall").unwrap().sink_pads().len(), 1);
-        pipe.set_state(gst::State::Null).unwrap();
-    }
-
-    /// pi3: головы PipeWire нет, линия — живая тишина. Sendspin входит в микс
-    /// уже после старта. Тон монитора должен дойти до выхода микшера.
-    #[test]
-    fn monitor_tone_survives_the_silent_line() {
-        gstreamer::init().unwrap();
-        let cfg = crate::config::PipelineCfg::default_tx();
-        let mut zone = zproto::ZoneEndpoints {
-            zone_id: "hall".into(),
-            endpoints: vec![zproto::Endpoint { ip: "192.0.2.36".into(), port: 5004 }],
-            source: None,
-        };
-        let pipe = build_tx_unicast_pw(&cfg, &[zone.clone()], 0, None, &mut LoopbackUdp).unwrap();
-        let peak = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let mix = pipe.by_name("zmix-hall").unwrap();
-        let src = mix.static_pad("src").unwrap();
-        let peak_probe = peak.clone();
-        let seen_probe = seen.clone();
-        src.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            let Some(gst::PadProbeData::Buffer(buf)) = &info.data else {
-                return gst::PadProbeReturn::Ok;
-            };
-            let Ok(map) = buf.map_readable() else {
-                return gst::PadProbeReturn::Ok;
-            };
-            let bytes = map.as_slice();
-            let mut local = 0i32;
-            if bytes.len() % 4 == 0 {
-                for chunk in bytes.chunks_exact(4) {
-                    let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    if sample.is_finite() {
-                        local = local.max((sample.abs() * 32768.0) as i32);
-                    }
-                }
-            }
-            if bytes.len() % 2 == 0 {
-                for chunk in bytes.chunks_exact(2) {
-                    let sample = i16::from_be_bytes([chunk[0], chunk[1]]).unsigned_abs() as i32;
-                    local = local.max(sample);
-                }
-            }
-            seen_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            peak_probe.fetch_max(local, std::sync::atomic::Ordering::Relaxed);
-            gst::PadProbeReturn::Ok
-        });
-        pipe.set_state(gst::State::Playing).unwrap();
-        assert_eq!(
-            pipe.state(gst::ClockTime::from_seconds(2)).0.unwrap(),
-            gst::StateChangeSuccess::Success
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        zone.source = Some("zvucast-hall-monitor".into());
-        reconcile_pw_monitors(&pipe, &[zone]).unwrap();
-        let monitor = pipe
-            .by_name("cap-hall")
-            .unwrap()
-            .dynamic_cast::<gstreamer_app::AppSrc>()
-            .unwrap();
-        let frame = {
-            let mut bytes = vec![0u8; 1920];
-            for chunk in bytes.chunks_exact_mut(4) {
-                chunk[..2].copy_from_slice(&16_000i16.to_le_bytes());
-                chunk[2..].copy_from_slice(&16_000i16.to_le_bytes());
-            }
-            bytes
-        };
-        for _ in 0..100 {
-            let mut buf = gst::Buffer::from_slice(frame.clone());
-            {
-                let b = buf.get_mut().unwrap();
-                b.set_duration(gst::ClockTime::from_mseconds(10));
-            }
-            monitor.push_buffer(buf).unwrap();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        let got = peak.load(std::sync::atomic::Ordering::Relaxed);
-        let buffers = seen.load(std::sync::atomic::Ordering::Relaxed);
-        pipe.set_state(gst::State::Null).unwrap();
-        assert!(
-            got > 1000,
-            "тон монитора не вышел из микшера с тихой линией: peak={got} buffers={buffers}"
-        );
     }
 
     #[test]
