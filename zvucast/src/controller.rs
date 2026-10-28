@@ -26,8 +26,8 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Mutex};
 use zproto::{
-    AgentMsg, BranchChannelMap, ChannelMap, CtlMsg, Endpoint, Role, SecretString, SetupIssue, SoloistState,
-    VirtualZone, ZoneEndpoints,
+    AgentMsg, BranchChannelMap, ChannelMap, CtlMsg, Endpoint, FeedKind, Role, SecretString, SetupIssue,
+    SoloistState, VirtualZone, ZoneEndpoints,
 };
 
 use crate::agent::successor_marker_path;
@@ -39,8 +39,8 @@ use crate::update::{
 };
 use crate::silence::{classify, fold_samples, Sample, SilenceBook, ZoneTick};
 use crate::state::{
-    assignment, default_jb_ms, owner_ids, owner_maps, source_channel_maps, zone_groups,
-    State as MasterState, StateStore, Zone,
+    assignment, clear_feed, default_jb_ms, drop_missing_feed_keys, normalize_sources, owner_ids,
+    owner_maps, source_channel_maps, zone_groups, State as MasterState, StateStore, Zone, ZoneSource,
 };
 
 /// Телеметрия старше этого таймаута → узел в offline по sweep.
@@ -1255,8 +1255,9 @@ struct PatchZone {
     name: Option<String>,
     #[serde(default)]
     tx: Option<String>,
+    /// Тот же JSON, что у `Zone.sources`: строка или объект `{kind, node_id}`.
     #[serde(default)]
-    sources: Option<Vec<String>>,
+    sources: Option<Vec<ZoneSource>>,
     #[serde(default)]
     members: Option<Vec<String>>,
     #[serde(default)]
@@ -1419,20 +1420,35 @@ async fn patch_zone(
     body: Result<Json<PatchZone>, JsonRejection>,
 ) -> Result<Json<ZoneView>, (StatusCode, String)> {
     let Json(b) = body.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let current = {
+    let (current, nodes) = {
         let store = st.store.lock().await;
-        store
-            .state()
+        let state = store.state();
+        let current = state
             .zones
             .iter()
             .find(|z| z.id == id)
             .cloned()
-            .ok_or((StatusCode::NOT_FOUND, format!("зона {id} не найдена")))?
+            .ok_or((StatusCode::NOT_FOUND, format!("зона {id} не найдена")))?;
+        (current, state.nodes.clone())
     };
     let sources_touched = b.sources.is_some() || b.tx.is_some();
     let members_touched = b.members.is_some();
     let new_sources = if sources_touched {
-        Some(resolve_sources(b.sources, b.tx)?)
+        let raw = match &b.sources {
+            Some(list) => list.clone(),
+            None => vec![ZoneSource::Line(b.tx.clone().unwrap_or_default())],
+        };
+        let flags = |node_id: &str, kind: FeedKind| {
+            nodes.get(node_id).is_some_and(|meta| match kind {
+                FeedKind::Spotify => meta.spotify,
+                FeedKind::Sendspin => meta.sendspin,
+                FeedKind::Virtual => meta.virtual_output,
+            })
+        };
+        Some(
+            normalize_sources(raw, &flags)
+                .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?,
+        )
     } else {
         None
     };
@@ -1449,8 +1465,18 @@ async fn patch_zone(
         // Валидируем только меняемые поля: роли узла могли смениться с
         // момента создания зоны, и PATCH имени не должен от них зависеть.
         if let Some(sources) = &new_sources {
-            for tx in sources {
-                validate_zone_tx(&reg, tx)?;
+            for src in sources {
+                let ZoneSource::Line(tx) = src else { continue };
+                match reg.roles_of(tx) {
+                    None => return Err((StatusCode::BAD_REQUEST, "Узел не найден".into())),
+                    Some(roles) if !roles.contains(&Role::Tx) => {
+                        return Err((
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            format!("узел {tx} не является tx"),
+                        ));
+                    }
+                    Some(_) => {}
+                }
             }
         }
         if members_touched {
@@ -1468,7 +1494,8 @@ async fn patch_zone(
     let pushed: Vec<String> = match &new_sources {
         Some(next) => {
             let mut ids = current.source_ids();
-            for id in next {
+            for src in next {
+                let ZoneSource::Line(id) = src else { continue };
                 if !ids.contains(id) {
                     ids.push(id.clone());
                 }
@@ -1484,6 +1511,7 @@ async fn patch_zone(
             }
             if let Some(sources) = new_sources {
                 z.set_sources(sources);
+                drop_missing_feed_keys(z);
             }
             z.members = new_members;
             if let Some(secs) = b.silence_timeout_s {
@@ -1708,6 +1736,9 @@ async fn patch_node(
         apply_chan_patches(&mut meta.outputs, patches);
         changed = true;
     }
+    let was_virtual = meta.virtual_output;
+    let was_spotify = meta.spotify;
+    let was_sendspin = meta.sendspin;
     if let Some(enabled) = b.virtual_output {
         meta.virtual_output = enabled;
         changed = true;
@@ -1724,10 +1755,26 @@ async fn patch_node(
         meta.sendspin = enabled;
         changed = true;
     }
+    let drop_virtual = b.virtual_output == Some(false) && was_virtual;
+    let drop_spotify = b.spotify == Some(false) && was_spotify;
+    let drop_sendspin = b.sendspin == Some(false) && was_sendspin;
     let prefs = meta.inputs.clone();
     let output_prefs = meta.outputs.clone();
     if changed {
         st.update_state(|s| {
+            if drop_virtual || drop_spotify || drop_sendspin {
+                for zone in &mut s.zones {
+                    if drop_virtual {
+                        clear_feed(zone, &node_id, FeedKind::Virtual);
+                    }
+                    if drop_spotify {
+                        clear_feed(zone, &node_id, FeedKind::Spotify);
+                    }
+                    if drop_sendspin {
+                        clear_feed(zone, &node_id, FeedKind::Sendspin);
+                    }
+                }
+            }
             s.nodes.insert(node_id.clone(), meta);
         })
         .await?;

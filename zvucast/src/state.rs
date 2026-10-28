@@ -180,11 +180,106 @@ impl Zone {
     }
 
     /// Пишет список и ещё раз оставляет первый из одинаковых ключей.
-    /// `String` — микрофон: контроллер пока отдаёт id узлов.
+    /// `String` — микрофон: создание зоны всё ещё отдаёт id узлов.
     pub fn set_sources<S: Into<ZoneSource>>(&mut self, sources: Vec<S>) {
         self.sources = sources.into_iter().map(Into::into).collect();
         self.sources = self.zone_sources();
         self.tx = tx_from(&self.sources);
+    }
+}
+
+fn feed_disabled(kind: FeedKind) -> &'static str {
+    match kind {
+        FeedKind::Spotify => "На узле выключен Spotify",
+        FeedKind::Sendspin => "На узле выключен Sendspin",
+        FeedKind::Virtual => "На узле выключена виртуальная колонка",
+    }
+}
+
+fn trimmed_source(src: ZoneSource) -> Option<ZoneSource> {
+    let id = src.node_id().trim();
+    if id.is_empty() {
+        return None;
+    }
+    if id == src.node_id() {
+        return Some(src);
+    }
+    Some(match src {
+        ZoneSource::Line(_) => ZoneSource::Line(id.to_string()),
+        ZoneSource::Feed { kind, .. } => ZoneSource::Feed { kind, node_id: id.to_string() },
+    })
+}
+
+/// Оставляет микрофоны и по одному хозяину каждого вида: из повторов вида
+/// остаётся последний. Пустой список и выключенная галочка — ошибка.
+/// Карты каналов не трогает: у функции нет зоны.
+pub fn normalize_sources(
+    sources: Vec<ZoneSource>,
+    flags: &dyn Fn(&str, FeedKind) -> bool,
+) -> Result<Vec<ZoneSource>, &'static str> {
+    if sources.is_empty() {
+        return Err("Выберите хотя бы один источник");
+    }
+    let sources: Vec<ZoneSource> = sources.into_iter().filter_map(trimmed_source).collect();
+    if sources.is_empty() {
+        return Err("Выберите хотя бы один источник");
+    }
+    for src in &sources {
+        if let ZoneSource::Feed { kind, node_id } = src {
+            if !flags(node_id, *kind) {
+                return Err(feed_disabled(*kind));
+            }
+        }
+    }
+    let mut last_of_kind = [None; 3];
+    for (i, src) in sources.iter().enumerate() {
+        if let ZoneSource::Feed { kind, .. } = src {
+            last_of_kind[feed_slot(*kind)] = Some(i);
+        }
+    }
+    Ok(sources
+        .into_iter()
+        .enumerate()
+        .filter(|(i, src)| match src {
+            ZoneSource::Line(_) => true,
+            ZoneSource::Feed { kind, .. } => last_of_kind[feed_slot(*kind)] == Some(*i),
+        })
+        .map(|(_, src)| src)
+        .collect())
+}
+
+fn feed_slot(kind: FeedKind) -> usize {
+    match kind {
+        FeedKind::Spotify => 0,
+        FeedKind::Sendspin => 1,
+        FeedKind::Virtual => 2,
+    }
+}
+
+fn is_feed_map_key(key: &str) -> bool {
+    key.starts_with("spotify:") || key.starts_with("sendspin:") || key.starts_with("virtual:")
+}
+
+/// Снимает вид узла с зоны и его ключ из карт каждого члена.
+/// `tx` пересчитывается: пустой список не должен снова стать микрофоном.
+pub fn clear_feed(zone: &mut Zone, node_id: &str, kind: FeedKind) {
+    let key = ZoneSource::Feed { kind, node_id: node_id.to_string() }.key();
+    zone.sources.retain(|src| match src {
+        ZoneSource::Feed { kind: got, node_id: id } => !(*got == kind && id == node_id),
+        ZoneSource::Line(_) => true,
+    });
+    zone.tx = tx_from(&zone.sources);
+    for maps in zone.source_maps.values_mut() {
+        maps.remove(&key);
+    }
+}
+
+/// Убирает из карт ключи видов, которых больше нет среди источников.
+/// Ключ микрофона не трогает и новый ключ не пишет.
+pub fn drop_missing_feed_keys(zone: &mut Zone) {
+    let live: Vec<String> = zone.zone_sources().iter().map(ZoneSource::key).collect();
+    for maps in zone.source_maps.values_mut() {
+        maps.retain(|key, _| !is_feed_map_key(key) || live.iter().any(|got| got == key));
     }
 }
 
@@ -676,5 +771,131 @@ mod tests {
             serde_json::to_string(&ZoneSource::Line("n1".into())).unwrap(),
             r#"{"kind":"line","node_id":"n1"}"#,
         );
+    }
+
+    fn zone_from_old_line(node_id: &str) -> Zone {
+        serde_json::from_str(&format!(
+            r#"{{"id":"z","name":"Зона","tx":"{node_id}","sources":["{node_id}"]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn second_spotify_replaces_host() {
+        let flags = |id: &str, kind: FeedKind| {
+            (id == "pc" || id == "pi") && kind == FeedKind::Spotify
+        };
+        let next = normalize_sources(vec![
+            ZoneSource::Line("n1".into()),
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pi".into() },
+        ], &flags).unwrap();
+        assert_eq!(next, vec![
+            ZoneSource::Line("n1".into()),
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pi".into() },
+        ]);
+        let only = normalize_sources(vec![
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+        ], &flags).unwrap();
+        assert_eq!(only, vec![
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+        ]);
+        let empty = normalize_sources(Vec::new(), &flags).unwrap_err();
+        assert_eq!(empty, "Выберите хотя бы один источник");
+        let off = |_: &str, _: FeedKind| false;
+        assert_eq!(
+            normalize_sources(vec![
+                ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+            ], &off).unwrap_err(),
+            "На узле выключен Spotify",
+        );
+        assert_eq!(
+            normalize_sources(vec![
+                ZoneSource::Feed { kind: FeedKind::Sendspin, node_id: "pc".into() },
+            ], &off).unwrap_err(),
+            "На узле выключен Sendspin",
+        );
+        assert_eq!(
+            normalize_sources(vec![
+                ZoneSource::Feed { kind: FeedKind::Virtual, node_id: "pc".into() },
+            ], &off).unwrap_err(),
+            "На узле выключена виртуальная колонка",
+        );
+    }
+
+    #[test]
+    fn dropped_feed_key_leaves_the_maps() {
+        let mut zone = zone_from_old_line("n1");
+        zone.source_maps.insert("spk".into(), HashMap::from([
+            ("spotify:pc".into(), ChannelMap::default()),
+            ("sendspin:pc".into(), ChannelMap::default()),
+            ("virtual:pc".into(), ChannelMap::default()),
+            ("n1".into(), ChannelMap::default()),
+            ("old-mic".into(), ChannelMap::default()),
+        ]));
+        zone.set_sources(vec![ZoneSource::Line("n1".into())]);
+        drop_missing_feed_keys(&mut zone);
+        assert!(zone.source_maps["spk"].get("spotify:pc").is_none());
+        assert!(zone.source_maps["spk"].get("sendspin:pc").is_none());
+        assert!(zone.source_maps["spk"].get("virtual:pc").is_none());
+        assert!(zone.source_maps["spk"].contains_key("n1"));
+        assert!(zone.source_maps["spk"].contains_key("old-mic"));
+        assert_eq!(zone.source_maps["spk"].len(), 2);
+    }
+
+    #[test]
+    fn clear_feed_on_one_zone_leaves_the_other() {
+        let mut a = zone_from_old_line("n1");
+        let mut b = zone_from_old_line("n1");
+        let feed = ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() };
+        a.set_sources(vec![ZoneSource::Line("n1".into()), feed.clone()]);
+        b.set_sources(vec![ZoneSource::Line("n1".into()), feed]);
+        a.source_maps.insert("spk".into(), HashMap::from([
+            ("spotify:pc".into(), ChannelMap::default()),
+            ("n1".into(), ChannelMap::default()),
+        ]));
+        b.source_maps.insert("spk".into(), HashMap::from([
+            ("spotify:pc".into(), ChannelMap::default()),
+        ]));
+        clear_feed(&mut b, "pc", FeedKind::Sendspin);
+        assert!(b.zone_sources().iter().any(|s| s.key() == "spotify:pc"));
+        assert!(b.source_maps["spk"].contains_key("spotify:pc"));
+        clear_feed(&mut a, "pc", FeedKind::Spotify);
+        assert!(a.zone_sources().iter().any(|s| s.key() == "n1"));
+        assert!(a.zone_sources().iter().all(|s| s.key() != "spotify:pc"));
+        assert!(a.source_maps["spk"].get("spotify:pc").is_none());
+        assert!(a.source_maps["spk"].contains_key("n1"));
+        assert!(b.zone_sources().iter().any(|s| s.key() == "spotify:pc"));
+        assert!(b.source_maps["spk"].contains_key("spotify:pc"));
+    }
+
+    #[test]
+    fn clear_feed_of_the_only_source_does_not_invent_a_mic() {
+        let mut zone = zone_from_old_line("n1");
+        zone.set_sources(vec![ZoneSource::Feed {
+            kind: FeedKind::Spotify,
+            node_id: "pc".into(),
+        }]);
+        assert_eq!(zone.tx, "pc");
+        clear_feed(&mut zone, "pc", FeedKind::Spotify);
+        assert!(zone.sources.is_empty());
+        assert_eq!(zone.tx, "");
+        assert!(zone.source_ids().is_empty());
+    }
+
+    #[test]
+    fn drop_missing_feed_keys_keeps_a_live_feed() {
+        let mut zone = zone_from_old_line("n1");
+        zone.set_sources(vec![
+            ZoneSource::Line("n1".into()),
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+        ]);
+        zone.source_maps.insert("spk".into(), HashMap::from([
+            ("spotify:pc".into(), ChannelMap::default()),
+            ("sendspin:pc".into(), ChannelMap::default()),
+        ]));
+        drop_missing_feed_keys(&mut zone);
+        assert!(zone.source_maps["spk"].contains_key("spotify:pc"));
+        assert!(zone.source_maps["spk"].get("sendspin:pc").is_none());
     }
 }
