@@ -1795,6 +1795,7 @@ async fn patch_node(
     } else {
         None
     };
+    let held = st.silence_holds.lock().await.clone();
     {
         let mut reg = st.reg.lock().await;
         if let Some(enabled) = b.virtual_output {
@@ -1810,7 +1811,7 @@ async fn patch_node(
                 let _ = reg.send_cmd(&node_id, soloist);
                 let _ = reg.send_cmd(&node_id, sendspin);
                 let ports = stream_ports(&reg, &snap);
-                let _ = reg.send_cmd(&node_id, feeds_cmd(&snap, &reg, &ports, &node_id));
+                let _ = reg.send_cmd(&node_id, feeds_cmd(&snap, &reg, &ports, &node_id, &held));
             }
         }
         if patched_inputs {
@@ -1850,7 +1851,7 @@ async fn patch_node(
 ///
 /// Играющее множество: tx с НЕпустым assign (до холда тишины) и online-rx
 /// из этого assign. Холд оставляет группу зоны с пустыми endpoints и не
-/// шлёт Stop: захват жив.
+/// шлёт Stop: захват жив. Тот же холд обнуляет endpoints вида в SetFeeds.
 /// Порядок прохода: сначала SetEndpoints всем затронутым tx (дедуп по last_sent —
 /// без изменений), затем Start вошедшим в множество и Stop выбывшим. Start
 /// уходит и узлам со свежим hello из playing: reconnect внутри окна дебаунса
@@ -1895,13 +1896,21 @@ pub fn spawn_silence_ticker(state: AppState) -> tokio::task::JoinHandle<()> {
                 let reg = state.reg.lock().await;
                 for z in &zones {
                     let samples: Vec<Sample> = z
-                        .source_ids()
+                        .zone_sources()
                         .iter()
-                        .map(|id| match reg.tx_sample(id, now) {
-                            Some((age, playing, l, r)) => {
-                                classify(age, playing, l, r, z.silence_threshold_db)
+                        .map(|src| {
+                            let got = match src {
+                                ZoneSource::Line(id) => reg.tx_sample(id, now),
+                                ZoneSource::Feed { node_id, kind } => {
+                                    reg.feed_sample(node_id, &z.id, *kind, now)
+                                }
+                            };
+                            match got {
+                                Some((age, playing, l, r)) => {
+                                    classify(age, playing, l, r, z.silence_threshold_db)
+                                }
+                                None => Sample::NoData,
                             }
-                            None => Sample::NoData,
                         })
                         .collect();
                     let sample = fold_samples(&samples);
@@ -2104,7 +2113,7 @@ pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {
                 if !reg.supports_virtual_output(id) && !last_feeds.contains_key(id) {
                     continue;
                 }
-                let CtlMsg::SetFeeds { feeds } = feeds_cmd(&snap, &reg, &tx_port, id) else {
+                let CtlMsg::SetFeeds { feeds } = feeds_cmd(&snap, &reg, &tx_port, id, &held) else {
                     continue;
                 };
                 let fresh_hello = prev_hello.get(id) != hello_now.get(id);
@@ -2455,13 +2464,14 @@ async fn push_virtual_zones(st: &AppState, node_id: &str) {
             FeedSnap::from_state(state),
         )
     };
+    let held = st.silence_holds.lock().await.clone();
     let reg = st.reg.lock().await;
     if reg.supports_virtual_output(node_id) {
         let _ = reg.send_cmd(node_id, zones);
         let _ = reg.send_cmd(node_id, soloist);
         let _ = reg.send_cmd(node_id, sendspin);
         let ports = stream_ports(&reg, &snap);
-        let _ = reg.send_cmd(node_id, feeds_cmd(&snap, &reg, &ports, node_id));
+        let _ = reg.send_cmd(node_id, feeds_cmd(&snap, &reg, &ports, node_id, &held));
     }
 }
 
@@ -2583,7 +2593,13 @@ fn listener_endpoints(
     endpoints
 }
 
-fn feeds_cmd(snap: &FeedSnap, reg: &Registry, ports: &HashMap<String, u16>, node_id: &str) -> CtlMsg {
+fn feeds_cmd(
+    snap: &FeedSnap,
+    reg: &Registry,
+    ports: &HashMap<String, u16>,
+    node_id: &str,
+    held: &HashSet<String>,
+) -> CtlMsg {
     let mut feeds = Vec::new();
     for zone in &snap.zones {
         for src in zone.zone_sources() {
@@ -2592,8 +2608,11 @@ fn feeds_cmd(snap: &FeedSnap, reg: &Registry, ports: &HashMap<String, u16>, node
                 continue;
             }
             let name = crate::mix::feed_port_name(kind, node_id, &zone.id);
+            // Холд гасит слушателей, хвост вида не снимает — как пустые mic endpoints.
             let endpoints = match ports.get(&name) {
-                Some(&port) if zone.active => listener_endpoints(zone, &snap.owners, reg, port),
+                Some(&port) if zone.active && !held.contains(&zone.id) => {
+                    listener_endpoints(zone, &snap.owners, reg, port)
+                }
                 _ => Vec::new(),
             };
             feeds.push(FeedSend {
@@ -2727,6 +2746,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
                 FeedSnap::from_state(state),
             )
         };
+        let held = st.silence_holds.lock().await.clone();
         let mut reg = st.reg.lock().await;
         let _ = reg.send_cmd(&node_id, CtlMsg::SetVirtualOutput { enabled });
         push_capture_target(&mut reg, &node_id, &prefs);
@@ -2734,7 +2754,7 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
         let _ = reg.send_cmd(&node_id, soloist);
         let _ = reg.send_cmd(&node_id, sendspin);
         let ports = stream_ports(&reg, &snap);
-        let _ = reg.send_cmd(&node_id, feeds_cmd(&snap, &reg, &ports, &node_id));
+        let _ = reg.send_cmd(&node_id, feeds_cmd(&snap, &reg, &ports, &node_id, &held));
     } else if roles.contains(&Role::Tx) {
         let prefs = {
             let store = st.store.lock().await;

@@ -166,6 +166,15 @@ mod tests {
     }
 
     #[test]
+    fn quiet_feed_does_not_hold_a_loud_line() {
+        let samples = vec![
+            classify(Duration::from_secs(0), true, -10.0, -10.0, -60.0),
+            classify(Duration::from_secs(0), true, -90.0, -90.0, -60.0),
+        ];
+        assert_eq!(fold_samples(&samples), Sample::Loud);
+    }
+
+    #[test]
     fn one_loud_source_keeps_the_zone_awake() {
         assert_eq!(
             fold_samples(&[Sample::Quiet, Sample::Loud, Sample::NoData]),
