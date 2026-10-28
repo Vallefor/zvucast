@@ -279,8 +279,24 @@ pub fn controller_command() -> &'static str {
     "sudo systemctl enable --now zvucast-controller"
 }
 
-pub fn quantum_command() -> &'static str {
-    "curl -fsSL https://raw.githubusercontent.com/Vallefor/zvucast/main/install.sh | bash"
+const QUANTUM_BODY: &str = include_str!("../../deploy/pipewire/99-zvucast-quantum.conf");
+const LATENCY_BODY: &str = include_str!("../../deploy/wireplumber/99-zvucast-latency.conf");
+
+/// Пишет оба дропа и перезапускает пользовательский PipeWire.
+/// Текст файлов — тот же, что кладёт установщик.
+pub fn quantum_command(user: &str, uid: u32) -> String {
+    format!(
+        "sudo mkdir -p -- /etc/pipewire/pipewire.conf.d /etc/wireplumber/wireplumber.conf.d\n\
+         sudo tee -- /etc/pipewire/pipewire.conf.d/99-zvucast-quantum.conf >/dev/null <<'ZVUCAST_QUANTUM'\n\
+         {quantum}\
+         ZVUCAST_QUANTUM\n\
+         sudo tee -- /etc/wireplumber/wireplumber.conf.d/99-zvucast-latency.conf >/dev/null <<'ZVUCAST_LATENCY'\n\
+         {latency}\
+         ZVUCAST_LATENCY\n\
+         sudo -u {user} XDG_RUNTIME_DIR=/run/user/{uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service",
+        quantum = QUANTUM_BODY,
+        latency = LATENCY_BODY,
+    )
 }
 
 fn marks_ok(text: &str, marks: &[&str]) -> bool {
@@ -421,7 +437,7 @@ pub fn inspect(host: &(impl Host + Sync)) -> SetupSnapshot {
         setup.push(issue("pipewire-socket", packages));
     }
     if !quanta_ok(probed.quantum.as_deref(), probed.latency.as_deref()) {
-        setup.push(issue("pipewire-quantum", quantum_command().to_string()));
+        setup.push(issue("pipewire-quantum", quantum_command(&user, uid)));
     }
     if !audio_rtprio_ok(&probed.limits) {
         setup.push(issue("rt-limits", limits_command(&user)));
@@ -750,7 +766,19 @@ mod tests {
             .into_iter()
             .find(|issue| issue.id == "pipewire-quantum")
             .expect("stale latency drop");
-        assert_eq!(issue.command, quantum_command());
+        let command = quantum_command("audio", 1000);
+        assert_eq!(issue.command, command);
+        assert!(
+            command.contains("sudo tee -- /etc/pipewire/pipewire.conf.d/99-zvucast-quantum.conf")
+        );
+        assert!(command
+            .contains("sudo tee -- /etc/wireplumber/wireplumber.conf.d/99-zvucast-latency.conf"));
+        assert!(command.contains("alsa.card_name = \"bcm2835 Headphones\""));
+        assert!(command.contains("api.alsa.period-size = 1024"));
+        assert!(command.contains(
+            "sudo -u audio XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service"
+        ));
+        assert!(!command.contains("install.sh"));
     }
 
     #[test]
