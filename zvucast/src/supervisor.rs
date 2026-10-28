@@ -497,8 +497,9 @@ impl Runner {
         Ok(())
     }
 
-    /// Уровень каждого хвоста, который реально собран. Нет level — записи нет.
-    /// Нет свежего сигнала — rms остаётся 0. Playing только у собранной играющей ветки.
+    /// Уровень каждого хвоста, который реально собран. Нет элемента — записи нет.
+    /// Играющий хвост без свежего level — −90/−90, не 0: иначе тишина не копится.
+    /// С `lev` микрофона эта пара не смешивается.
     pub fn feed_levels(&self, feeds: &[zproto::FeedSend]) -> Vec<zproto::FeedLevel> {
         let mut out = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
@@ -514,12 +515,20 @@ impl Runner {
                 gst::State::Playing | gst::State::Paused => zproto::PipelineState::Playing,
                 _ => zproto::PipelineState::Stopped,
             };
-            let (rms_l, rms_r) = self
+            let measured = self
                 .rms
                 .lock()
                 .ok()
                 .map(|book| book.recent(&level_name))
                 .unwrap_or((0.0, 0.0));
+            // 0/0 — level ещё не прислал буфер. Для играющего хвоста это тишина,
+            // не «нет данных»: микрофонный `lev` по-прежнему остаётся 0.
+            let (rms_l, rms_r) = if state == zproto::PipelineState::Playing && measured == (0.0, 0.0)
+            {
+                (-90.0, -90.0)
+            } else {
+                measured
+            };
             out.push(zproto::FeedLevel {
                 zone_id: feed.zone_id.clone(),
                 kind: feed.kind,

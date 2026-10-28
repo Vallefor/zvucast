@@ -224,3 +224,13 @@ export function selectFeed(
 export function sourceMapKey(source: ZoneSource): string {
   return source.kind === 'line' ? source.node_id : `${source.kind}:${source.node_id}`
 }
+
+/// Подпись окна «Каналы». Один вид — та же короткая фраза, что у нескольких
+/// источников: у вида нет входов узла.
+export function channelMapLead(sources: readonly ZoneSource[]): string {
+  const singleLine = sources.length === 1 && sources[0].kind === 'line'
+  if (sources.length === 0 || singleLine) {
+    return 'Каждый включённый выход колонки берёт канал из включённых входов источника.'
+  }
+  return 'У каждого источника своя карта: выход колонки берёт канал этого источника.'
+}

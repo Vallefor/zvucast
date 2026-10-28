@@ -2560,6 +2560,267 @@ async fn spotify_feeds_stay_in_their_zones() {
     );
 }
 
+/// Колонка, которую забрала более поздняя зона, не получает порт вида ранней.
+#[tokio::test]
+async fn stolen_speaker_does_not_get_the_earlier_feed_port() {
+    let path = temp_state_path("stolen-feed-port");
+    let state = AppState::with_state(&path);
+    spawn_endpoint_pusher(state.clone());
+    let port = serve(state).await;
+
+    let mut pc = MockAgent::connect_virtual(port).await;
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualOutput { enabled: false });
+    assert_eq!(
+        pc.recv_raw_within(2).await,
+        CtlMsg::SetCaptureTarget { device_key: Some("plughw:CARD=Generic_1".into()) }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(5).await,
+        CtlMsg::SetEndpoints { zones: vec![], dscp: 40 }
+    );
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":true}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let mut s1 = MockAgent::connect_as_from(port, "s1", Role::Rx, "127.0.0.3").await;
+    wait_node(port, "s1").await;
+
+    let (status, zone) = create_zone(port, r#"{"name":"Ранняя","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let z1 = zone["id"].as_str().unwrap().to_string();
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSoloist { api_key: None, zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: vec![] });
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{z1}"),
+        r#"{"sources":[{"kind":"spotify","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist {
+            api_key: None,
+            zones: vec![zproto::VirtualZone { zone_id: z1.clone(), name: "Ранняя".into() }],
+        }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: z1.clone(),
+                kind: zproto::FeedKind::Spotify,
+                monitor: zvucast::soloist::monitor_name(&z1),
+                endpoints: vec![],
+            }],
+        }
+    );
+
+    let (status, _) = http(port, "POST", &format!("/api/zones/{z1}/start")).await;
+    assert_eq!(status, 200);
+    let n1 = zvucast::mix::feed_port_name(zproto::FeedKind::Spotify, "pc", &z1);
+    let early_alone = assigned_port(&["pc".to_string(), n1.clone()], &n1);
+    assert_eq!(
+        pc.recv_ctl_within(5).await,
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: z1.clone(),
+                kind: zproto::FeedKind::Spotify,
+                monitor: zvucast::soloist::monitor_name(&z1),
+                endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: early_alone }],
+            }],
+        }
+    );
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(s1.recv_ctl_within(5).await, CtlMsg::Start);
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetChannelMap { map: ChannelMap::default(), branches: vec![] }
+    );
+    assert_eq!(
+        s1.recv_ctl_within(5).await,
+        CtlMsg::SetMix { ports: vec![early_alone], jb_ms: 2 }
+    );
+
+    let (status, zone) = create_zone(port, r#"{"name":"Поздняя","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let z2 = zone["id"].as_str().unwrap().to_string();
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist {
+            api_key: None,
+            zones: vec![zproto::VirtualZone { zone_id: z1.clone(), name: "Ранняя".into() }],
+        }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetFeeds {
+            feeds: vec![zproto::FeedSend {
+                zone_id: z1.clone(),
+                kind: zproto::FeedKind::Spotify,
+                monitor: zvucast::soloist::monitor_name(&z1),
+                endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: early_alone }],
+            }],
+        }
+    );
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{z2}"),
+        r#"{"sources":[{"kind":"spotify","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let mut soloist_zones = vec![
+        zproto::VirtualZone { zone_id: z1.clone(), name: "Ранняя".into() },
+        zproto::VirtualZone { zone_id: z2.clone(), name: "Поздняя".into() },
+    ];
+    soloist_zones.sort_by(|a, b| a.zone_id.cmp(&b.zone_id));
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
+    assert_eq!(
+        pc.recv_ctl_within(2).await,
+        CtlMsg::SetSoloist { api_key: None, zones: soloist_zones }
+    );
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetSendspin { zones: vec![] });
+    let mut inactive = vec![
+        zproto::FeedSend {
+            zone_id: z1.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z1),
+            endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: early_alone }],
+        },
+        zproto::FeedSend {
+            zone_id: z2.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z2),
+            endpoints: vec![],
+        },
+    ];
+    inactive.sort_by(|a, b| a.zone_id.cmp(&b.zone_id).then(a.kind.as_str().cmp(b.kind.as_str())));
+    assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetFeeds { feeds: inactive });
+
+    let (status, _) = http(port, "POST", &format!("/api/zones/{z2}/start")).await;
+    assert_eq!(status, 200);
+    let n2 = zvucast::mix::feed_port_name(zproto::FeedKind::Spotify, "pc", &z2);
+    let names = vec!["pc".to_string(), n1.clone(), n2.clone()];
+    let early = assigned_port(&names, &n1);
+    let late = assigned_port(&names, &n2);
+    assert_ne!(early, late);
+    let mut live = vec![
+        zproto::FeedSend {
+            zone_id: z1.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z1),
+            endpoints: vec![],
+        },
+        zproto::FeedSend {
+            zone_id: z2.clone(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: zvucast::soloist::monitor_name(&z2),
+            endpoints: vec![Endpoint { ip: "127.0.0.3".into(), port: late }],
+        },
+    ];
+    live.sort_by(|a, b| a.zone_id.cmp(&b.zone_id).then(a.kind.as_str().cmp(b.kind.as_str())));
+    assert_eq!(pc.recv_ctl_within(5).await, CtlMsg::SetFeeds { feeds: live });
+    let mix = loop {
+        match s1.recv_ctl_within(5).await {
+            CtlMsg::SetMix { ports, .. } => break ports,
+            CtlMsg::SetChannelMap { .. } => {}
+            other => panic!("ждали SetMix угнанной колонки, пришло {other:?}"),
+        }
+    };
+    assert_eq!(mix, vec![late], "колонка слышит только позднюю зону");
+    assert!(
+        !mix.contains(&early) && !mix.contains(&early_alone),
+        "порт вида ранней зоны в SetMix не входит"
+    );
+    s1.assert_silent_within(1).await;
+}
+
+/// Второй источник не забирает карту единственного: она остаётся на его ключе.
+/// Прямое стерео отдельной записью не появляется.
+#[tokio::test]
+async fn adding_a_second_source_keeps_the_map_on_the_first() {
+    let path = temp_state_path("carry-source-map");
+    let port = serve(AppState::with_state(&path)).await;
+    let _pc = MockAgent::connect_virtual(port).await;
+    let _s1 = MockAgent::connect_as_from(port, "s1", Role::Rx, "127.0.0.3").await;
+    wait_node(port, "pc").await;
+    wait_node(port, "s1").await;
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/pc", r#"{"spotify":true}"#).await;
+    assert_eq!(status, 200);
+    let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let id = zone["id"].as_str().unwrap();
+
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{id}"),
+        r#"{"sources":[{"kind":"spotify","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{id}"),
+        r#"{"maps":{"s1":{"out_l":"r","out_r":null}}}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{id}"),
+        r#"{"sources":[{"kind":"spotify","node_id":"pc"},"pc"]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        view["source_maps"]["s1"]["spotify:pc"],
+        serde_json::json!({"out_l": "r", "out_r": null})
+    );
+    assert!(view["source_maps"]["s1"].get("pc").is_none(), "новый микрофон не получает выдуманную карту");
+    assert_eq!(view["maps"]["s1"], serde_json::json!({"out_l": "r", "out_r": null}));
+
+    let (status, zone) = create_zone(port, r#"{"name":"Стерео","tx":"pc","members":["s1"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let plain = zone["id"].as_str().unwrap();
+    let (status, body) = http_body(
+        port,
+        "PATCH",
+        &format!("/api/zones/{plain}"),
+        r#"{"sources":["pc",{"kind":"spotify","node_id":"pc"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        view["source_maps"],
+        serde_json::json!({}),
+        "без своей карты ключ стерео не появляется"
+    );
+}
+
 /// PATCH `source_maps` хранит ключ вида `spotify:{узел}` и ключ микрофона.
 /// Ключ вида, которого нет среди источников зоны, не остаётся.
 #[tokio::test]

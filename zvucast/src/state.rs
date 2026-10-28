@@ -283,6 +283,45 @@ pub fn drop_missing_feed_keys(zone: &mut Zone) {
     }
 }
 
+/// Пока источник один, карта лежит на члене. При переходе к двум и больше
+/// та же карта пишется на ключ источника, который уже был. Прямое стерео
+/// ключом не становится. Источника, которого в новом списке нет, это не касается.
+pub fn keep_single_source_map(zone: &mut Zone, previous: &[ZoneSource]) {
+    let next = zone.zone_sources();
+    if previous.len() != 1 || next.len() < 2 {
+        return;
+    }
+    let kept = &previous[0];
+    if !next.iter().any(|src| src.key() == kept.key()) {
+        return;
+    }
+    let key = kept.key();
+    for member in zone.members.clone() {
+        let custom = zone
+            .maps
+            .get(&member)
+            .copied()
+            .filter(|map| *map != ChannelMap::default());
+        match custom {
+            Some(map) => {
+                zone.source_maps
+                    .entry(member)
+                    .or_default()
+                    .insert(key.clone(), map);
+            }
+            None => {
+                let empty = zone.source_maps.get_mut(&member).is_some_and(|slot| {
+                    slot.remove(&key);
+                    slot.is_empty()
+                });
+                if empty {
+                    zone.source_maps.remove(&member);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
     pub version: u32,
@@ -898,5 +937,74 @@ mod tests {
         drop_missing_feed_keys(&mut zone);
         assert!(zone.source_maps["spk"].contains_key("spotify:pc"));
         assert!(zone.source_maps["spk"].get("sendspin:pc").is_none());
+    }
+
+    fn swapped() -> ChannelMap {
+        ChannelMap { out_l: Some(ChanSel::R), out_r: None }
+    }
+
+    #[test]
+    fn member_map_follows_the_source_that_was_already_there() {
+        let mut zone = zone_from_old_line("n1");
+        zone.members = vec!["spk".into()];
+        zone.set_sources(vec![ZoneSource::Feed {
+            kind: FeedKind::Spotify,
+            node_id: "pc".into(),
+        }]);
+        zone.maps.insert("spk".into(), swapped());
+        let previous = zone.zone_sources();
+        zone.set_sources(vec![
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+            ZoneSource::Line("n1".into()),
+        ]);
+        keep_single_source_map(&mut zone, &previous);
+        assert_eq!(zone.source_maps["spk"]["spotify:pc"], swapped());
+        assert!(zone.source_maps["spk"].get("n1").is_none(), "новый микрофон карту не получает");
+        assert_eq!(zone.maps["spk"], swapped(), "карта члена остаётся");
+
+        let mut mic = zone_from_old_line("n1");
+        mic.members = vec!["spk".into()];
+        mic.maps.insert("spk".into(), swapped());
+        let previous = mic.zone_sources();
+        mic.set_sources(vec![
+            ZoneSource::Line("n1".into()),
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pc".into() },
+        ]);
+        keep_single_source_map(&mut mic, &previous);
+        assert_eq!(mic.source_maps["spk"]["n1"], swapped());
+        assert!(
+            mic.source_maps["spk"].get("spotify:pc").is_none(),
+            "новый хозяин остаётся без ключа"
+        );
+
+        let mut plain = zone_from_old_line("n1");
+        plain.members = vec!["spk".into()];
+        plain.maps.insert("spk".into(), ChannelMap::default());
+        plain.source_maps.entry("spk".into()).or_default().insert("n1".into(), swapped());
+        let previous = plain.zone_sources();
+        plain.set_sources(vec![
+            ZoneSource::Line("n1".into()),
+            ZoneSource::Feed { kind: FeedKind::Virtual, node_id: "pc".into() },
+        ]);
+        keep_single_source_map(&mut plain, &previous);
+        assert!(
+            plain.source_maps.get("spk").is_none(),
+            "прямое стерео ключом не пишется и старый ключ не звучит вместо карты члена"
+        );
+
+        let mut replaced = zone_from_old_line("n1");
+        replaced.members = vec!["spk".into()];
+        replaced.set_sources(vec![ZoneSource::Feed {
+            kind: FeedKind::Spotify,
+            node_id: "pc".into(),
+        }]);
+        replaced.maps.insert("spk".into(), swapped());
+        let previous = replaced.zone_sources();
+        replaced.set_sources(vec![
+            ZoneSource::Feed { kind: FeedKind::Spotify, node_id: "pi".into() },
+            ZoneSource::Line("n1".into()),
+        ]);
+        keep_single_source_map(&mut replaced, &previous);
+        assert!(replaced.source_maps.is_empty(), "сменённый хозяин карту не наследует");
     }
 }

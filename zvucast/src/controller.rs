@@ -39,8 +39,9 @@ use crate::update::{
 };
 use crate::silence::{classify, fold_samples, Sample, SilenceBook, ZoneTick};
 use crate::state::{
-    assignment, clear_feed, default_jb_ms, drop_missing_feed_keys, normalize_sources, owner_ids,
-    owner_maps, zone_groups, NodeMeta, State as MasterState, StateStore, Zone, ZoneSource,
+    assignment, clear_feed, default_jb_ms, drop_missing_feed_keys, keep_single_source_map,
+    normalize_sources, owner_ids, owner_maps, zone_groups, NodeMeta, State as MasterState, StateStore,
+    Zone, ZoneSource,
 };
 
 /// Телеметрия старше этого таймаута → узел в offline по sweep.
@@ -1529,10 +1530,12 @@ async fn patch_zone(
     };
     st.update_state(|s| {
         if let Some(z) = s.zones.iter_mut().find(|z| z.id == id) {
+            let mut previous_sources = None;
             if let Some(name) = b.name {
                 z.name = name;
             }
             if let Some(sources) = new_sources {
+                previous_sources = Some(z.zone_sources());
                 z.set_sources(sources);
                 drop_missing_feed_keys(z);
             }
@@ -1552,6 +1555,9 @@ async fn patch_zone(
                         z.maps.insert(member, map);
                     }
                 }
+            }
+            if let Some(previous) = previous_sources {
+                keep_single_source_map(z, &previous);
             }
             if let Some(incoming) = b.source_maps.clone() {
                 for (member, by_source) in incoming {

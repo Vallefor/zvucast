@@ -510,8 +510,8 @@ impl PlayGate {
 }
 
 /// Транспортное состояние tx в gst-домене: группы зон + dscp.
-/// Пустые группы и пустой список не шлют udpsink, поэтому разница dscp
-/// между двумя такими наборами пересборку не вызывает.
+/// Пустые группы микрофона udpsink не шлют, поэтому смена dscp их не
+/// пересобирает. Метка всё равно запоминается: хвосты видов метят RTP ею.
 #[derive(Default)]
 struct Transport {
     zones: Vec<ZoneEndpoints>,
@@ -619,29 +619,36 @@ fn zones_have_sinks(zones: &[ZoneEndpoints]) -> bool {
 enum SetEndpointsOutcome {
     /// набор и dscp совпали с применёнными — пересборка не нужна.
     Unchanged,
-    /// транспорт изменён — Runner остановлен, пересборка вооружена.
+    /// микрофонные группы или dscp при живых колонках — Runner остановлен.
     Changed,
+    /// колонок микрофона нет, dscp запомнен. Живые хвосты видов пересобрать.
+    FeedDscp,
 }
 
-/// Обработка CtlMsg::SetEndpoints — вызывается ТОЛЬКО для tx-половины
-/// (узлы без неё фильтруются в gst_domain). Дедуп по эффективному транспорту
-/// как прежде: два пустых набора равны независимо от dscp (см. Transport).
+/// Обработка CtlMsg::SetEndpoints — только tx-половина.
+/// Пустой набор микрофона dscp запоминает и не роняет runner: хвосты видов
+/// пересобирает вызывающий. Зона с колонками микрофона по-прежнему
+/// пересобирает весь tx, если набор или dscp изменились.
 fn handle_set_endpoints(
     transport: &RefCell<Transport>,
     zones: Vec<ZoneEndpoints>,
     dscp: u8,
     half: &mut RoleHalf,
 ) -> SetEndpointsOutcome {
-    {
+    let (zones_same, dscp_same, both_silent) = {
         let t = transport.borrow();
-        let unchanged = if !zones_have_sinks(&t.zones) && !zones_have_sinks(&zones) {
-            t.zones == zones
-        } else {
-            t.zones == zones && t.dscp == dscp
-        };
-        if unchanged {
-            return SetEndpointsOutcome::Unchanged;
-        }
+        (
+            t.zones == zones,
+            t.dscp == dscp,
+            !zones_have_sinks(&t.zones) && !zones_have_sinks(&zones),
+        )
+    };
+    if zones_same && dscp_same {
+        return SetEndpointsOutcome::Unchanged;
+    }
+    if both_silent && zones_same {
+        transport.borrow_mut().dscp = dscp;
+        return SetEndpointsOutcome::FeedDscp;
     }
     {
         let mut t = transport.borrow_mut();
@@ -651,6 +658,43 @@ fn handle_set_endpoints(
     drop_runner(&mut half.runner);
     half.gate.arm(&mut half.policy);
     SetEndpointsOutcome::Changed
+}
+
+/// Смена dscp без колонок микрофона. Набор видов тот же, метка на udpsink новая.
+/// Пустой набор и отсутствие runner ничего не собирают: метка уже в Transport.
+fn retarget_feed_dscp(
+    wanted: &RefCell<Vec<zproto::FeedSend>>,
+    applied: &RefCell<Vec<zproto::FeedSend>>,
+    failed: &RefCell<bool>,
+    half: &mut RoleHalf,
+    dscp: u8,
+    bind: Option<&mut dyn crate::pipeline::LocalUdp>,
+) {
+    let feeds = wanted.borrow().clone();
+    if feeds.is_empty() || half.runner.is_none() {
+        return;
+    }
+    let Some(bind) = bind else {
+        return;
+    };
+    match half
+        .runner
+        .as_mut()
+        .unwrap()
+        .reconcile_feeds(&feeds, dscp, bind)
+    {
+        Ok(()) => {
+            *applied.borrow_mut() = feeds;
+            *failed.borrow_mut() = false;
+            tracing::info!(dscp, "tx: dscp хвостов видов обновлён");
+        }
+        Err(e) => {
+            tracing::warn!("tx: хвост вида не принял dscp, пересобираем: {e:#}");
+            *failed.borrow_mut() = true;
+            drop_runner(&mut half.runner);
+            half.gate.arm(&mut half.policy);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1509,14 +1553,34 @@ fn gst_domain(
             }
             Ok(CtlMsg::SetEndpoints { zones, dscp }) => match tx_half.as_mut() {
                 None => tracing::debug!("SetEndpoints: у узла нет tx-половины — игнорируем"),
-                Some(h) => match handle_set_endpoints(&transport, zones, dscp, h) {
-                    SetEndpointsOutcome::Unchanged => tracing::debug!(
-                        "SetEndpoints: транспорт не изменился — пересборка не нужна"
-                    ),
-                    SetEndpointsOutcome::Changed => {
-                        tracing::info!("SetEndpoints: транспорт изменён — пересборка tx-пайплайна")
+                Some(h) => {
+                    let link = link_cell.borrow().clone();
+                    match handle_set_endpoints(&transport, zones, dscp, h) {
+                        SetEndpointsOutcome::Unchanged => tracing::debug!(
+                            "SetEndpoints: транспорт не изменился — пересборка не нужна"
+                        ),
+                        SetEndpointsOutcome::Changed => {
+                            tracing::info!(
+                                "SetEndpoints: транспорт изменён — пересборка tx-пайплайна"
+                            )
+                        }
+                        SetEndpointsOutcome::FeedDscp => {
+                            let dscp = transport.borrow().dscp;
+                            tracing::info!(dscp, "SetEndpoints: dscp хвостов видов");
+                            if link.is_some() {
+                                let mut bind = pipeline_bind(&link);
+                                retarget_feed_dscp(
+                                    &feeds_cell,
+                                    &feeds_applied,
+                                    &feeds_failed,
+                                    h,
+                                    dscp,
+                                    Some(bind.as_mut()),
+                                );
+                            }
+                        }
                     }
-                },
+                }
             },
             Ok(CtlMsg::SetMix { ports, jb_ms }) => match rx_half.as_mut() {
                 None => tracing::debug!("SetMix: у узла нет rx-половины — игнорируем"),
@@ -2212,20 +2276,20 @@ mod tests {
             monitor: "absent".into(),
             endpoints: vec![],
         }]);
-        assert!(missing.is_empty(), "несобранной ветки в feeds нет");
+        assert!(missing.is_empty(), "несобранной ветки в feeds нет — уровень не выдумываем");
         let before = runner.feed_levels(&feeds);
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].zone_id, "hall");
         assert_eq!(before[0].kind, zproto::FeedKind::Spotify);
         assert_eq!(before[0].state, PipelineState::Stopped);
-        assert_eq!(before[0].rms_l, 0.0);
+        assert_eq!(before[0].rms_l, 0.0, "неиграющий хвост не выглядит громким");
         assert_eq!(before[0].rms_r, 0.0);
         runner.start().unwrap();
         let _ = runner.pipeline().state(gstreamer::ClockTime::from_seconds(2));
         let after = runner.feed_levels(&feeds);
         assert_eq!(after[0].state, PipelineState::Playing, "ветка собрана и играет");
-        assert_eq!(after[0].rms_l, 0.0, "нет сигнала — rms остаётся 0");
-        assert_eq!(after[0].rms_r, 0.0);
+        assert_eq!(after[0].rms_l, -90.0, "нет сигнала — тихий уровень, не 0");
+        assert_eq!(after[0].rms_r, -90.0);
         let (bus_tx, _bus_rx) = std::sync::mpsc::channel();
         runner.spawn_bus_watch(bus_tx);
         let feed_src = runner
@@ -2252,15 +2316,18 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut feed_rms = 0.0;
+        let mut feed_rms = -90.0;
         while std::time::Instant::now() < deadline {
             feed_rms = runner.feed_levels(&feeds)[0].rms_l;
-            if feed_rms != 0.0 {
+            if feed_rms > -30.0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_ne!(feed_rms, 0.0, "сигнал фида виден на его level");
+        assert!(
+            feed_rms > -30.0,
+            "сигнал фида виден на его level, rms={feed_rms}"
+        );
         let mic = runner.stats();
         assert_eq!(mic.rms_l, 0.0, "lev микрофона не берёт уровень фида");
         assert_eq!(mic.rms_r, 0.0);
@@ -2882,11 +2949,11 @@ mod tests {
         drop_runner(&mut half.runner);
     }
 
-    /// Свежий агент ({[], 0} по умолчанию) + пуш SetEndpoints{[], 40} —
-    /// дедупликация по эффективному транспорту: branchless-сборка dscp не
-    /// применяет, пересборки нет. Непустой набор пересобирает как обычно.
+    /// Пустой набор микрофона dscp запоминает, но tx не пересобирает:
+    /// udpsink микрофона нет. Повтор той же метки — no-op. Колонка микрофона
+    /// по-прежнему вооружает пересборку.
     #[test]
-    fn set_endpoints_empty_set_ignores_dscp() {
+    fn set_endpoints_empty_set_remembers_dscp_without_mic_rebuild() {
         gstreamer::init().unwrap();
         let transport = RefCell::new(Transport::default());
         let builds = std::cell::Cell::new(0usize);
@@ -2903,19 +2970,22 @@ mod tests {
         assert_eq!(builds.get(), 1);
 
         let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
-        assert_eq!(out, SetEndpointsOutcome::Unchanged);
+        assert_eq!(out, SetEndpointsOutcome::FeedDscp);
+        assert_eq!(transport.borrow().dscp, 40);
         assert!(
             !half.gate.due(),
-            "dscp при пустом наборе не вооружает пересборку"
+            "dscp при пустом наборе не вооружает пересборку микрофона"
         );
+        assert!(half.runner.is_some());
         assert_eq!(builds.get(), 1);
 
-        let out = handle_set_endpoints(&transport, vec![], 0, &mut half);
-        assert_eq!(out, SetEndpointsOutcome::Unchanged);
         let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
         assert_eq!(out, SetEndpointsOutcome::Unchanged);
+        let out = handle_set_endpoints(&transport, vec![], 24, &mut half);
+        assert_eq!(out, SetEndpointsOutcome::FeedDscp);
+        assert_eq!(transport.borrow().dscp, 24);
         assert!(!half.gate.due());
-        assert_eq!(builds.get(), 1, "пересборок так и не было");
+        assert_eq!(builds.get(), 1, "пересборок микрофона так и не было");
         wait_state(half.runner.as_ref().unwrap(), PipelineState::Playing);
 
         let out = handle_set_endpoints(
@@ -2932,9 +3002,102 @@ mod tests {
             &mut half,
         );
         assert_eq!(out, SetEndpointsOutcome::Changed);
+        assert_eq!(transport.borrow().dscp, 40);
         assert!(half.gate.due(), "появился эндпоинт — пересборка вооружена");
 
         drop_runner(&mut half.runner);
+    }
+
+    /// Вид без колонок микрофона получает dscp из SetEndpoints на свой udpsink.
+    /// Повтор той же метки хвост не трогает. Колонка микрофона роняет runner.
+    #[test]
+    fn empty_endpoints_rebuild_feed_tails_with_stored_dscp() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
+        let pipe = crate::pipeline::build_tx_unicast_pw(
+            &cfg,
+            &[],
+            0,
+            Some("mic"),
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let feeds = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![Endpoint {
+                ip: "192.0.2.10".into(),
+                port: 5010,
+            }],
+        }];
+        let mut runner = Runner::from_pipeline_for_test(pipe);
+        runner
+            .reconcile_feeds(&feeds, 0, &mut crate::pipeline::LoopbackUdp)
+            .unwrap();
+        assert_eq!(feed_udpsink_dscp(runner.pipeline()), 0);
+
+        let transport = RefCell::new(Transport::default());
+        let wanted = RefCell::new(feeds.clone());
+        let applied = RefCell::new(Vec::new());
+        let failed = RefCell::new(false);
+        let mut half = RoleHalf::new();
+        half.gate.on_start();
+        half.runner = Some(runner);
+
+        let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
+        assert_eq!(out, SetEndpointsOutcome::FeedDscp);
+        assert_eq!(transport.borrow().dscp, 40);
+        assert!(!half.gate.due());
+        assert_eq!(
+            feed_udpsink_dscp(half.runner.as_ref().unwrap().pipeline()),
+            0,
+            "метка на хвосте меняется отдельным шагом, не сносом tx"
+        );
+
+        retarget_feed_dscp(
+            &wanted,
+            &applied,
+            &failed,
+            &mut half,
+            transport.borrow().dscp,
+            Some(&mut crate::pipeline::LoopbackUdp),
+        );
+        assert!(!*failed.borrow());
+        assert_eq!(applied.borrow().as_slice(), feeds.as_slice());
+        assert!(!half.gate.due(), "живой хвост не вооружает пересборку микрофона");
+        assert_eq!(feed_udpsink_dscp(half.runner.as_ref().unwrap().pipeline()), 40);
+
+        let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
+        assert_eq!(out, SetEndpointsOutcome::Unchanged);
+
+        let out = handle_set_endpoints(
+            &transport,
+            vec![ZoneEndpoints {
+                zone_id: "hall".into(),
+                endpoints: vec![Endpoint {
+                    ip: "192.0.2.36".into(),
+                    port: 5004,
+                }],
+                source: None,
+            }],
+            40,
+            &mut half,
+        );
+        assert_eq!(out, SetEndpointsOutcome::Changed, "колонка микрофона роняет tx");
+        assert!(half.gate.due());
+        assert!(half.runner.is_none());
+    }
+
+    fn feed_udpsink_dscp(pipe: &gstreamer::Pipeline) -> i32 {
+        let sinks: Vec<_> = pipe
+            .children()
+            .into_iter()
+            .filter(|e| e.factory().unwrap().name() == "udpsink")
+            .filter(|e| e.name().starts_with("fsink-"))
+            .collect();
+        assert_eq!(sinks.len(), 1, "у хвоста вида один udpsink");
+        sinks[0].property::<i32>("qos-dscp")
     }
 
     /// Тестовый Runner без ALSA: зеркалит чтение карты в make_rx — имя

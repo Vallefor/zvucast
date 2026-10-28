@@ -5,6 +5,7 @@ import {
   afterMapAttempt,
   applyMapSide,
   canSendZoneMap,
+  channelMapLead,
   ChannelMap,
   ChanSel,
   DEFAULT_ZONE_MAP,
@@ -375,11 +376,7 @@ function ZoneCard({
       )}
       {popup === 'channels' && (
         <Popup title="Каналы" wide onClose={() => setPopup(null)}>
-          <p>
-            {manySources
-              ? 'У каждого источника своя карта: выход колонки берёт канал этого источника.'
-              : 'Каждый включённый выход колонки берёт канал из включённых входов источника.'}
-          </p>
+          <p>{channelMapLead(sources)}</p>
           {effective.length === 0 && <p>Сначала добавьте колонку.</p>}
           <div>
             {effective.map((id) => {
