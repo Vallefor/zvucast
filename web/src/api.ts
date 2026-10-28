@@ -1,6 +1,10 @@
 // Типы зеркалят Rust-структуры controller/registry (serde-имена как в Rust,
 // camelCase не используем).
 
+import type { ZoneSource } from './zoneMap'
+
+export type { ZoneSource } from './zoneMap'
+
 export type ChanSel = 'l' | 'r'
 
 export interface ChannelMap {
@@ -87,7 +91,7 @@ export interface ZoneView {
   id: string
   name: string
   tx: string
-  sources?: string[]
+  sources?: ZoneSource[]
   members: string[]
   active: boolean
   seq: number
@@ -142,7 +146,7 @@ export const api = {
       body: JSON.stringify({ node_id }),
     }),
   zones: (): Promise<{ zones: ZoneView[] }> => fetch('/api/zones').then((r) => r.json()),
-  createZone: (body: { name: string; tx?: string; sources?: string[]; members: string[] }) =>
+  createZone: (body: { name: string; tx?: string; sources?: ZoneSource[]; members: string[] }) =>
     fetch('/api/zones', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -153,7 +157,7 @@ export const api = {
   patchZone: (id: string, body: {
     name?: string
     tx?: string
-    sources?: string[]
+    sources?: ZoneSource[]
     members?: string[]
     silence_timeout_s?: number
     silence_threshold_db?: number

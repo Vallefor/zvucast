@@ -5,7 +5,11 @@ import {
   applyMapSide,
   canSendZoneMap,
   DEFAULT_ZONE_MAP,
+  feedChannelLabel,
+  feedChoiceLabel,
+  selectFeed,
   shouldSendZoneMap,
+  sourceMapKey,
   speakerOutputRows,
 } from './src/zoneMap.ts'
 
@@ -69,6 +73,23 @@ test('откат к поллу во время сохранения всё ра�
   // Без неподтверждённой другой карты совпадение с поллом — не слать.
   assert.equal(shouldSendZoneMap(reverted, polled, undefined), false)
   assert.equal(shouldSendZoneMap(reverted, polled, reverted), false)
+})
+
+test('подписи вида короткие, выбор хозяина с именем узла', () => {
+  assert.equal(feedChannelLabel('spotify', 'l'), 'Spotify (левый)')
+  assert.equal(feedChannelLabel('virtual', 'r'), 'Виртуальная колонка (правый)')
+  assert.equal(feedChoiceLabel('pi4-tx', 'sendspin'), 'Sendspin — pi4-tx')
+  assert.equal(sourceMapKey({ kind: 'line', node_id: 'pi4-tx' }), 'pi4-tx')
+  assert.equal(sourceMapKey({ kind: 'spotify', node_id: 'pc' }), 'spotify:pc')
+  const next = selectFeed(
+    [{ kind: 'line', node_id: 'pi4-tx' }, { kind: 'spotify', node_id: 'pc' }],
+    'spotify',
+    'pi',
+  )
+  assert.deepEqual(next, [
+    { kind: 'line', node_id: 'pi4-tx' },
+    { kind: 'spotify', node_id: 'pi' },
+  ])
 })
 
 test('два левых выхода остаются двумя строками', () => {

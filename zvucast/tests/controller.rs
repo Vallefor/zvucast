@@ -765,7 +765,13 @@ async fn zone_with_two_sources_mixes_both_ports_on_the_speaker() {
     .await;
     assert_eq!(status, 200, "{zone}");
     assert_eq!(zone["tx"], "tx1");
-    assert_eq!(zone["sources"], serde_json::json!(["tx1", "tx2"]));
+    assert_eq!(
+        zone["sources"],
+        serde_json::json!([
+            {"kind": "line", "node_id": "tx1"},
+            {"kind": "line", "node_id": "tx2"}
+        ])
+    );
     let id = zone["id"].as_str().unwrap().to_string();
 
     let (status, _) = http(port, "POST", &format!("/api/zones/{id}/start")).await;
@@ -825,7 +831,7 @@ async fn zone_with_two_sources_mixes_both_ports_on_the_speaker() {
     assert_eq!(status, 200, "{zone}");
     let zone: Value = serde_json::from_str(&zone).unwrap();
     assert_eq!(zone["tx"], "tx2");
-    assert_eq!(zone["sources"], serde_json::json!(["tx2"]));
+    assert_eq!(zone["sources"], serde_json::json!([{"kind": "line", "node_id": "tx2"}]));
     assert_eq!(
         tx1.recv_ctl_within(5).await,
         CtlMsg::SetEndpoints { zones: vec![], dscp: 40 }
@@ -2260,7 +2266,13 @@ async fn virtual_feed_does_not_duplicate_endpoints() {
     .await;
     assert_eq!(status, 200, "{body}");
     let view: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(view["sources"], serde_json::json!(["pc"]));
+    assert_eq!(
+        view["sources"],
+        serde_json::json!([
+            {"kind": "line", "node_id": "pc"},
+            {"kind": "virtual", "node_id": "pc"}
+        ])
+    );
     assert_eq!(view["source_maps"], serde_json::json!({}), "новый хозяин не получает карту по умолчанию");
 
     let feed_name = zvucast::mix::feed_port_name(zproto::FeedKind::Virtual, "pc", &z1);
@@ -2387,7 +2399,10 @@ async fn spotify_feeds_stay_in_their_zones() {
     .await;
     assert_eq!(status, 200, "{body}");
     let view: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(view["sources"], serde_json::json!([]));
+    assert_eq!(
+        view["sources"],
+        serde_json::json!([{"kind": "spotify", "node_id": "pc"}])
+    );
     assert_eq!(view["source_maps"], serde_json::json!({}));
     let n1 = zvucast::mix::feed_port_name(zproto::FeedKind::Spotify, "pc", &z1);
     assert_eq!(pc.recv_ctl_within(2).await, CtlMsg::SetVirtualZones { zones: vec![] });
@@ -2571,7 +2586,13 @@ async fn feed_source_map_is_stored_under_the_source_key() {
     .await;
     assert_eq!(status, 200, "{body}");
     let view: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(view["sources"], serde_json::json!(["pc"]));
+    assert_eq!(
+        view["sources"],
+        serde_json::json!([
+            {"kind": "line", "node_id": "pc"},
+            {"kind": "spotify", "node_id": "pc"}
+        ])
+    );
     assert_eq!(
         view["source_maps"]["s1"],
         serde_json::json!({

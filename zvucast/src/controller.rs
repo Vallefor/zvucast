@@ -1165,7 +1165,8 @@ struct ZoneView {
     id: String,
     name: String,
     tx: String,
-    sources: Vec<String>,
+    /// Микрофоны и виды, как в state: объект `{kind, node_id}`.
+    sources: Vec<ZoneSource>,
     members: Vec<String>,
     active: bool,
     seq: u64,
@@ -1201,7 +1202,7 @@ fn zone_views(state: &MasterState, held: &HashSet<String>) -> Vec<ZoneView> {
                 id: z.id.clone(),
                 name: z.name.clone(),
                 tx: z.tx.clone(),
-                sources: z.source_ids(),
+                sources: z.zone_sources(),
                 members: z.members.clone(),
                 active: z.active,
                 seq: z.seq,
@@ -1241,8 +1242,9 @@ struct CreateZone {
     name: String,
     #[serde(default)]
     tx: Option<String>,
+    /// Строка — микрофон. Объект `{kind, node_id}` — тот же `ZoneSource`, что у PATCH.
     #[serde(default)]
-    sources: Option<Vec<String>>,
+    sources: Option<Vec<ZoneSource>>,
     members: Vec<String>,
     /// Нет поля — запас 2 мс.
     #[serde(default)]
@@ -1276,17 +1278,33 @@ struct PatchZone {
     source_maps: Option<HashMap<String, HashMap<String, ChannelMap>>>,
 }
 
-/// Валидация источника зоны: узел известен реестру (online не требуется —
-/// роли помнятся с последнего hello) и имеет роль Tx.
+fn trimmed_zone_source(src: ZoneSource) -> Option<ZoneSource> {
+    let id = src.node_id().trim();
+    if id.is_empty() {
+        return None;
+    }
+    if id == src.node_id() {
+        return Some(src);
+    }
+    Some(match src {
+        ZoneSource::Line(_) => ZoneSource::Line(id.to_string()),
+        ZoneSource::Feed { kind, .. } => ZoneSource::Feed {
+            kind,
+            node_id: id.to_string(),
+        },
+    })
+}
+
 /// Список источников. `sources` важнее одного `tx`. Пустой список — ошибка.
+/// Строка и `{kind:line}` — микрофон. Повтор ключа схлопывается, первый остаётся.
 fn resolve_sources(
-    sources: Option<Vec<String>>,
+    sources: Option<Vec<ZoneSource>>,
     tx: Option<String>,
-) -> Result<Vec<String>, (StatusCode, String)> {
+) -> Result<Vec<ZoneSource>, (StatusCode, String)> {
     let raw = match sources {
         Some(list) => list,
         None => match tx {
-            Some(id) => vec![id],
+            Some(id) => vec![ZoneSource::Line(id)],
             None => {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1295,12 +1313,15 @@ fn resolve_sources(
             }
         },
     };
-    let mut out = Vec::new();
-    for id in raw {
-        let id = id.trim().to_string();
-        if !id.is_empty() && !out.contains(&id) {
-            out.push(id);
+    let mut out: Vec<ZoneSource> = Vec::new();
+    for src in raw {
+        let Some(src) = trimmed_zone_source(src) else {
+            continue;
+        };
+        if out.iter().any(|got| got.key() == src.key()) {
+            continue;
         }
+        out.push(src);
     }
     if out.is_empty() {
         return Err((
@@ -1311,6 +1332,8 @@ fn resolve_sources(
     Ok(out)
 }
 
+/// Узел известен реестру (online не требуется — роли помнятся с последнего
+/// hello) и имеет роль Tx.
 fn validate_zone_tx(reg: &Registry, tx: &str) -> Result<(), (StatusCode, String)> {
     let roles = reg.roles_of(tx).ok_or((
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -1359,8 +1382,8 @@ async fn create_zone(
     let sources = resolve_sources(b.sources, b.tx)?;
     {
         let reg = st.reg.lock().await;
-        for tx in &sources {
-            validate_zone_tx(&reg, tx)?;
+        for src in &sources {
+            validate_zone_tx(&reg, src.node_id())?;
         }
         validate_zone_members(&reg, &members)?;
     }
@@ -1400,7 +1423,7 @@ fn zone_view_from(z: &Zone) -> ZoneView {
         id: z.id.clone(),
         name: z.name.clone(),
         tx: z.tx.clone(),
-        sources: z.source_ids(),
+        sources: z.zone_sources(),
         members: z.members.clone(),
         active: z.active,
         seq: z.seq,
