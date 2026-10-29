@@ -56,6 +56,8 @@ pub struct Runner {
     captures: Vec<MonitorCapture>,
     /// pw-record монитора зоны. Снимается отдельно, чтобы не ронять RTP.
     monitors: Vec<ZoneMonitor>,
+    /// pw-record хвостов видов. Не пишет в микшер микрофона.
+    feed_captures: Vec<FeedCapture>,
     /// pw-play колонок. Нет, пока rx не через PipeWire.
     playback: Option<DesktopPlay>,
 }
@@ -63,6 +65,10 @@ pub struct Runner {
 struct ZoneMonitor {
     zone_id: String,
     node: String,
+    capture: MonitorCapture,
+}
+
+struct FeedCapture {
     capture: MonitorCapture,
 }
 
@@ -461,6 +467,79 @@ impl Runner {
         Ok(())
     }
 
+    /// Хвосты видов в том же пайплайне. pw-record пишет в appsrc хвоста,
+    /// не в микшер микрофона. Ошибка pw-record не снимает хвост: сигнала нет.
+    pub fn reconcile_feeds(
+        &mut self,
+        feeds: &[zproto::FeedSend],
+        dscp: u8,
+        bind: &mut dyn crate::pipeline::LocalUdp,
+    ) -> Result<()> {
+        for cap in self.feed_captures.drain(..) {
+            cap.capture.shutdown();
+        }
+        crate::pipeline::reconcile_feed_tails(&self.pipeline, feeds, dscp, bind)?;
+        // Тот же вид в той же зоне — один appsrc. Второй pw-record в него не стартует.
+        let mut seen = std::collections::BTreeSet::new();
+        for feed in feeds {
+            let name = crate::pipeline::feed_appsrc_name(feed.kind.as_str(), &feed.zone_id);
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(src) = self.pipeline.by_name(&name) else {
+                continue;
+            };
+            match MonitorCapture::start(src, &feed.monitor) {
+                Ok(capture) => self.feed_captures.push(FeedCapture { capture }),
+                Err(e) => tracing::warn!(monitor = %feed.monitor, "pw-record вида: {e:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Уровень каждого хвоста, который реально собран. Нет элемента — записи нет.
+    /// Играющий хвост без свежего level — −90/−90, не 0: иначе тишина не копится.
+    /// С `lev` микрофона эта пара не смешивается.
+    pub fn feed_levels(&self, feeds: &[zproto::FeedSend]) -> Vec<zproto::FeedLevel> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for feed in feeds {
+            let level_name = crate::pipeline::feed_level_name(feed.kind.as_str(), &feed.zone_id);
+            if !seen.insert(level_name.clone()) {
+                continue;
+            }
+            let Some(el) = self.pipeline.by_name(&level_name) else {
+                continue;
+            };
+            let state = match el.current_state() {
+                gst::State::Playing | gst::State::Paused => zproto::PipelineState::Playing,
+                _ => zproto::PipelineState::Stopped,
+            };
+            let measured = self
+                .rms
+                .lock()
+                .ok()
+                .map(|book| book.recent(&level_name))
+                .unwrap_or((0.0, 0.0));
+            // 0/0 — level ещё не прислал буфер. Для играющего хвоста это тишина,
+            // не «нет данных»: микрофонный `lev` по-прежнему остаётся 0.
+            let (rms_l, rms_r) = if state == zproto::PipelineState::Playing && measured == (0.0, 0.0)
+            {
+                (-90.0, -90.0)
+            } else {
+                measured
+            };
+            out.push(zproto::FeedLevel {
+                zone_id: feed.zone_id.clone(),
+                kind: feed.kind,
+                state,
+                rms_l,
+                rms_r,
+            });
+        }
+        out
+    }
+
     /// rx-половина: udpsrc → … → alsasink(slave-method=skew); карта ALSA
     /// из device — для queue_ms из /proc/asound. cm — матрица микширования
     /// зон (channel-matrix → mix-matrix в mconv).
@@ -532,6 +611,7 @@ impl Runner {
             stop_flag: Arc::new(AtomicBool::new(false)),
             captures: Vec::new(),
             monitors: Vec::new(),
+            feed_captures: Vec::new(),
             playback: None,
         }
     }
@@ -561,6 +641,9 @@ impl Runner {
         }
         for monitor in &self.monitors {
             monitor.capture.shutdown();
+        }
+        for cap in &self.feed_captures {
+            cap.capture.shutdown();
         }
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             tracing::warn!("set_state(Null) не удался: {e}");
@@ -598,7 +681,8 @@ impl Runner {
         s.dropped = stutter_count(self.underruns.load(Ordering::Relaxed), late, lost);
         s.queue_ms = self.alsa_card.as_deref().map_or(-1, read_alsa_queue_ms);
         if let Ok(rms) = self.rms.lock() {
-            let (l, r) = rms.loudest();
+            // Линия `lev` — только голова захвата. Хвосты видов сюда не входят.
+            let (l, r) = rms.recent("lev");
             s.rms_l = l;
             s.rms_r = r;
         }
@@ -720,22 +804,13 @@ impl RmsBook {
         self.slots.insert(key.to_string(), (l, r, Instant::now()));
     }
 
-    /// Самый громкий level за последние 500 мс. Тишина общей головы не
-    /// затирает зону, которая играет со своего выхода.
-    fn loudest(&self) -> (f64, f64) {
+    /// Свежий замер одного level за последние 500 мс. Нет сигнала — 0.
+    fn recent(&self, key: &str) -> (f64, f64) {
         let cutoff = Instant::now() - Duration::from_millis(500);
-        let mut best: Option<(f64, f64)> = None;
-        for (l, r, at) in self.slots.values() {
-            if *at < cutoff {
-                continue;
-            }
-            let score = l.max(*r);
-            match best {
-                Some((bl, br)) if bl.max(br) >= score => {}
-                _ => best = Some((*l, *r)),
-            }
+        match self.slots.get(key) {
+            Some((l, r, at)) if *at >= cutoff => (*l, *r),
+            _ => (0.0, 0.0),
         }
-        best.unwrap_or((0.0, 0.0))
     }
 }
 

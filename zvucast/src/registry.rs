@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use zproto::{
-    CaptureChan, ChannelMap, CtlMsg, Endpoint, EventKind, PipelineState, Role, SetupIssue,
+    CaptureChan, ChannelMap, CtlMsg, Endpoint, EventKind, FeedKind, PipelineState, Role, SetupIssue,
     SoloistState, Telemetry,
 };
 
@@ -325,6 +325,28 @@ impl Registry {
         ))
     }
 
+    /// Уровень вида в зоне: возраст от `now`, играет ли хвост, rms_l, rms_r.
+    /// Нет узла, кадра или этой пары зона+вид → None. С tx-парой не смешивается.
+    pub fn feed_sample(
+        &self,
+        node_id: &str,
+        zone_id: &str,
+        kind: FeedKind,
+        now: Instant,
+    ) -> Option<(Duration, bool, f64, f64)> {
+        let (at, telem) = self.nodes.get(node_id)?.last_telem.as_ref()?;
+        let feed = telem
+            .feeds
+            .iter()
+            .find(|level| level.zone_id == zone_id && level.kind == kind)?;
+        Some((
+            now.saturating_duration_since(*at),
+            feed.state == PipelineState::Playing,
+            feed.rms_l,
+            feed.rms_r,
+        ))
+    }
+
     /// Событие от узла (AgentMsg::Event, по node_id). Неизвестный узел — warn,
     /// не паника.
     pub fn event(&mut self, node_id: &str, kind: EventKind, detail: String) {
@@ -533,7 +555,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zproto::{ChanSel, PipelineState, RoleRx, SetupIssue, SoloistState};
+    use zproto::{ChanSel, FeedKind, FeedLevel, PipelineState, RoleRx, RoleTx, SetupIssue, SoloistState};
 
     fn telem() -> Telemetry {
         Telemetry {
@@ -544,6 +566,7 @@ mod tests {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         }
     }
 
@@ -989,5 +1012,46 @@ mod tests {
         assert_eq!(command, "curl soloist");
         assert!(!r.list()[0].online);
         assert_eq!(r.setup_of("missing"), (false, vec![], SoloistState::Unknown, String::new()));
+    }
+
+    /// tx RMS и RMS вида одной телеметрии не смешиваются. Чужая зона — None.
+    #[test]
+    fn feed_sample_reads_its_zone_and_misses_another() {
+        let mut r = Registry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        r.hello(
+            "pc", "pc", vec![Role::Tx], "0.1".into(), String::new(),
+            None, None, "192.0.2.10".into(), tx,
+        );
+        r.telemetry(
+            "pc",
+            Telemetry {
+                tx: Some(RoleTx { state: PipelineState::Playing, rms_l: -10.0, rms_r: -10.0 }),
+                rx: None,
+                ptp_offset_ns: 0,
+                uptime_s: 1,
+                capture_volume: None,
+                playback_volume: None,
+                device_volumes: Vec::new(),
+                feeds: vec![FeedLevel {
+                    zone_id: "z1".into(),
+                    kind: FeedKind::Spotify,
+                    state: PipelineState::Playing,
+                    rms_l: -90.0,
+                    rms_r: -90.0,
+                }],
+            },
+        );
+        let now = Instant::now();
+        let (age, playing, rms_l, rms_r) = r.tx_sample("pc", now).unwrap();
+        assert!(age < Duration::from_secs(2));
+        assert!(playing);
+        assert_eq!((rms_l, rms_r), (-10.0, -10.0));
+        let (age, playing, rms_l, rms_r) = r.feed_sample("pc", "z1", FeedKind::Spotify, now).unwrap();
+        assert!(age < Duration::from_secs(2));
+        assert!(playing);
+        assert_eq!((rms_l, rms_r), (-90.0, -90.0));
+        assert!(r.feed_sample("pc", "other", FeedKind::Spotify, now).is_none());
+        assert!(r.feed_sample("missing", "z1", FeedKind::Spotify, now).is_none());
     }
 }

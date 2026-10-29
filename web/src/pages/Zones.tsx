@@ -5,14 +5,21 @@ import {
   afterMapAttempt,
   applyMapSide,
   canSendZoneMap,
+  channelMapLead,
   ChannelMap,
   ChanSel,
   DEFAULT_ZONE_MAP,
+  feedChoiceLabel,
+  feedMappingChoices,
+  FeedKind,
   mappingChoices,
   MappingChoice,
   sameChannelMap,
+  selectFeed,
   shouldSendZoneMap,
+  sourceMapKey,
   speakerOutputRows,
+  ZoneSource,
 } from '../zoneMap'
 
 const POLL_MS = 2000
@@ -21,8 +28,25 @@ function nodeLabel(n: NodeView): string {
   return n.display_name ?? n.name
 }
 
-function zoneSourceIds(zone: ZoneView): string[] {
-  return zone.sources && zone.sources.length > 0 ? zone.sources : [zone.tx]
+const FEED_KINDS: readonly FeedKind[] = ['spotify', 'sendspin', 'virtual']
+
+function zoneSources(zone: ZoneView): ZoneSource[] {
+  return zone.sources ?? []
+}
+
+function sourceCaption(src: ZoneSource, byId: Map<string, NodeView>): string {
+  const node = byId.get(src.node_id)
+  const label = node ? nodeLabel(node) : src.node_id
+  return src.kind === 'line' ? label : feedChoiceLabel(label, src.kind)
+}
+
+function feedHosts(nodes: readonly NodeView[], kind: FeedKind): NodeView[] {
+  return nodes.filter((n) => {
+    if (!n.supports_virtual_output) return false
+    if (kind === 'spotify') return Boolean(n.spotify)
+    if (kind === 'sendspin') return Boolean(n.sendspin)
+    return Boolean(n.virtual_output)
+  })
 }
 
 function mapStorageKey(member: string, sourceId: string | null): string {
@@ -34,8 +58,16 @@ function splitMapKey(key: string): { member: string; sourceId: string | null } {
   return { member, sourceId: sourceId ?? null }
 }
 
+function isFeedMapKey(key: string): boolean {
+  return key.startsWith('spotify:') || key.startsWith('sendspin:') || key.startsWith('virtual:')
+}
+
 function storedMap(zone: ZoneView, member: string, sourceId: string | null): ChannelMap | undefined {
-  if (sourceId) return zone.source_maps?.[member]?.[sourceId] ?? zone.maps[member]
+  if (!sourceId) return zone.maps[member]
+  const own = zone.source_maps?.[member]?.[sourceId]
+  if (own) return own
+  // Нет ключа у вида — прямое стерео, не общая карта микрофона.
+  if (isFeedMapKey(sourceId)) return undefined
   return zone.maps[member]
 }
 
@@ -248,16 +280,13 @@ function ZoneCard({
     })()
   }
 
-  const sourceIds = zoneSourceIds(zone)
+  const sources = zoneSources(zone)
   const stolenTitle = zone.stolen
     .map((id) => byId.get(id)?.display_name ?? byId.get(id)?.name ?? id)
     .join(', ')
 
-  const sourceNames = sourceIds.map((id) => {
-    const n = txNodes.find((node) => node.node_id === id)
-    return n ? nodeLabel(n) : id
-  })
-  const manySources = sourceIds.length > 1
+  const sourceNames = sources.map((src) => sourceCaption(src, byId))
+  const manySources = sources.length > 1
   const freeRx = rxNodes.filter((n) => !effective.includes(n.node_id))
 
   return (
@@ -347,11 +376,7 @@ function ZoneCard({
       )}
       {popup === 'channels' && (
         <Popup title="Каналы" wide onClose={() => setPopup(null)}>
-          <p>
-            {manySources
-              ? 'У каждого источника своя карта: выход колонки берёт канал этого источника.'
-              : 'Каждый включённый выход колонки берёт канал из включённых входов источника.'}
-          </p>
+          <p>{channelMapLead(sources)}</p>
           {effective.length === 0 && <p>Сначала добавьте колонку.</p>}
           <div>
             {effective.map((id) => {
@@ -363,22 +388,25 @@ function ZoneCard({
                 <div key={id} className="stack" style={{ marginBottom: '0.8rem' }}>
                   <strong>{label}</strong>
                   {rows.length === 0 && <p className="hint">У колонки нет включённых выходов в стереопотоке.</p>}
-                  {sourceIds.map((sourceId) => {
-                    const src = txNodes.find((node) => node.node_id === sourceId)
-                    const srcName = src ? nodeLabel(src) : sourceId
-                    const srcOptions = mappingChoices(src?.inputs ?? [])
-                    const sourceKey = manySources ? sourceId : null
+                  {sources.map((source) => {
+                    const src = byId.get(source.node_id)
+                    const srcName = sourceCaption(source, byId)
+                    const srcOptions = source.kind === 'line'
+                      ? mappingChoices(src?.inputs ?? [])
+                      : feedMappingChoices(source.kind)
+                    const mapKey = sourceMapKey(source)
+                    const sourceKey = manySources ? mapKey : null
                     const map = mapOverrides[mapStorageKey(id, sourceKey)]
                       ?? storedMap(zone, id, sourceKey)
                       ?? DEFAULT_ZONE_MAP
                     return (
-                      <div key={sourceId}>
+                      <div key={mapKey}>
                         {manySources && <div className="device-name">{srcName}</div>}
                         {rows.map((row) => (
-                          <div key={`${sourceId}-${row.id}`} className="stack" style={{ gap: '0.25rem', marginTop: '0.45rem' }}>
+                          <div key={`${mapKey}-${row.id}`} className="stack" style={{ gap: '0.25rem', marginTop: '0.45rem' }}>
                             <div>{row.label}</div>
                             <ChanSelect
-                              group={`${id}-${sourceId}-${row.id}`}
+                              group={`${id}-${mapKey}-${row.id}`}
                               label={`${row.label}, ${label}, ${srcName}`}
                               options={srcOptions}
                               value={row.side === 'out_l' ? map.out_l : map.out_r}
@@ -396,14 +424,15 @@ function ZoneCard({
               )
             })}
           </div>
-          {sourceIds.map((sourceId) => {
-            const src = txNodes.find((node) => node.node_id === sourceId)
+          {sources.map((source) => {
+            if (source.kind !== 'line') return null
+            const src = byId.get(source.node_id)
             const listed = new Set(mappingChoices(src?.inputs ?? []).map((c) => c.id))
             const idle = (src?.inputs ?? []).filter((i) => i.enabled && i.stream == null && !listed.has(i.id))
             if (idle.length === 0) return null
-            const prefix = manySources ? `${src ? nodeLabel(src) : sourceId}: ` : ''
+            const prefix = manySources ? `${sourceCaption(source, byId)}: ` : ''
             return (
-              <p key={sourceId} className="hint">
+              <p key={sourceMapKey(source)} className="hint">
                 {prefix}В стереопоток не входят: {idle.map((i) => i.name).join(', ')}.
               </p>
             )
@@ -426,7 +455,22 @@ function ZoneSettings({
   const run = useRun()
   const { toast } = useUi()
   const [name, setName] = useState(zone.name)
-  const [picked, setPicked] = useState(zoneSourceIds(zone))
+  const [picked, setPicked] = useState(zoneSources(zone))
+  const lineOn = (id: string) => picked.some((s) => s.kind === 'line' && s.node_id === id)
+  const toggleLine = (id: string) => {
+    setPicked((prev) => (
+      prev.some((s) => s.kind === 'line' && s.node_id === id)
+        ? prev.filter((s) => !(s.kind === 'line' && s.node_id === id))
+        : [...prev, { kind: 'line', node_id: id }]
+    ))
+  }
+  const toggleFeed = (kind: FeedKind, nodeId: string) => {
+    setPicked((prev) => {
+      const current = prev.find((s) => s.kind === kind)
+      if (current?.node_id === nodeId) return prev.filter((s) => s.kind !== kind)
+      return selectFeed(prev, kind, nodeId)
+    })
+  }
   const [minutes, setMinutes] = useState(String(Math.round(zone.silence_timeout_s / 60)))
   const [db, setDb] = useState(String(zone.silence_threshold_db))
   const [jbMs, setJbMs] = useState(String(zone.jb_ms))
@@ -490,31 +534,48 @@ function ZoneSettings({
               <input
                 type="checkbox"
                 aria-label={`Источник ${nodeLabel(n)}`}
-                checked={picked.includes(n.node_id)}
-                onChange={() => {
-                  setPicked((prev) => (
-                    prev.includes(n.node_id)
-                      ? prev.filter((id) => id !== n.node_id)
-                      : [...prev, n.node_id]
-                  ))
-                }}
+                checked={lineOn(n.node_id)}
+                onChange={() => toggleLine(n.node_id)}
               />
               <span>{nodeLabel(n)}</span>
             </label>
           ))}
           {picked
-            .filter((id) => !txNodes.some((n) => n.node_id === id))
-            .map((id) => (
-              <label key={id} className="source-row">
+            .filter((s) => s.kind === 'line' && !txNodes.some((n) => n.node_id === s.node_id))
+            .map((s) => (
+              <label key={s.node_id} className="source-row">
                 <input
                   type="checkbox"
-                  aria-label={`Источник ${id}`}
+                  aria-label={`Источник ${s.node_id}`}
                   checked
-                  onChange={() => setPicked((prev) => prev.filter((x) => x !== id))}
+                  onChange={() => toggleLine(s.node_id)}
                 />
-                <span>{id} (нет в реестре)</span>
+                <span>{s.node_id} (нет в реестре)</span>
               </label>
             ))}
+          {FEED_KINDS.map((kind) => {
+            const hosts = feedHosts(txNodes, kind)
+            if (hosts.length === 0) return null
+            const selected = picked.find((s) => s.kind === kind)?.node_id
+            return (
+              <div key={kind}>
+                {hosts.map((n) => {
+                  const label = feedChoiceLabel(nodeLabel(n), kind)
+                  return (
+                    <label key={`${kind}:${n.node_id}`} className="source-row">
+                      <input
+                        type="checkbox"
+                        aria-label={label}
+                        checked={selected === n.node_id}
+                        onChange={() => toggleFeed(kind, n.node_id)}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  )
+                })}
+              </div>
+            )
+          })}
         </div>
         <label className="inline">
           Тишина, мин
@@ -588,7 +649,11 @@ export default function Zones() {
       return
     }
     void run(
-      api.createZone({ name: 'Новая зона', sources: [firstTx.node_id], members: [] }),
+      api.createZone({
+        name: 'Новая зона',
+        sources: [{ kind: 'line', node_id: firstTx.node_id }],
+        members: [],
+      }),
       'создание зоны',
     )
   }

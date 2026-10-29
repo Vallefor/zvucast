@@ -79,6 +79,19 @@ pub mod proto {
         /// Старый агент поле не шлёт.
         #[serde(default)]
         pub device_volumes: Vec<DeviceVolume>,
+        /// Уровни живых хвостов видов. Старый JSON без поля — пустой вектор.
+        #[serde(default)]
+        pub feeds: Vec<FeedLevel>,
+    }
+
+    /// Уровень одного хвоста вида. Нет сигнала — `rms_l` и `rms_r` остаются 0.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct FeedLevel {
+        pub zone_id: String,
+        pub kind: FeedKind,
+        pub state: PipelineState,
+        pub rms_l: f64,
+        pub rms_r: f64,
     }
 
     /// Кубическая громкость одного устройства, 0.0..=1.5.
@@ -185,6 +198,25 @@ pub mod proto {
         pub port: u16,
     }
 
+    /// Вид на узле-хозяине. Микрофон сюда не входит.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum FeedKind {
+        Spotify,
+        Sendspin,
+        Virtual,
+    }
+
+    impl FeedKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                FeedKind::Spotify => "spotify",
+                FeedKind::Sendspin => "sendspin",
+                FeedKind::Virtual => "virtual",
+            }
+        }
+    }
+
     /// Одна зона передатчика: свой RTP, свои слушатели.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ZoneEndpoints {
@@ -200,6 +232,16 @@ pub mod proto {
     pub struct VirtualZone {
         pub zone_id: String,
         pub name: String,
+    }
+
+    /// Поток одного вида в одну зону. Порт в `endpoints` — слот этого вида,
+    /// не порт микрофона. Пустой `SetFeeds` снимает все такие потоки.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct FeedSend {
+        pub zone_id: String,
+        pub kind: FeedKind,
+        pub monitor: String,
+        pub endpoints: Vec<Endpoint>,
     }
 
     /// Секрет в сообщениях контроллера. В Debug не попадает.
@@ -261,6 +303,8 @@ pub mod proto {
         /// Sendspin-колонка на каждую зону передатчика. Пустой список гасит всех.
         /// Ключа нет: зоны и есть колонки.
         SetSendspin { zones: Vec<VirtualZone> },
+        /// Потоки видов хозяина. Пустой список снимает все. Одна запись — одна зона одного вида.
+        SetFeeds { feeds: Vec<FeedSend> },
         /// Создать или убрать виртуальный выход zvucast.
         SetVirtualOutput { enabled: bool },
         /// Куда смотрит захват. None — голова без цели (на PipeWire это тишина).
@@ -406,6 +450,7 @@ mod tests {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"rx\":null"), "отсутствующая роль — null: {s}");
@@ -423,6 +468,7 @@ mod tests {
             capture_volume: None,
             playback_volume: None,
             device_volumes: Vec::new(),
+            feeds: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"queue_ms\":5"), "поля rx на месте: {s}");
@@ -590,6 +636,22 @@ mod tests {
             serde_json::from_str::<CtlMsg>(r#"{"type":"SetSendspin","zones":[]}"#).unwrap(),
             CtlMsg::SetSendspin { zones: vec![] }
         );
+        let feeds = CtlMsg::SetFeeds {
+            feeds: vec![FeedSend {
+                zone_id: "z1".into(),
+                kind: FeedKind::Spotify,
+                monitor: "zvucast-spotify-z1-monitor".into(),
+                endpoints: vec![Endpoint { ip: "192.0.2.36".into(), port: 5010 }],
+            }],
+        };
+        let feeds_json = serde_json::to_string(&feeds).unwrap();
+        assert!(feeds_json.contains("\"type\":\"SetFeeds\""));
+        assert!(feeds_json.contains("\"kind\":\"spotify\""));
+        assert_eq!(serde_json::from_str::<CtlMsg>(&feeds_json).unwrap(), feeds);
+        assert_eq!(
+            serde_json::from_str::<CtlMsg>(r#"{"type":"SetFeeds","feeds":[]}"#).unwrap(),
+            CtlMsg::SetFeeds { feeds: vec![] }
+        );
         // совместимость: старые варианты не сломаны
         assert_eq!(serde_json::from_str::<CtlMsg>("{\"type\":\"Start\"}").unwrap(), CtlMsg::Start);
         assert_eq!(
@@ -664,6 +726,36 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_without_feeds_defaults_to_empty() {
+        let raw = r#"{"type":"Telemetry","tx":null,"rx":null,"ptp_offset_ns":0,"uptime_s":1}"#;
+        let AgentMsg::Telemetry(t) = serde_json::from_str(raw).unwrap() else {
+            panic!("не телеметрия");
+        };
+        assert!(t.feeds.is_empty(), "старый JSON без feeds — пустой вектор");
+
+        let with = AgentMsg::Telemetry(Telemetry {
+            tx: None,
+            rx: None,
+            ptp_offset_ns: 0,
+            uptime_s: 1,
+            capture_volume: None,
+            playback_volume: None,
+            device_volumes: Vec::new(),
+            feeds: vec![FeedLevel {
+                zone_id: "hall".into(),
+                kind: FeedKind::Sendspin,
+                state: PipelineState::Playing,
+                rms_l: 0.0,
+                rms_r: 0.0,
+            }],
+        });
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(s.contains("\"feeds\""));
+        assert!(s.contains("\"kind\":\"sendspin\""));
+        assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), with);
+    }
+
+    #[test]
     fn volume_message_roundtrip() {
         let m = AgentMsg::Telemetry(Telemetry {
             tx: None,
@@ -673,6 +765,7 @@ mod tests {
             capture_volume: Some(1.0),
             playback_volume: Some(0.4),
             device_volumes: vec![DeviceVolume { device: "alsa_output.hifi".into(), volume: 0.4, card: String::new(), class: String::new() }],
+            feeds: Vec::new(),
         });
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"capture_volume\":1.0"), "{s}");
@@ -687,5 +780,14 @@ mod tests {
         };
         let wire = serde_json::to_string(&set).unwrap();
         assert_eq!(serde_json::from_str::<CtlMsg>(&wire).unwrap(), set);
+    }
+
+    #[test]
+    fn feed_kind_spotify_serializes_as_spotify() {
+        assert_eq!(serde_json::to_string(&FeedKind::Spotify).unwrap(), "\"spotify\"");
+        assert_eq!(serde_json::from_str::<FeedKind>("\"spotify\"").unwrap(), FeedKind::Spotify);
+        assert_eq!(FeedKind::Spotify.as_str(), "spotify");
+        assert_eq!(FeedKind::Sendspin.as_str(), "sendspin");
+        assert_eq!(FeedKind::Virtual.as_str(), "virtual");
     }
 }

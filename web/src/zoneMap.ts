@@ -158,3 +158,79 @@ export function shouldSendZoneMap(
   if (!base) return true
   return !sameChannelMap(pending, base)
 }
+
+export type FeedKind = 'spotify' | 'sendspin' | 'virtual'
+
+/// Источник зоны, как его отдаёт контроллер: `{kind, node_id}`.
+export type ZoneSource = {
+  kind: 'line' | FeedKind
+  node_id: string
+}
+
+export function feedTitle(kind: FeedKind): string {
+  switch (kind) {
+    case 'spotify':
+      return 'Spotify'
+    case 'sendspin':
+      return 'Sendspin'
+    case 'virtual':
+      return 'Виртуальная колонка'
+  }
+}
+
+export function feedChannelLabel(kind: FeedKind, side: 'l' | 'r'): string {
+  const sideName = side === 'l' ? 'левый' : 'правый'
+  return `${feedTitle(kind)} (${sideName})`
+}
+
+export function feedChoiceLabel(nodeLabel: string, kind: FeedKind): string {
+  return `${feedTitle(kind)} — ${nodeLabel}`
+}
+
+/// В «Каналах» у вида только две стороны, не входы узла.
+export function feedMappingChoices(kind: FeedKind): MappingChoice[] {
+  return (['l', 'r'] as const).map((side) => ({
+    id: `${kind}-${side}`,
+    side,
+    label: feedChannelLabel(kind, side),
+  }))
+}
+
+/// Новый хозяин занимает место прежнего источника этого вида.
+/// Микрофоны и другие виды не двигаются.
+export function selectFeed(
+  sources: readonly ZoneSource[],
+  kind: FeedKind,
+  nodeId: string,
+): ZoneSource[] {
+  const next: ZoneSource = { kind, node_id: nodeId }
+  let placed = false
+  const out: ZoneSource[] = []
+  for (const src of sources) {
+    if (src.kind !== kind) {
+      out.push(src)
+      continue
+    }
+    if (!placed) {
+      out.push(next)
+      placed = true
+    }
+  }
+  if (!placed) out.push(next)
+  return out
+}
+
+/// Ключ `source_maps`. Микрофон — `node_id`, вид — `spotify:pc`. Как `ZoneSource::key`.
+export function sourceMapKey(source: ZoneSource): string {
+  return source.kind === 'line' ? source.node_id : `${source.kind}:${source.node_id}`
+}
+
+/// Подпись окна «Каналы». Один вид — та же короткая фраза, что у нескольких
+/// источников: у вида нет входов узла.
+export function channelMapLead(sources: readonly ZoneSource[]): string {
+  const singleLine = sources.length === 1 && sources[0].kind === 'line'
+  if (sources.length === 0 || singleLine) {
+    return 'Каждый включённый выход колонки берёт канал из включённых входов источника.'
+  }
+  return 'У каждого источника своя карта: выход колонки берёт канал этого источника.'
+}

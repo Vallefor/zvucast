@@ -1,6 +1,8 @@
 //! Стабильный UDP-порт источника. Один tx — один порт на всех колонках,
 //! чтобы два RTP не сходились в одном jitterbuffer.
 
+use zproto::FeedKind;
+
 pub const MIX_PORT_BASE: u16 = 5004;
 pub const MIX_PORT_SLOTS: u16 = 64;
 
@@ -16,6 +18,11 @@ fn fnv1a(name: &str) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     h
+}
+
+/// Имя слота вида. Микрофон в том же вызове остаётся системным именем узла.
+pub fn feed_port_name(kind: FeedKind, node_id: &str, zone_id: &str) -> String {
+    format!("{}:{node_id}:{zone_id}", kind.as_str())
 }
 
 /// Порт каждого имени. Имена сортируются и дедупятся. Коллизия слота —
@@ -51,6 +58,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use zproto::FeedKind;
 
     #[test]
     fn same_set_same_ports_regardless_of_order() {
@@ -115,5 +123,17 @@ mod tests {
         assert_eq!(got.len(), 64);
         let ports: HashSet<u16> = got.iter().map(|(_, p)| *p).collect();
         assert_eq!(ports.len(), 64);
+    }
+
+    #[test]
+    fn feed_port_name_differs_by_zone_and_kind() {
+        let a = feed_port_name(FeedKind::Spotify, "pc", "z1");
+        let b = feed_port_name(FeedKind::Spotify, "pc", "z2");
+        let c = feed_port_name(FeedKind::Sendspin, "pc", "z1");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        let ports = assign_mix_ports(&[a.clone(), "pi4-tx".into()]);
+        assert_eq!(ports.len(), 2);
+        assert_ne!(ports[0].1, ports[1].1);
     }
 }

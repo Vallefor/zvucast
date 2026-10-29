@@ -510,16 +510,15 @@ impl PlayGate {
 }
 
 /// Транспортное состояние tx в gst-домене: группы зон + dscp.
-/// Пустые группы и пустой список не шлют udpsink, поэтому разница dscp
-/// между двумя такими наборами пересборку не вызывает.
+/// Пустые группы микрофона udpsink не шлют, поэтому смена dscp их не
+/// пересобирает. Метка всё равно запоминается: хвосты видов метят RTP ею.
 #[derive(Default)]
 struct Transport {
     zones: Vec<ZoneEndpoints>,
     dscp: u8,
 }
 
-/// Источник зоны после оверлея. Mute и монитор, который уже открыла голова,
-/// дают None: второй pw-record того же узла не нужен.
+/// Источник, который таблица помнит. В RTP микрофона не копируется.
 fn effective_zone_source(
     zone_id: &str,
     linked: bool,
@@ -536,27 +535,15 @@ fn effective_zone_source(
     }
 }
 
+/// Хвост микрофона. Монитор вида в `zone.source` не пишется.
 fn overlay_sources(
     zones: &[ZoneEndpoints],
-    linked: &BTreeSet<String>,
-    table: &crate::sendspin::ZoneTable,
-    muted: &BTreeSet<String>,
-    capture_head: Option<&str>,
+    _linked: &BTreeSet<String>,
+    _table: &crate::sendspin::ZoneTable,
+    _muted: &BTreeSet<String>,
+    _capture_head: Option<&str>,
 ) -> Vec<ZoneEndpoints> {
-    zones
-        .iter()
-        .cloned()
-        .map(|mut zone| {
-            zone.source = effective_zone_source(
-                &zone.zone_id,
-                linked.contains(&zone.zone_id),
-                table,
-                muted,
-                capture_head,
-            );
-            zone
-        })
-        .collect()
+    zones.to_vec()
 }
 
 fn zone_sources(
@@ -632,29 +619,36 @@ fn zones_have_sinks(zones: &[ZoneEndpoints]) -> bool {
 enum SetEndpointsOutcome {
     /// набор и dscp совпали с применёнными — пересборка не нужна.
     Unchanged,
-    /// транспорт изменён — Runner остановлен, пересборка вооружена.
+    /// микрофонные группы или dscp при живых колонках — Runner остановлен.
     Changed,
+    /// колонок микрофона нет, dscp запомнен. Живые хвосты видов пересобрать.
+    FeedDscp,
 }
 
-/// Обработка CtlMsg::SetEndpoints — вызывается ТОЛЬКО для tx-половины
-/// (узлы без неё фильтруются в gst_domain). Дедуп по эффективному транспорту
-/// как прежде: два пустых набора равны независимо от dscp (см. Transport).
+/// Обработка CtlMsg::SetEndpoints — только tx-половина.
+/// Пустой набор микрофона dscp запоминает и не роняет runner: хвосты видов
+/// пересобирает вызывающий. Зона с колонками микрофона по-прежнему
+/// пересобирает весь tx, если набор или dscp изменились.
 fn handle_set_endpoints(
     transport: &RefCell<Transport>,
     zones: Vec<ZoneEndpoints>,
     dscp: u8,
     half: &mut RoleHalf,
 ) -> SetEndpointsOutcome {
-    {
+    let (zones_same, dscp_same, both_silent) = {
         let t = transport.borrow();
-        let unchanged = if !zones_have_sinks(&t.zones) && !zones_have_sinks(&zones) {
-            t.zones == zones
-        } else {
-            t.zones == zones && t.dscp == dscp
-        };
-        if unchanged {
-            return SetEndpointsOutcome::Unchanged;
-        }
+        (
+            t.zones == zones,
+            t.dscp == dscp,
+            !zones_have_sinks(&t.zones) && !zones_have_sinks(&zones),
+        )
+    };
+    if zones_same && dscp_same {
+        return SetEndpointsOutcome::Unchanged;
+    }
+    if both_silent && zones_same {
+        transport.borrow_mut().dscp = dscp;
+        return SetEndpointsOutcome::FeedDscp;
     }
     {
         let mut t = transport.borrow_mut();
@@ -664,6 +658,43 @@ fn handle_set_endpoints(
     drop_runner(&mut half.runner);
     half.gate.arm(&mut half.policy);
     SetEndpointsOutcome::Changed
+}
+
+/// Смена dscp без колонок микрофона. Набор видов тот же, метка на udpsink новая.
+/// Пустой набор и отсутствие runner ничего не собирают: метка уже в Transport.
+fn retarget_feed_dscp(
+    wanted: &RefCell<Vec<zproto::FeedSend>>,
+    applied: &RefCell<Vec<zproto::FeedSend>>,
+    failed: &RefCell<bool>,
+    half: &mut RoleHalf,
+    dscp: u8,
+    bind: Option<&mut dyn crate::pipeline::LocalUdp>,
+) {
+    let feeds = wanted.borrow().clone();
+    if feeds.is_empty() || half.runner.is_none() {
+        return;
+    }
+    let Some(bind) = bind else {
+        return;
+    };
+    match half
+        .runner
+        .as_mut()
+        .unwrap()
+        .reconcile_feeds(&feeds, dscp, bind)
+    {
+        Ok(()) => {
+            *applied.borrow_mut() = feeds;
+            *failed.borrow_mut() = false;
+            tracing::info!(dscp, "tx: dscp хвостов видов обновлён");
+        }
+        Err(e) => {
+            tracing::warn!("tx: хвост вида не принял dscp, пересобираем: {e:#}");
+            *failed.borrow_mut() = true;
+            drop_runner(&mut half.runner);
+            half.gate.arm(&mut half.policy);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,7 +740,8 @@ fn handle_set_playback_target(
     SetCaptureTargetOutcome::Changed
 }
 
-/// Mute меняет только `zone.source`. Тот же набор — no-op.
+/// Mute помнит набор. Монитор вида в `zone.source` не пишется.
+/// Тот же набор — no-op.
 /// PipeWire: живой tx микширует на месте, RTP остаётся. Нет runner
 /// или монитор не встал — дроп и вооружение гейта.
 /// ALSA: микшера зоны нет, набор пишется, runner не рвём, RTP на месте.
@@ -771,7 +803,7 @@ fn handle_set_muted_zones(
         None => false,
     };
     if mixed {
-        tracing::info!("tx: монитор зоны в миксе с line-in, RTP на месте");
+        tracing::info!("tx: RTP микрофона на месте");
         SetCaptureTargetOutcome::Changed
     } else {
         tracing::info!("tx: заглушённые зоны изменились, пересборка");
@@ -960,6 +992,83 @@ fn handle_set_mix(
     drop_runner(&mut half.runner);
     half.gate.arm(&mut half.policy);
     SetMixOutcome::Rebuild
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetFeedsOutcome {
+    Unchanged,
+    Applied,
+    Rebuild,
+}
+
+/// Живой `SetFeeds`. Успех записывает набор в `applied`. Срыв reconcile
+/// оставляет `applied` прежним, кладёт желаемый список в `wanted` и,
+/// как mute, снимает runner и вооружает гейт: `make_tx` соберёт микрофон
+/// и хвосты заново. Пока `failed`, тот же вектор — не no-op.
+fn handle_set_feeds(
+    wanted: &RefCell<Vec<zproto::FeedSend>>,
+    applied: &RefCell<Vec<zproto::FeedSend>>,
+    failed: &RefCell<bool>,
+    next: Vec<zproto::FeedSend>,
+    half: &mut RoleHalf,
+    dscp: u8,
+    bind: Option<&mut dyn crate::pipeline::LocalUdp>,
+) -> SetFeedsOutcome {
+    let retry = *failed.borrow();
+    if !retry && applied.borrow().as_slice() == next.as_slice() {
+        tracing::debug!("SetFeeds: набор не изменился");
+        return SetFeedsOutcome::Unchanged;
+    }
+    let Some(bind) = bind else {
+        *wanted.borrow_mut() = next.clone();
+        *applied.borrow_mut() = next;
+        *failed.borrow_mut() = false;
+        tracing::info!("tx: хвосты видов запомнены, линка нет");
+        return SetFeedsOutcome::Applied;
+    };
+    if half.runner.is_some() {
+        let reconciled = half
+            .runner
+            .as_mut()
+            .unwrap()
+            .reconcile_feeds(&next, dscp, bind);
+        match reconciled {
+            Ok(()) => {
+                *wanted.borrow_mut() = next.clone();
+                *applied.borrow_mut() = next;
+                *failed.borrow_mut() = false;
+                tracing::info!("tx: хвосты видов обновлены, RTP микрофона на месте");
+                SetFeedsOutcome::Applied
+            }
+            Err(e) => {
+                tracing::warn!("tx: хвост вида не встал, пересобираем: {e:#}");
+                *wanted.borrow_mut() = next;
+                *failed.borrow_mut() = true;
+                drop_runner(&mut half.runner);
+                half.gate.arm(&mut half.policy);
+                SetFeedsOutcome::Rebuild
+            }
+        }
+    } else {
+        *wanted.borrow_mut() = next;
+        if retry {
+            SetFeedsOutcome::Rebuild
+        } else {
+            *applied.borrow_mut() = wanted.borrow().clone();
+            tracing::info!("tx: хвосты видов встанут при сборке");
+            SetFeedsOutcome::Applied
+        }
+    }
+}
+
+/// `make_tx` собрал хвосты. Набор считается применённым.
+fn feeds_built(
+    applied: &RefCell<Vec<zproto::FeedSend>>,
+    failed: &RefCell<bool>,
+    wanted: &[zproto::FeedSend],
+) {
+    *applied.borrow_mut() = wanted.to_vec();
+    *failed.borrow_mut() = false;
 }
 
 /// Боевой биндер, когда линк опубликован. Без линка в сборку уходит пустой
@@ -1199,6 +1308,11 @@ fn gst_domain(
 
     // Транспортное состояние (unicast-эндпоинты + dscp) — только tx-половина.
     let transport = RefCell::new(Transport::default());
+    let feeds_cell: RefCell<Vec<zproto::FeedSend>> = RefCell::new(Vec::new());
+    // `applied` — последний успешный набор. `failed` — живой reconcile сорвался,
+    // тот же SetFeeds не no-op, пока `make_tx` не соберёт хвосты.
+    let feeds_applied: RefCell<Vec<zproto::FeedSend>> = RefCell::new(Vec::new());
+    let feeds_failed: RefCell<bool> = RefCell::new(false);
     let capture_target: RefCell<Option<String>> = RefCell::new(None);
     let playback_target: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let muted_zones: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
@@ -1256,7 +1370,14 @@ fn gst_domain(
                     };
                     let zones: &[ZoneEndpoints] = if silent { &[] } else { &t.zones };
                     let mut bind = pipeline_bind(&link);
-                    Runner::new_tx(&cfg.pipeline, &device, zones, t.dscp, bind.as_mut())?
+                    let mut runner =
+                        Runner::new_tx(&cfg.pipeline, &device, zones, t.dscp, bind.as_mut())?;
+                    if !silent {
+                        let wanted = feeds_cell.borrow().clone();
+                        runner.reconcile_feeds(&wanted, t.dscp, bind.as_mut())?;
+                        feeds_built(&feeds_applied, &feeds_failed, &wanted);
+                    }
+                    runner
                 }
                 // Тот же бэкенд, что у rx: PipeWire не отдаёт ALSA захвату от root.
                 // Строка ALSA целью не открывается: голова остаётся тишиной.
@@ -1295,13 +1416,16 @@ fn gst_domain(
                             &muted_now,
                             target.as_deref(),
                         );
-                        let runner = Runner::new_tx_pw(
+                        let mut runner = Runner::new_tx_pw(
                             &cfg.pipeline,
                             &zones,
                             t.dscp,
                             target.as_deref(),
                             bind.as_mut(),
                         )?;
+                        let wanted = feeds_cell.borrow().clone();
+                        runner.reconcile_feeds(&wanted, t.dscp, bind.as_mut())?;
+                        feeds_built(&feeds_applied, &feeds_failed, &wanted);
                         *built_sources.borrow_mut() = sources;
                         runner
                     }
@@ -1429,14 +1553,34 @@ fn gst_domain(
             }
             Ok(CtlMsg::SetEndpoints { zones, dscp }) => match tx_half.as_mut() {
                 None => tracing::debug!("SetEndpoints: у узла нет tx-половины — игнорируем"),
-                Some(h) => match handle_set_endpoints(&transport, zones, dscp, h) {
-                    SetEndpointsOutcome::Unchanged => tracing::debug!(
-                        "SetEndpoints: транспорт не изменился — пересборка не нужна"
-                    ),
-                    SetEndpointsOutcome::Changed => {
-                        tracing::info!("SetEndpoints: транспорт изменён — пересборка tx-пайплайна")
+                Some(h) => {
+                    let link = link_cell.borrow().clone();
+                    match handle_set_endpoints(&transport, zones, dscp, h) {
+                        SetEndpointsOutcome::Unchanged => tracing::debug!(
+                            "SetEndpoints: транспорт не изменился — пересборка не нужна"
+                        ),
+                        SetEndpointsOutcome::Changed => {
+                            tracing::info!(
+                                "SetEndpoints: транспорт изменён — пересборка tx-пайплайна"
+                            )
+                        }
+                        SetEndpointsOutcome::FeedDscp => {
+                            let dscp = transport.borrow().dscp;
+                            tracing::info!(dscp, "SetEndpoints: dscp хвостов видов");
+                            if link.is_some() {
+                                let mut bind = pipeline_bind(&link);
+                                retarget_feed_dscp(
+                                    &feeds_cell,
+                                    &feeds_applied,
+                                    &feeds_failed,
+                                    h,
+                                    dscp,
+                                    Some(bind.as_mut()),
+                                );
+                            }
+                        }
                     }
-                },
+                }
             },
             Ok(CtlMsg::SetMix { ports, jb_ms }) => match rx_half.as_mut() {
                 None => tracing::debug!("SetMix: у узла нет rx-половины — игнорируем"),
@@ -1569,6 +1713,36 @@ fn gst_domain(
                     soloist.sync(soloist_key.as_deref(), &zones);
                 }
             }
+            Ok(CtlMsg::SetFeeds { feeds: next }) => {
+                if tx_half.is_none() {
+                    tracing::debug!("SetFeeds: нет tx — игнорируем");
+                } else if let Some(h) = tx_half.as_mut() {
+                    let link = link_cell.borrow().clone();
+                    let dscp = transport.borrow().dscp;
+                    if link.is_none() {
+                        handle_set_feeds(
+                            &feeds_cell,
+                            &feeds_applied,
+                            &feeds_failed,
+                            next,
+                            h,
+                            dscp,
+                            None,
+                        );
+                    } else {
+                        let mut bind = pipeline_bind(&link);
+                        handle_set_feeds(
+                            &feeds_cell,
+                            &feeds_applied,
+                            &feeds_failed,
+                            next,
+                            h,
+                            dscp,
+                            Some(bind.as_mut()),
+                        );
+                    }
+                }
+            }
             Ok(CtlMsg::SetSendspin { zones }) => {
                 if tx_half.is_none() {
                     tracing::debug!("SetSendspin: нет tx — игнорируем");
@@ -1667,10 +1841,7 @@ fn gst_domain(
         }
 
         while let Ok(crate::sendspin::Note::Stream(zone_id, wire)) = notes_rx.try_recv() {
-            let effect = table.borrow_mut().on_wire(&zone_id, wire);
-            if effect.deactivate {
-                soloist.request_deactivate(&zone_id);
-            }
+            let _effect = table.borrow_mut().on_wire(&zone_id, wire);
         }
 
         let poll_links = cfg.playback_backend == crate::config::Backend::PipeWire
@@ -1695,19 +1866,6 @@ fn gst_domain(
                         let _ = external_tx
                             .try_send(crate::sendspin::External::Exit(effect.zone_id.clone()));
                     }
-                }
-                let deactivate: Vec<String> = {
-                    let t = table.borrow();
-                    t.zone_ids()
-                        .into_iter()
-                        .filter(|zone_id| {
-                            t.holder(zone_id) == crate::sendspin::Holder::Sendspin
-                                && active.contains(zone_id)
-                        })
-                        .collect()
-                };
-                for zone_id in deactivate {
-                    soloist.request_deactivate(&zone_id);
                 }
 
                 let source_map_changed = {
@@ -1759,7 +1917,7 @@ fn gst_domain(
                         None => false,
                     };
                     if mixed {
-                        tracing::info!("tx: монитор зоны в миксе с line-in, RTP на месте");
+                        tracing::info!("tx: RTP микрофона на месте");
                     } else {
                         tracing::info!("tx: источник зоны сменился, пересборка");
                         drop_runner(&mut h.runner);
@@ -1890,6 +2048,11 @@ fn gst_domain(
                 capture_volume: vols.capture,
                 playback_volume: vols.playback,
                 device_volumes: vols.devices.clone(),
+                feeds: tx_half
+                    .as_ref()
+                    .and_then(|h| h.runner.as_ref())
+                    .map(|runner| runner.feed_levels(&feeds_cell.borrow()))
+                    .unwrap_or_default(),
             });
         }
     }
@@ -2031,6 +2194,7 @@ pub(crate) fn initial_telemetry(roles: &[Role]) -> Telemetry {
         capture_volume: None,
         playback_volume: None,
         device_volumes: Vec::new(),
+        feeds: Vec::new(),
     }
 }
 
@@ -2041,7 +2205,7 @@ mod tests {
     use zproto::{ChanSel, Endpoint};
 
     #[test]
-    fn overlay_reads_the_zone_owner() {
+    fn overlay_does_not_write_the_feed_into_the_microphone() {
         let zones = vec![zproto::ZoneEndpoints {
             zone_id: "hall".into(),
             endpoints: vec![],
@@ -2055,51 +2219,227 @@ mod tests {
         table.on_wire("hall", crate::sendspin::Wire::StreamStart);
         let linked = BTreeSet::new();
         let out = overlay_sources(&zones, &linked, &table, &BTreeSet::new(), None);
+        assert_eq!(out[0].source, None, "Sendspin не пишется в RTP микрофона");
+
+        let preset = vec![zproto::ZoneEndpoints {
+            zone_id: "hall".into(),
+            endpoints: vec![],
+            source: Some("line".into()),
+        }];
+        let muted = BTreeSet::from(["hall".to_string()]);
+        let out = overlay_sources(
+            &preset,
+            &BTreeSet::from(["hall".to_string()]),
+            &table,
+            &muted,
+            Some("zvucast-hall-monitor"),
+        );
         assert_eq!(
             out[0].source.as_deref(),
-            Some("zvucast-sendspin-hall-monitor")
+            Some("line"),
+            "оверлей не затирает source микрофона"
         );
     }
 
     #[test]
-    fn overlay_drops_muted_zone_and_the_head_monitor() {
+    fn feed_tail_stays_quiet_and_plays_only_when_built() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
         let zones = vec![zproto::ZoneEndpoints {
             zone_id: "hall".into(),
             endpoints: vec![],
-            source: Some("zvucast-hall-monitor".into()),
+            source: None,
         }];
-        let linked = BTreeSet::from(["hall".to_string()]);
-        let table = crate::sendspin::ZoneTable::new();
-        let muted = BTreeSet::from(["hall".to_string()]);
-        let out = overlay_sources(&zones, &linked, &table, &muted, None);
-        assert_eq!(out[0].source, None, "mute hall гасит монитор зоны");
-
-        let out = overlay_sources(
+        let pipe = crate::pipeline::build_tx_unicast_pw(
+            &cfg,
             &zones,
-            &linked,
-            &table,
-            &BTreeSet::new(),
-            Some("zvucast-hall-monitor"),
-        );
-        assert_eq!(out[0].source, None, "голова уже открыла этот монитор");
-
-        let mut foreign = crate::sendspin::ZoneTable::new();
-        foreign.sync(&[zproto::VirtualZone {
+            0,
+            Some("mic"),
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let feeds = vec![zproto::FeedSend {
             zone_id: "hall".into(),
-            name: "Зал".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![Endpoint {
+                ip: "192.0.2.10".into(),
+                port: 5010,
+            }],
+        }];
+        crate::pipeline::reconcile_feed_tails(&pipe, &feeds, 0, &mut crate::pipeline::LoopbackUdp)
+            .unwrap();
+        let runner = Runner::from_pipeline_for_test(pipe);
+        let missing = runner.feed_levels(&[zproto::FeedSend {
+            zone_id: "bed".into(),
+            kind: zproto::FeedKind::Sendspin,
+            monitor: "absent".into(),
+            endpoints: vec![],
         }]);
-        foreign.on_wire("hall", crate::sendspin::Wire::StreamStart);
-        let out = overlay_sources(
-            &zones,
-            &BTreeSet::new(),
-            &foreign,
-            &BTreeSet::new(),
-            Some("alsa_input.usb-mic"),
+        assert!(missing.is_empty(), "несобранной ветки в feeds нет — уровень не выдумываем");
+        let before = runner.feed_levels(&feeds);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].zone_id, "hall");
+        assert_eq!(before[0].kind, zproto::FeedKind::Spotify);
+        assert_eq!(before[0].state, PipelineState::Stopped);
+        assert_eq!(before[0].rms_l, 0.0, "неиграющий хвост не выглядит громким");
+        assert_eq!(before[0].rms_r, 0.0);
+        runner.start().unwrap();
+        let _ = runner.pipeline().state(gstreamer::ClockTime::from_seconds(2));
+        let after = runner.feed_levels(&feeds);
+        assert_eq!(after[0].state, PipelineState::Playing, "ветка собрана и играет");
+        assert_eq!(after[0].rms_l, -90.0, "нет сигнала — тихий уровень, не 0");
+        assert_eq!(after[0].rms_r, -90.0);
+        let (bus_tx, _bus_rx) = std::sync::mpsc::channel();
+        runner.spawn_bus_watch(bus_tx);
+        let feed_src = runner
+            .pipeline()
+            .by_name("feed-spotify-hall")
+            .unwrap()
+            .dynamic_cast::<gstreamer_app::AppSrc>()
+            .unwrap();
+        let frame = {
+            let mut bytes = vec![0u8; 1920];
+            for chunk in bytes.chunks_exact_mut(4) {
+                chunk[..2].copy_from_slice(&16_000i16.to_le_bytes());
+                chunk[2..].copy_from_slice(&16_000i16.to_le_bytes());
+            }
+            bytes
+        };
+        for _ in 0..20 {
+            let mut buf = gstreamer::Buffer::from_slice(frame.clone());
+            {
+                let b = buf.get_mut().unwrap();
+                b.set_duration(gstreamer::ClockTime::from_mseconds(10));
+            }
+            feed_src.push_buffer(buf).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut feed_rms = -90.0;
+        while std::time::Instant::now() < deadline {
+            feed_rms = runner.feed_levels(&feeds)[0].rms_l;
+            if feed_rms > -30.0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            feed_rms > -30.0,
+            "сигнал фида виден на его level, rms={feed_rms}"
+        );
+        let mic = runner.stats();
+        assert_eq!(mic.rms_l, 0.0, "lev микрофона не берёт уровень фида");
+        assert_eq!(mic.rms_r, 0.0);
+        runner.stop();
+    }
+
+    /// Срыв живого reconcile не записывает набор как применённый: runner снят,
+    /// гейт вооружён, повтор того же списка не no-op.
+    #[test]
+    fn failed_feed_apply_does_not_stick_and_arms_the_gate() {
+        gstreamer::init().unwrap();
+        struct FailUdp;
+        impl crate::pipeline::LocalUdp for FailUdp {
+            fn tx(&mut self) -> anyhow::Result<std::net::UdpSocket> {
+                anyhow::bail!("сокет вида недоступен");
+            }
+            fn rx(&mut self, _port: u16) -> anyhow::Result<std::net::UdpSocket> {
+                anyhow::bail!("сокет вида недоступен");
+            }
+        }
+        let previous = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Sendspin,
+            monitor: "zvucast-sendspin-hall-monitor".into(),
+            endpoints: vec![],
+        }];
+        let next = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![Endpoint {
+                ip: "192.0.2.10".into(),
+                port: 5010,
+            }],
+        }];
+        let wanted = RefCell::new(previous.clone());
+        let applied = RefCell::new(previous.clone());
+        let failed = RefCell::new(false);
+        let mut half = RoleHalf::new();
+        half.runner = Some(Runner::from_pipeline_for_test(gstreamer::Pipeline::new()));
+
+        assert_eq!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                previous.clone(),
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Unchanged,
+            "применённый набор не открывает сокет"
+        );
+        assert!(half.runner.is_some());
+        assert!(half.gate.restart_at.is_none());
+
+        assert_eq!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                next.clone(),
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Rebuild
         );
         assert_eq!(
-            out[0].source.as_deref(),
-            Some("zvucast-sendspin-hall-monitor"),
-            "чужой источник при голове line-in остаётся"
+            applied.borrow().as_slice(),
+            previous.as_slice(),
+            "срыв не делает новый набор применённым"
+        );
+        assert_eq!(
+            wanted.borrow().as_slice(),
+            next.as_slice(),
+            "make_tx собирает хвосты из нового списка"
+        );
+        assert!(*failed.borrow());
+        assert!(half.runner.is_none(), "runner снят");
+        assert!(half.gate.restart_at.is_some(), "гейт вооружён");
+
+        assert_ne!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                next.clone(),
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Unchanged,
+            "тот же SetFeeds не no-op, пока ошибка не залечена"
+        );
+        assert_eq!(applied.borrow().as_slice(), previous.as_slice());
+        assert!(half.runner.is_none());
+
+        feeds_built(&applied, &failed, &wanted.borrow());
+        assert_eq!(
+            handle_set_feeds(
+                &wanted,
+                &applied,
+                &failed,
+                next,
+                &mut half,
+                0,
+                Some(&mut FailUdp),
+            ),
+            SetFeedsOutcome::Unchanged,
+            "после make_tx тот же набор уже применён"
         );
     }
 
@@ -2609,11 +2949,11 @@ mod tests {
         drop_runner(&mut half.runner);
     }
 
-    /// Свежий агент ({[], 0} по умолчанию) + пуш SetEndpoints{[], 40} —
-    /// дедупликация по эффективному транспорту: branchless-сборка dscp не
-    /// применяет, пересборки нет. Непустой набор пересобирает как обычно.
+    /// Пустой набор микрофона dscp запоминает, но tx не пересобирает:
+    /// udpsink микрофона нет. Повтор той же метки — no-op. Колонка микрофона
+    /// по-прежнему вооружает пересборку.
     #[test]
-    fn set_endpoints_empty_set_ignores_dscp() {
+    fn set_endpoints_empty_set_remembers_dscp_without_mic_rebuild() {
         gstreamer::init().unwrap();
         let transport = RefCell::new(Transport::default());
         let builds = std::cell::Cell::new(0usize);
@@ -2630,19 +2970,22 @@ mod tests {
         assert_eq!(builds.get(), 1);
 
         let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
-        assert_eq!(out, SetEndpointsOutcome::Unchanged);
+        assert_eq!(out, SetEndpointsOutcome::FeedDscp);
+        assert_eq!(transport.borrow().dscp, 40);
         assert!(
             !half.gate.due(),
-            "dscp при пустом наборе не вооружает пересборку"
+            "dscp при пустом наборе не вооружает пересборку микрофона"
         );
+        assert!(half.runner.is_some());
         assert_eq!(builds.get(), 1);
 
-        let out = handle_set_endpoints(&transport, vec![], 0, &mut half);
-        assert_eq!(out, SetEndpointsOutcome::Unchanged);
         let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
         assert_eq!(out, SetEndpointsOutcome::Unchanged);
+        let out = handle_set_endpoints(&transport, vec![], 24, &mut half);
+        assert_eq!(out, SetEndpointsOutcome::FeedDscp);
+        assert_eq!(transport.borrow().dscp, 24);
         assert!(!half.gate.due());
-        assert_eq!(builds.get(), 1, "пересборок так и не было");
+        assert_eq!(builds.get(), 1, "пересборок микрофона так и не было");
         wait_state(half.runner.as_ref().unwrap(), PipelineState::Playing);
 
         let out = handle_set_endpoints(
@@ -2659,9 +3002,102 @@ mod tests {
             &mut half,
         );
         assert_eq!(out, SetEndpointsOutcome::Changed);
+        assert_eq!(transport.borrow().dscp, 40);
         assert!(half.gate.due(), "появился эндпоинт — пересборка вооружена");
 
         drop_runner(&mut half.runner);
+    }
+
+    /// Вид без колонок микрофона получает dscp из SetEndpoints на свой udpsink.
+    /// Повтор той же метки хвост не трогает. Колонка микрофона роняет runner.
+    #[test]
+    fn empty_endpoints_rebuild_feed_tails_with_stored_dscp() {
+        gstreamer::init().unwrap();
+        let cfg = crate::config::PipelineCfg::default_tx();
+        let pipe = crate::pipeline::build_tx_unicast_pw(
+            &cfg,
+            &[],
+            0,
+            Some("mic"),
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let feeds = vec![zproto::FeedSend {
+            zone_id: "hall".into(),
+            kind: zproto::FeedKind::Spotify,
+            monitor: "zvucast-spotify-hall-monitor".into(),
+            endpoints: vec![Endpoint {
+                ip: "192.0.2.10".into(),
+                port: 5010,
+            }],
+        }];
+        let mut runner = Runner::from_pipeline_for_test(pipe);
+        runner
+            .reconcile_feeds(&feeds, 0, &mut crate::pipeline::LoopbackUdp)
+            .unwrap();
+        assert_eq!(feed_udpsink_dscp(runner.pipeline()), 0);
+
+        let transport = RefCell::new(Transport::default());
+        let wanted = RefCell::new(feeds.clone());
+        let applied = RefCell::new(Vec::new());
+        let failed = RefCell::new(false);
+        let mut half = RoleHalf::new();
+        half.gate.on_start();
+        half.runner = Some(runner);
+
+        let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
+        assert_eq!(out, SetEndpointsOutcome::FeedDscp);
+        assert_eq!(transport.borrow().dscp, 40);
+        assert!(!half.gate.due());
+        assert_eq!(
+            feed_udpsink_dscp(half.runner.as_ref().unwrap().pipeline()),
+            0,
+            "метка на хвосте меняется отдельным шагом, не сносом tx"
+        );
+
+        retarget_feed_dscp(
+            &wanted,
+            &applied,
+            &failed,
+            &mut half,
+            transport.borrow().dscp,
+            Some(&mut crate::pipeline::LoopbackUdp),
+        );
+        assert!(!*failed.borrow());
+        assert_eq!(applied.borrow().as_slice(), feeds.as_slice());
+        assert!(!half.gate.due(), "живой хвост не вооружает пересборку микрофона");
+        assert_eq!(feed_udpsink_dscp(half.runner.as_ref().unwrap().pipeline()), 40);
+
+        let out = handle_set_endpoints(&transport, vec![], 40, &mut half);
+        assert_eq!(out, SetEndpointsOutcome::Unchanged);
+
+        let out = handle_set_endpoints(
+            &transport,
+            vec![ZoneEndpoints {
+                zone_id: "hall".into(),
+                endpoints: vec![Endpoint {
+                    ip: "192.0.2.36".into(),
+                    port: 5004,
+                }],
+                source: None,
+            }],
+            40,
+            &mut half,
+        );
+        assert_eq!(out, SetEndpointsOutcome::Changed, "колонка микрофона роняет tx");
+        assert!(half.gate.due());
+        assert!(half.runner.is_none());
+    }
+
+    fn feed_udpsink_dscp(pipe: &gstreamer::Pipeline) -> i32 {
+        let sinks: Vec<_> = pipe
+            .children()
+            .into_iter()
+            .filter(|e| e.factory().unwrap().name() == "udpsink")
+            .filter(|e| e.name().starts_with("fsink-"))
+            .collect();
+        assert_eq!(sinks.len(), 1, "у хвоста вида один udpsink");
+        sinks[0].property::<i32>("qos-dscp")
     }
 
     /// Тестовый Runner без ALSA: зеркалит чтение карты в make_rx — имя
