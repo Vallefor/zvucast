@@ -363,20 +363,45 @@ const PW_LATENCY: &str = "128";
 const CAPTURE_BYTES: usize = 128 * 2 * 2;
 
 fn feed_capture(mut stdout: impl Read, appsrc: gst_app::AppSrc, stop: Arc<AtomicBool>) {
-    let mut buf = [0u8; CAPTURE_BYTES];
+    // Квант приходит пачкой кусков по 128 кадров. do-timestamp ставит
+    // им один PTS: на приёме куски лежат друг на друге. Монотонная метка
+    // лечит хрип, но труба pw-record уже держит сотни миллисекунд. Если
+    // разметить весь затор вперёд от «сейчас», колонка доигрывает его:
+    // задержка около полусекунды. Дальше одного кванта кадр не ставим.
+    appsrc.set_property("do-timestamp", false);
+    appsrc.set_property("max-buffers", 32u64);
+    let mut raw = [0u8; CAPTURE_BYTES];
+    let mut next_ns: Option<u64> = None;
+    let frames = (CAPTURE_BYTES / 4) as u64;
+    let dur_ns = frames * 1_000_000_000 / 48_000;
+    /// 1024 кадра @ 48 кГц ≈ 21 мс. Запас сверху — дрожание чтения.
+    const MAX_LEAD_NS: u64 = 32_000_000;
     while !stop.load(Ordering::Relaxed) {
-        if stdout.read_exact(&mut buf).is_err() {
+        if stdout.read_exact(&mut raw).is_err() {
             break;
         }
-        let mut gstbuf = match gst::Buffer::with_size(buf.len()) {
+        let now = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
+        let mut pts = next_ns.unwrap_or(now);
+        if now > pts && now - pts > 20_000_000 {
+            pts = now;
+        }
+        if pts > now.saturating_add(MAX_LEAD_NS) {
+            continue;
+        }
+        let mut gstbuf = match gst::Buffer::with_size(raw.len()) {
             Ok(buf) => buf,
             Err(_) => break,
         };
         {
             let Some(gstbuf) = gstbuf.get_mut() else { break };
-            let Ok(mut map) = gstbuf.map_writable() else { break };
-            map.as_mut().copy_from_slice(&buf);
+            {
+                let Ok(mut map) = gstbuf.map_writable() else { break };
+                map.as_mut().copy_from_slice(&raw);
+            }
+            gstbuf.set_pts(gst::ClockTime::from_nseconds(pts));
+            gstbuf.set_duration(gst::ClockTime::from_nseconds(dur_ns));
         }
+        next_ns = Some(pts + dur_ns);
         match appsrc.push_buffer(gstbuf) {
             Ok(_) => {}
             Err(gst::FlowError::Flushing) | Err(gst::FlowError::Eos) => break,
@@ -992,6 +1017,203 @@ appl_ptr    : 313632\n";
                 "пустой набор держит fakesink, иначе level не течёт");
         assert!(!children.iter().any(|e| e.factory().unwrap().name() == "udpsink"),
                 "udpsink нет: пустой набор = тишина, не multicast");
+    }
+
+    /// Пачка кванта не схлопывается в один PTS и не выбрасывается
+    /// leaky-очередью, пока udpsink ждёт метку.
+    #[test]
+    fn quantum_burst_keeps_its_samples_on_the_feed() {
+        gst::init().unwrap();
+        let zone_id = "hall";
+        let tx = crate::pipeline::build_tx_unicast_pw(
+            &crate::config::PipelineCfg::default_tx(),
+            &[],
+            0,
+            None,
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        tx.set_state(gst::State::Playing).unwrap();
+        let _ = tx.state(gst::ClockTime::from_seconds(2));
+        let feeds = vec![zproto::FeedSend {
+            zone_id: zone_id.into(),
+            kind: zproto::FeedKind::Virtual,
+            monitor: format!("zvucast-{zone_id}-monitor"),
+            endpoints: vec![zproto::Endpoint {
+                ip: "127.0.0.1".into(),
+                port: 41987,
+            }],
+        }];
+        crate::pipeline::reconcile_feed_tails(
+            &tx,
+            &feeds,
+            0,
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let hold = tx.by_name("fhold-virtual-hall").unwrap();
+        assert_eq!(hold.property::<u32>("max-size-buffers"), 0);
+        assert_eq!(hold.property::<u64>("max-size-time"), 40_000_000);
+
+        let rows: Arc<Mutex<Vec<(Option<gst::ClockTime>, Option<gst::ClockTime>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let slot = rows.clone();
+        tx.by_name("fpay-virtual-hall")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if let Some(buf) = info.buffer() {
+                    if let Ok(mut guard) = slot.lock() {
+                        guard.push((buf.pts(), buf.duration()));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+
+        let src = tx
+            .by_name("feed-virtual-hall")
+            .unwrap()
+            .dynamic_cast::<gst_app::AppSrc>()
+            .unwrap();
+        let quanta = 8usize;
+        let per = 8usize;
+        struct Bursts {
+            left: usize,
+            in_burst: usize,
+        }
+        impl std::io::Read for Bursts {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Ok(0);
+                }
+                if self.in_burst == 8 {
+                    self.in_burst = 0;
+                    std::thread::sleep(Duration::from_millis(21));
+                }
+                let n = buf.len().min(self.left);
+                buf[..n].fill(0);
+                self.left -= n;
+                self.in_burst += 1;
+                Ok(n)
+            }
+        }
+        feed_capture(
+            Bursts {
+                left: CAPTURE_BYTES * quanta * per,
+                in_burst: 0,
+            },
+            src,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let want = quanta * per;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && rows.lock().unwrap().len() < want {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let got = rows.lock().unwrap().clone();
+        let _ = tx.set_state(gst::State::Null);
+        assert_eq!(got.len(), want, "пачка кванта потерялась по дороге к payloader");
+        for pair in got.windows(2) {
+            let (p0, d0) = pair[0];
+            let (p1, _) = pair[1];
+            let p0 = p0.expect("pts");
+            let d0 = d0.expect("duration");
+            let p1 = p1.expect("pts");
+            assert_eq!(
+                p1.nseconds(),
+                p0.nseconds() + d0.nseconds(),
+                "метки кусков должны идти встык"
+            );
+        }
+    }
+
+    /// Затор в трубе (сотни миллисекунд сразу) не размечается вперёд:
+    /// на payloader уходит только окно около кванта.
+    #[test]
+    fn backlog_stays_inside_one_quantum() {
+        gst::init().unwrap();
+        let zone_id = "hall";
+        let tx = crate::pipeline::build_tx_unicast_pw(
+            &crate::config::PipelineCfg::default_tx(),
+            &[],
+            0,
+            None,
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        tx.set_state(gst::State::Playing).unwrap();
+        let _ = tx.state(gst::ClockTime::from_seconds(2));
+        let feeds = vec![zproto::FeedSend {
+            zone_id: zone_id.into(),
+            kind: zproto::FeedKind::Virtual,
+            monitor: format!("zvucast-{zone_id}-monitor"),
+            endpoints: vec![zproto::Endpoint {
+                ip: "127.0.0.1".into(),
+                port: 41988,
+            }],
+        }];
+        crate::pipeline::reconcile_feed_tails(
+            &tx,
+            &feeds,
+            0,
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let rows: Arc<Mutex<Vec<gst::ClockTime>>> = Arc::new(Mutex::new(Vec::new()));
+        let slot = rows.clone();
+        tx.by_name("fpay-virtual-hall")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if let Some(buf) = info.buffer() {
+                    if let Some(pts) = buf.pts() {
+                        if let Ok(mut guard) = slot.lock() {
+                            guard.push(pts);
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        struct InstantBacklog {
+            left: usize,
+        }
+        impl std::io::Read for InstantBacklog {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.left);
+                buf[..n].fill(0);
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        // 200 кусков по 128 кадров ≈ 533 мс, если разметить всё.
+        feed_capture(
+            InstantBacklog {
+                left: CAPTURE_BYTES * 200,
+            },
+            tx.by_name("feed-virtual-hall")
+                .unwrap()
+                .dynamic_cast::<gst_app::AppSrc>()
+                .unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && rows.lock().unwrap().len() < 8 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        let got = rows.lock().unwrap().clone();
+        let _ = tx.set_state(gst::State::Null);
+        assert!(!got.is_empty(), "окно кванта не дошло до payloader");
+        assert!(got.len() < 40, "затор ушёл целиком: {} буферов", got.len());
+        let span = got.last().unwrap().nseconds() - got.first().unwrap().nseconds();
+        assert!(span < 60_000_000, "окно длиннее кванта: {span} нс");
     }
 
     #[test]

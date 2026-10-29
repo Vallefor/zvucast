@@ -872,7 +872,15 @@ fn attach_feed_tail(
     let kind = feed.kind.as_str();
     let tag = feed_tag(kind, &feed.zone_id);
     let src = live_appsrc(&feed_appsrc_name(kind, &feed.zone_id))?;
-    let hold = monitor_queue(format!("fhold-{tag}"))?;
+    // Пачка кванта (~21 мс) должна дождаться своих меток. Leaky на два
+    // буфера выбрасывает её ещё до payloader. Дольше кванта очередь не
+    // копим: иначе затор из трубы становится слышимой задержкой.
+    let hold = gst::ElementFactory::make("queue")
+        .property("name", format!("fhold-{tag}"))
+        .property("max-size-buffers", 0u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 40_000_000u64)
+        .build()?;
     let conv = gst::ElementFactory::make("audioconvert")
         .property("name", format!("fconv-{tag}"))
         .build()?;
@@ -1767,9 +1775,10 @@ mod tests {
         ports.sort();
         assert_eq!(ports, vec![5004, 5010]);
         let hold = pipe.by_name("fhold-spotify-hall").expect("очередь хвоста");
-        assert_eq!(hold.property::<u32>("max-size-buffers"), 2);
+        assert_eq!(hold.property::<u32>("max-size-buffers"), 0);
+        assert_eq!(hold.property::<u64>("max-size-time"), 40_000_000);
         let leaky = hold.property_value("leaky").serialize().expect("leaky");
-        assert_eq!(leaky.as_str(), "downstream");
+        assert_ne!(leaky.as_str(), "downstream");
 
         reconcile_feed_tails(&pipe, &[], 0, &mut LoopbackUdp).unwrap();
         assert!(pipe.by_name("feed-spotify-hall").is_none(), "пустой SetFeeds снимает хвост");

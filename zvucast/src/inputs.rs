@@ -266,8 +266,10 @@ fn stereo_slot_key(views: &[InputView], allow_virtual: bool) -> Option<String> {
 
 /// Канал 0 включённого слота захвата → `l`, канал 1 → `r`.
 /// Выключенный левый не становится правым.
+/// Виртуальный кабель слотом не становится: его звук играет только
+/// виртуальная колонка зоны, не line-in узла.
 fn assign_stream(views: &mut [InputView]) {
-    let Some(key) = stereo_slot_key(views, true) else {
+    let Some(key) = stereo_slot_key(views, false) else {
         return;
     };
     for ch in views.iter_mut() {
@@ -598,13 +600,11 @@ mod tests {
             "имя узла PipeWire остаётся ключом слота"
         );
 
-        // Железо выключено — слот захвата у первого виртуального ключа.
+        // Железо выключено — виртуальный кабель line-in не занимает.
         let prefs = vec![InputPref { id: "hw:0".into(), name: "Левый".into(), enabled: false }];
         let hw_off = merge_inputs(&discovered, &prefs);
-        assert_eq!(capture_target(&hw_off).as_deref(), Some("zvucast-monitor"));
-        assert_eq!(hw_off.iter().find(|v| v.id == "zvucast:0").unwrap().stream.as_deref(), Some("l"));
-        assert_eq!(hw_off.iter().find(|v| v.id == "zvucast:1").unwrap().stream.as_deref(), Some("r"));
-        assert!(hw_off.iter().find(|v| v.id == "zvucast-z1:0").unwrap().stream.is_none());
+        assert_eq!(capture_target(&hw_off), None);
+        assert!(hw_off.iter().filter(|v| is_virtual_device_key(&v.device_key)).all(|v| v.stream.is_none()));
         assert!(hw_off.iter().find(|v| v.id == "hw:0").unwrap().stream.is_none());
     }
 
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_cable_becomes_the_slot_when_hardware_is_off() {
+    fn virtual_cable_stays_off_the_line_slot_when_hardware_is_off() {
         let prefs = vec![
             InputPref { id: "hw:0".into(), name: "л".into(), enabled: false },
             InputPref { id: "hw:1".into(), name: "п".into(), enabled: false },
@@ -673,8 +673,8 @@ mod tests {
             ch("z:1", "zvucast-hall", 1),
         ];
         let views = merge_inputs(&discovered, &prefs);
-        assert_eq!(capture_target(&views).as_deref(), Some("zvucast-hall-monitor"));
-        assert_eq!(views.iter().find(|v| v.id == "z:0").unwrap().stream.as_deref(), Some("l"));
+        assert_eq!(capture_target(&views), None);
+        assert!(views.iter().filter(|v| v.device_key == "zvucast-hall").all(|v| v.stream.is_none()));
         assert_eq!(playback_target(&views), None);
     }
 
