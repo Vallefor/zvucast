@@ -2334,6 +2334,95 @@ mod tests {
         runner.stop();
     }
 
+    /// Живой SetFeeds: хвост с udpsink, затем пересборка в fakesink и обратно.
+    /// Сырые кадры захвата без PTS обязаны остаться видны на level.
+    #[test]
+    fn virtual_feed_measures_raw_capture_chunks() {
+        gstreamer::init().unwrap();
+        let zone_id = "01303ec9-e89b-4de1-913c-335be5bd5644";
+        let cfg = crate::config::PipelineCfg::default_tx();
+        let zones = vec![zproto::ZoneEndpoints {
+            zone_id: zone_id.into(),
+            endpoints: vec![],
+            source: None,
+        }];
+        let pipe = crate::pipeline::build_tx_unicast_pw(
+            &cfg,
+            &zones,
+            0,
+            Some("mic"),
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let speakers = vec![Endpoint {
+            ip: "192.0.2.10".into(),
+            port: 5010,
+        }];
+        let with_speakers = vec![zproto::FeedSend {
+            zone_id: zone_id.into(),
+            kind: zproto::FeedKind::Virtual,
+            monitor: format!("zvucast-{zone_id}-monitor"),
+            endpoints: speakers,
+        }];
+        let held = vec![zproto::FeedSend {
+            zone_id: zone_id.into(),
+            kind: zproto::FeedKind::Virtual,
+            monitor: format!("zvucast-{zone_id}-monitor"),
+            endpoints: vec![],
+        }];
+        let runner = Runner::from_pipeline_for_test(pipe);
+        runner.start().unwrap();
+        let _ = runner.pipeline().state(gstreamer::ClockTime::from_seconds(2));
+        let (bus_tx, _bus_rx) = std::sync::mpsc::channel();
+        runner.spawn_bus_watch(bus_tx);
+        let frame = {
+            let mut bytes = vec![0u8; 128 * 2 * 2];
+            for chunk in bytes.chunks_exact_mut(4) {
+                chunk[..2].copy_from_slice(&16_000i16.to_le_bytes());
+                chunk[2..].copy_from_slice(&16_000i16.to_le_bytes());
+            }
+            bytes
+        };
+        let pump = |feeds: &[zproto::FeedSend], phase: &str| {
+            crate::pipeline::reconcile_feed_tails(
+                runner.pipeline(),
+                feeds,
+                0,
+                &mut crate::pipeline::LoopbackUdp,
+            )
+            .unwrap();
+            let feed_src = runner
+                .pipeline()
+                .by_name(&format!("feed-virtual-{zone_id}"))
+                .unwrap()
+                .dynamic_cast::<gstreamer_app::AppSrc>()
+                .unwrap();
+            for _ in 0..80 {
+                let buf = gstreamer::Buffer::from_slice(frame.clone());
+                feed_src.push_buffer(buf).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut feed_rms = -90.0;
+            while std::time::Instant::now() < deadline {
+                feed_rms = runner.feed_levels(feeds)[0].rms_l;
+                if feed_rms > -30.0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                feed_rms > -30.0,
+                "{phase}: rms={feed_rms} appsrc={:?}",
+                feed_src.current_state()
+            );
+        };
+        pump(&with_speakers, "udpsink на живом пайплайне");
+        pump(&held, "пересборка в fakesink, пока играет");
+        pump(&with_speakers, "обратно в udpsink, пока играет");
+        runner.stop();
+    }
+
     /// Срыв живого reconcile не записывает набор как применённый: runner снят,
     /// гейт вооружён, повтор того же списка не no-op.
     #[test]

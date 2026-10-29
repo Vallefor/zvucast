@@ -962,12 +962,15 @@ fn attach_named_pay_tail(
         let queue = gst::ElementFactory::make("queue")
             .property("name", format!("fsinkq-{tag}-{index}"))
             .build()?;
+        // async=false: живой пайплайн иначе ждёт preroll этого сокета и
+        // оставляет appsrc в Paused. Кадры не выходят, level молчит.
         let sink = gst::ElementFactory::make("udpsink")
             .property("name", format!("fsink-{tag}-{index}"))
             .property("host", &ep.ip)
             .property("port", ep.port as i32)
             .property("qos-dscp", dscp as i32)
             .property("sync", true)
+            .property("async", false)
             .property("socket", &gio_socket)
             .build()?;
         pipe.add_many([&queue, &sink])?;
@@ -1030,6 +1033,12 @@ fn remove_downstream(pipe: &gst::Pipeline, root_name: &str) -> Result<()> {
     }
     for el in &order {
         el.set_state(gst::State::Null)?;
+        // set_state(Null) часто Async. remove до фактического Null
+        // уничтожает элемент в Playing и роняет процесс.
+        let (_res, cur, _) = el.state(gst::ClockTime::from_seconds(2));
+        if cur != gst::State::Null {
+            anyhow::bail!("хвост {} не остановился: {cur:?}", el.name());
+        }
         pipe.remove(el)?;
     }
     Ok(())
