@@ -10,6 +10,8 @@ Wants=network-online.target
 Environment=RUST_LOG=info
 # PipeWire слушает в сессии пользователя, не в системной. uid на платах и на PC — 1000.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Запас проигрывателя, мс. 40, 20 или 5 — правка и перезапуск агента, без пересборки.
+Environment=ZVUCAST_PLAY_MS=40
 ExecStart=/usr/local/bin/zvucast agent --config /etc/zvucast.toml
 Restart=always
 RestartSec=2

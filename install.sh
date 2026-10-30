@@ -460,19 +460,28 @@ install_drops() {
   quantum=$(root_path /etc/pipewire/pipewire.conf.d/99-zvucast-quantum.conf)
   latency=$(root_path /etc/wireplumber/wireplumber.conf.d/99-zvucast-latency.conf)
   write_file "$quantum" <<'ZVUCAST_QUANTUM'
-# Квант графа 128 кадров @ 48 кГц = 2.7 мс. max не даёт клиенту
-# (pw-play --latency, браузер, soloist) раздуть цикл обратно до 20–100 мс.
+# Часы машины не запираем. Квант 240 кадров, 5 мс, стоит только на
+# своём null-sink (node.force-quantum). Граф карты живёт на периоде
+# этой карты. Частота одна: 48 кГц.
 context.properties = {
     default.clock.rate = 48000
     default.clock.allowed-rates = [ 48000 ]
-    default.clock.quantum = 128
-    default.clock.min-quantum = 32
-    default.clock.max-quantum = 128
 }
 ZVUCAST_QUANTUM
   write_file "$latency" <<'ZVUCAST_LATENCY'
-# USB (UCA202) в batch-режиме держит лишний период в headroom.
-# HiFiBerry по I2S этот же период 128 переваривает без запаса.
+# Граф машины не заперт в один квант. Период карты — её кольцо, не цикл
+# всего PipeWire. Квант захвата, 240 кадров, задаёт свой синк, не этот
+# файл. Запас колонки — целое число периодов HiFiBerry в кольце карты.
+# HiFiBerry ест период 256. 20 периодов — кольцо 5120 кадров, около
+# 107 мс. headroom в файле 1920; агент при старте плеера ставит запас
+# сам (40 мс → 2048 кадров, 8 квантов): пропуск пробуждения доигрывает его.
+# USB Audio CODEC (PCM2902, full speed) отдаёт звук пакетами по 1 мс,
+# 48 кадров. Период 128 — не целое число пакетов, в динамике сплошной
+# хрип. Кодеку оставляем batch и период 960 (20 мс, ровно 20 пакетов).
+# Batch режет период пополам: в железе период 480 и кольцо
+# period-num×480. Четыре периода — это 40 мс на всё кольцо, запас
+# около 40 мс упирается в край и плата снова вставляет тишину.
+# 16 периодов дают кольцо около 160 мс, этот запас в нём помещается.
 # bcm2835 Headphones — ШИМ через mailbox VideoCore. Период 128 и
 # disable-batch оставляют в кольце доли кванта, прошивка забирает
 # звук пачками: delay уходит в минус, sink копит xrun. В наушниках
@@ -508,6 +517,38 @@ monitor.alsa.rules = [
       }
     }
   }
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.*"
+        alsa.card_name = "snd_rpi_hifiberry_dac"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.period-size = 256
+        api.alsa.period-num = 20
+        api.alsa.headroom = 1920
+        api.alsa.disable-batch = true
+      }
+    }
+  }
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.*"
+        alsa.card_name = "USB Audio CODEC"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.period-size = 960
+        api.alsa.period-num = 16
+        api.alsa.headroom = 1920
+        api.alsa.disable-batch = false
+      }
+    }
+  }
 ]
 ZVUCAST_LATENCY
 }
@@ -526,7 +567,7 @@ install_session() {
   as_root loginctl enable-linger "$AUDIO_USER"
   as_root systemctl start "user@${AUDIO_UID}.service"
   # enable --now не перечитывает уже запущенный граф. Рестарт нужен,
-  # чтобы квант 128 и период джека bcm2835 вступили сразу.
+  # чтобы дропы часов и периода карты вступили сразу.
   sudo -u "$AUDIO_USER" \
     "XDG_RUNTIME_DIR=/run/user/${AUDIO_UID}" \
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${AUDIO_UID}/bus" \
@@ -646,6 +687,8 @@ Wants=network-online.target
 Environment=RUST_LOG=info
 # PipeWire слушает в сессии пользователя, не в системной. uid на платах и на PC — 1000.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+# Запас проигрывателя, мс. 40, 20 или 5 — правка и перезапуск агента, без пересборки.
+Environment=ZVUCAST_PLAY_MS=40
 ExecStart=/usr/local/bin/zvucast agent --config /etc/zvucast.toml
 Restart=always
 RestartSec=2

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use gstreamer::prelude::*;
@@ -146,6 +147,10 @@ fn rx_head(
         .property("latency", gst::ClockTime::from_mseconds(2))
         .property_from_str("start-time-selection", "first")
         .build()?;
+    if let Some(pad) = mix.static_pad("src") {
+        crate::rx_tap::watch_pcm(&pad, b'M');
+    }
+    crate::rx_tap::watch_mixer(&mix);
     let identity = ChannelMap::default();
     let tail = if branches.is_empty() { cm } else { &identity };
     let mconv = build_mconv(tail)?;
@@ -443,6 +448,11 @@ fn add_rtp_branch(
         .property("name", format!("jb{port}"))
         .property("latency", jb_ms)
         .property("do-lost", true)
+        // slave сглаживает часы и отпускает куски реже, чем идёт звук.
+        // Сетка на таких паузах прыгает и микшер пишет тишину. none считает
+        // метку прямо из RTP, шаг там ровно квант. На часы приёма кусок
+        // сажает сетка ниже, иначе none начинает шкалу с нуля.
+        .property_from_str("mode", "none")
         .build()?;
     let depay = gst::ElementFactory::make("rtpL16depay")
         .property("name", format!("depay{port}"))
@@ -468,6 +478,19 @@ fn add_rtp_branch(
     let queue = gst::ElementFactory::make("queue")
         .property("name", format!("uq{port}"))
         .build()?;
+    if let Some(pad) = jb.static_pad("sink") {
+        crate::rx_tap::watch_rtp(&pad);
+    }
+    if let Some(pad) = jb.static_pad("src") {
+        crate::rx_tap::watch_lost(&pad);
+    }
+    if let Some(pad) = depay.static_pad("src") {
+        crate::rx_tap::watch_pcm(&pad, b'P');
+        crate::rx_tap::watch_gap(&pad);
+    }
+    if let Some(pad) = conceal.static_pad("src") {
+        crate::rx_tap::watch_pcm(&pad, b'C');
+    }
     let chain = [&src, &jb, &depay, &conceal, &conv, &res, &caps, &queue];
     pipe.add_many(chain)?;
     gst::Element::link_many(chain)?;
@@ -504,12 +527,130 @@ fn add_silence_branch(pipe: &gst::Pipeline, mixer: &gst::Element) -> Result<()> 
     Ok(())
 }
 
+/// Запас посадки, 20 мс. Короткая пауза съедает его и не рвёт шкалу.
+/// Кусок, который уже целиком позади, сажает тот же запас заново:
+/// одна дыра на провал, а не нулевая подушка на каждый следующий квант.
+const GRID_LEAD_NS: u64 = 20_000_000;
+
+struct QuantumGrid {
+    /// Следующая метка в running time приёма. `None` — сетка ещё не сидит.
+    next_running: Option<u64>,
+}
+
+/// Куда поставить кусок, чтобы шкала не копила микросекунды slave.
+///
+/// Входящая метка не читается. Первый кусок сажается на `now` плюс запас.
+/// Дальше метка равна предыдущей плюс длительность этого куска. Кусок, чей
+/// конец ещё впереди часов, остаётся на этой метке. Кусок, который уже
+/// целиком позади, сажается снова на `now` плюс запас. Посадка на сами часы
+/// оставляла подушку в один квант, и каждая следующая дырка становилась нулями.
+/// `true` — запас посажен заново, не обычный шаг.
+fn quantum_grid_pts(scheduled: Option<u64>, now: u64, duration: u64) -> (u64, bool) {
+    match scheduled {
+        Some(pts) if pts.saturating_add(duration) > now => (pts, false),
+        Some(_) => (now.saturating_add(GRID_LEAD_NS), true),
+        None => (now.saturating_add(GRID_LEAD_NS), false),
+    }
+}
+
+/// Метка буфера, чьё running time равно `running_ns` в сегменте этого пэда.
+fn running_to_buffer_pts(pad: &gst::Pad, running_ns: u64) -> Option<u64> {
+    let event = pad.sticky_event::<gst::event::Segment>(0)?;
+    let segment = event.segment().downcast_ref::<gst::ClockTime>()?;
+    segment
+        .position_from_running_time(gst::ClockTime::from_nseconds(running_ns))
+        .map(|time| time.nseconds())
+}
+
+/// Ровная сетка меток на входе микшера. Проба не блокирует и не выбрасывает куски.
+fn stamp_quantum_grid(pad: &gst::Pad) {
+    let grid = Arc::new(Mutex::new(QuantumGrid { next_running: None }));
+    let _ = pad.add_probe(
+        gst::PadProbeType::BUFFER
+            | gst::PadProbeType::EVENT_DOWNSTREAM
+            | gst::PadProbeType::EVENT_FLUSH,
+        move |pad, info| {
+            if let Some(event) = info.event() {
+                let kind = event.type_();
+                if kind == gst::EventType::FlushStart || kind == gst::EventType::FlushStop {
+                    if let Ok(mut state) = grid.lock() {
+                        state.next_running = None;
+                    }
+                }
+                return gst::PadProbeReturn::Ok;
+            }
+            let Some(duration) = info.buffer().and_then(|buffer| buffer.duration()) else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let duration = duration.nseconds();
+            if duration == 0 {
+                return gst::PadProbeReturn::Ok;
+            }
+            let Some(now) = pad
+                .parent_element()
+                .and_then(|element| element.current_running_time())
+                .map(|time| time.nseconds())
+            else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let placed = {
+                let Ok(mut state) = grid.lock() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let first = state.next_running.is_none();
+                let (running, reseat) = quantum_grid_pts(state.next_running, now, duration);
+                let Some(pts) = running_to_buffer_pts(pad, running) else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                state.next_running = Some(running.saturating_add(duration));
+                (pts, running, first, reseat)
+            };
+            let (pts, running, first, reseat) = placed;
+            let Some(buffer) = info.buffer_mut() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let buffer = buffer.make_mut();
+            buffer.set_pts(gst::ClockTime::from_nseconds(pts));
+            if buffer.dts().is_some() {
+                buffer.set_dts(gst::ClockTime::from_nseconds(pts));
+            }
+            if first || reseat {
+                buffer.set_flags(gst::BufferFlags::DISCONT);
+            }
+            if first {
+                tracing::info!(
+                    running_ns = running,
+                    now_ns = now,
+                    "сетка приёма: первый кусок посажен на часы"
+                );
+            } else if reseat {
+                tracing::info!(
+                    running_ns = running,
+                    now_ns = now,
+                    duration_ns = duration,
+                    "сетка приёма: кусок был позади часов, запас посажен заново"
+                );
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+}
+
 fn link_queue_to_mixer(queue: &gst::Element, mixer: &gst::Element, volume: f64) -> Result<()> {
     let pad = mixer
         .request_pad_simple("sink_%u")
         .context("audiomixer не отдал sink_%u")?;
     let src = queue.static_pad("src").context("нет src у queue")?;
     src.link(&pad)?;
+    let qname = queue.name();
+    if qname == "uqsilence" {
+        crate::rx_tap::watch_pcm(&pad, b'Z');
+    } else if qname.starts_with("uq") {
+        // Сначала сетка, потом журнал: строка S уже с ровной меткой.
+        // P и C остаются как их поставил slave.
+        stamp_quantum_grid(&pad);
+        crate::rx_tap::watch_pcm(&pad, b'S');
+    }
     set_queue_volume(queue, volume);
     Ok(())
 }
@@ -1310,6 +1451,8 @@ mod tests {
         let children = p.children();
         let jb = children.iter().find(|e| e.factory().unwrap().name() == "rtpjitterbuffer").unwrap();
         assert_eq!(jb.property::<u32>("latency"), 2);
+        let mode = jb.property_value("mode").serialize().unwrap().to_string();
+        assert!(mode.contains("none"), "джиттер-буфер без растяжки slave: {mode}");
     }
 
     #[test]
@@ -1830,5 +1973,56 @@ update: id:0 key:'default.audio.sink' value:'{\"name\":\"zvucast-hall\"}' type:'
         assert_eq!(playback_target_from_metadata(zone_sink).as_deref(), Some("alsa_output.speaker"));
         let easy = "update: id:0 key:'default.audio.sink' value:'{\"name\":\"easyeffects_sink\"}' type:''\n";
         assert_eq!(playback_target_from_metadata(easy).as_deref(), Some("easyeffects_sink"));
+    }
+
+    #[test]
+    fn quantum_grid_stays_flat_and_reseats_when_late() {
+        let dur = 2_666_666u64;
+        let mut now = 50_000_000u64;
+        let mut scheduled = None;
+        let mut prev = None;
+        let mut reseats = 0u32;
+        for _ in 0..22_500 {
+            let (pts, reseat) = quantum_grid_pts(scheduled, now, dur);
+            if reseat {
+                reseats += 1;
+            }
+            if let Some(previous) = prev {
+                assert_eq!(pts, previous + dur, "шаг сетки уехал с одного кванта");
+            } else {
+                assert_eq!(pts, now + GRID_LEAD_NS);
+                assert!(!reseat);
+            }
+            prev = Some(pts);
+            scheduled = Some(pts + dur);
+            now += dur;
+        }
+        assert_eq!(reseats, 0, "ровный приход не пересаживает сетку");
+
+        // Пауза короче запаса съедает запас, но метку не рвёт.
+        let (pts, reseat) = quantum_grid_pts(scheduled, now + 8_000_000, dur);
+        assert!(!reseat);
+        assert_eq!(pts, scheduled.unwrap());
+
+        // Пауза длиннее запаса: кусок сажается на часы плюс тот же запас.
+        let stalled = now + 30_000_000;
+        let (jumped, reseat) = quantum_grid_pts(scheduled, stalled, dur);
+        assert!(reseat);
+        assert_eq!(jumped, stalled + GRID_LEAD_NS);
+        let next = Some(jumped + dur);
+        let (followed, reseat) = quantum_grid_pts(next, stalled + dur, dur);
+        assert!(!reseat);
+        assert_eq!(followed, jumped + dur);
+
+        // Конец ровно на часах — кусок уже целиком позади, запас сажается заново.
+        let (on_clock, reseat) = quantum_grid_pts(Some(stalled - dur), stalled, dur);
+        assert!(reseat);
+        assert_eq!(on_clock, stalled + GRID_LEAD_NS);
+
+        // Вторая пауза длиннее уже возвращённого запаса сажает его ещё раз.
+        let stalled_again = stalled + 40_000_000;
+        let (again, reseat) = quantum_grid_pts(Some(followed + dur), stalled_again, dur);
+        assert!(reseat);
+        assert_eq!(again, stalled_again + GRID_LEAD_NS);
     }
 }

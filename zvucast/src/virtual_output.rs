@@ -1,11 +1,15 @@
-//! Виртуальный стереовыход на каждую зону передатчика: pw-loopback, не null-sink.
+//! Виртуальный стереовыход на каждую зону передатчика: свой null-sink.
 //!
 //! Sink `zvucast-{zone}` — то, что выбирают в апплете (`Zvucast: {имя}`).
-//! Source `zvucast-{zone}-monitor` читает pw-record. Модуль сам забирает
-//! буферы, поэтому выбор выхода не останавливает колонки.
+//! Это драйвер своей группы: `node.force-quantum` 240 кадров, 5 мс.
+//! Часы машины он не запирает и чужую группу не водит. Монитор — порты
+//! этого же синка. `pw-record` читает их, отдельного источника нет.
+//! Узел жив, пока жив `pw-cli`. `object.linger` нет: после выхода
+//! процесса синка не остаётся.
 
 use std::collections::{BTreeSet, HashMap};
-use std::process::{Child, Command, Stdio};
+use std::io::{self, Write};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -21,6 +25,8 @@ pub fn sink_name(zone_id: &str) -> String {
     format!("zvucast-{zone_id}")
 }
 
+/// Имя в фиде. Порты монитора живут на синке, отдельного узла нет,
+/// поэтому захват открывает [`feed_capture_target`], а не эту строку.
 pub fn monitor_name(zone_id: &str) -> String {
     format!("zvucast-{zone_id}-monitor")
 }
@@ -29,50 +35,113 @@ fn process_name(zone_id: &str) -> String {
     format!("zvucast-zone-{zone_id}")
 }
 
-/// `--latency` pw-loopback, миллисекунды. Рядом с квантом 128/48000:
-/// без флага модуль держит свой запас, и кабель длиннее кванта.
-pub const LOOPBACK_LATENCY_MS: &str = "3";
+/// Квант своего синка, кадры. 240 @ 48 кГц = 5 мс, один кадр провода.
+/// Через `node.latency` PipeWire округлил бы 240 вниз до 128.
+pub const SINK_QUANTUM: &str = "240";
 
-/// Аргументы pw-loopback до `--capture-props`.
-pub fn loopback_front(name: &str) -> Vec<String> {
-    vec![
-        "--name".into(),
-        name.into(),
-        "--channels".into(),
-        "2".into(),
-        "--channel-map".into(),
-        "[ FL, FR ]".into(),
-        "--latency".into(),
-        LOOPBACK_LATENCY_MS.into(),
-    ]
-}
-
-/// Plasma считает устройство виртуальным без флага HARDWARE и прячет его.
-/// pipewire-pulse ставит HARDWARE, когда `node.virtual` не true.
-/// Пробел и двоеточие в «Zvucast: Зал» без кавычек — синтаксическая ошибка pw-loopback.
-/// `node.lock-quantum` на обоих концах не даёт кабелю раздуть квант графа.
-fn pw_value(value: &str) -> String {
-    let clean = value.replace('"', "");
-    if clean.chars().any(|c| c.is_whitespace() || matches!(c, ':' | '=')) {
-        format!("\"{clean}\"")
-    } else {
-        clean
+/// Куда `pw-record` целится. `zvucast-…-monitor` — это монитор синка
+/// `zvucast-…`, не отдельный источник.
+pub fn feed_capture_target(monitor: &str) -> &str {
+    match monitor.strip_suffix("-monitor") {
+        Some(sink) if sink.starts_with("zvucast-") && !sink.is_empty() => sink,
+        _ => monitor,
     }
 }
 
-fn capture_props(name: &str, description: &str) -> String {
+/// `pw-record` монитора своего синка. `stream.capture.sink` читает
+/// порты монитора. Квант просит поток, замок и `force-quantum` — нет:
+/// квант группы задаёт сам синк.
+pub fn feed_capture_args(monitor: &str) -> Vec<String> {
+    let props = format!(
+        "{{\"stream.capture.sink\":\"true\",\"node.latency\":\"{q}/48000\",\"node.passive\":\"true\",\"node.dont-fallback\":\"true\"}}",
+        q = SINK_QUANTUM,
+    );
+    vec![
+        "--target".into(),
+        feed_capture_target(monitor).into(),
+        "--rate".into(),
+        "48000".into(),
+        "--channels".into(),
+        "2".into(),
+        "--format".into(),
+        "s16".into(),
+        "--latency".into(),
+        SINK_QUANTUM.into(),
+        "--properties".into(),
+        props,
+        "--raw".into(),
+        "-".into(),
+    ]
+}
+
+fn json_str(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '\n' | '\r' => out.push(' '),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Пропсы `support.null-audio-sink`. `visible` — узел апплета:
+/// `node.virtual` не true, pipewire-pulse ставит HARDWARE и Plasma
+/// его показывает. Скрытый синк (Sendspin, Spotify) в апплет не лезет.
+/// `priority.driver` нет. `object.linger` нет.
+pub fn null_sink_props(name: &str, description: &str, visible: bool) -> String {
+    let virtual_flag = if visible { "false" } else { "true" };
     format!(
-        "media.class=Audio/Sink node.name={name} node.description={} audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.virtual=false",
-        pw_value(description)
+        "{{\"factory.name\":\"{factory}\",\"node.name\":{name},\"node.description\":{desc},\"media.class\":\"Audio/Sink\",\"audio.rate\":48000,\"audio.channels\":2,\"audio.position\":\"[ FL FR ]\",\"node.force-quantum\":{quantum},\"node.virtual\":{virtual_flag},\"session.suspend-timeout-seconds\":0,\"priority.session\":50,\"monitor.channel-volumes\":true,\"monitor.passthrough\":true}}",
+        factory = NULL_SINK_FACTORY,
+        name = json_str(name),
+        desc = json_str(description),
+        quantum = SINK_QUANTUM,
     )
 }
 
-/// Источник кабеля в списке микрофонов не нужен.
-fn playback_props(name: &str, description: &str) -> String {
-    format!(
-        "media.class=Audio/Source node.name={name} node.description={} audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.passive=true node.virtual=true",
-        pw_value(description)
-    )
+/// `pw-cli` держит узел, пока открыт stdin. Закрытие или смерть процесса
+/// убирает синк.
+pub struct HeldSink {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl HeldSink {
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for HeldSink {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+pub fn spawn_null_sink(props: &str) -> Result<HeldSink> {
+    let mut child = Command::new("pw-cli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("pw-cli не запустился")?;
+    let mut stdin = child.stdin.take().context("pw-cli без stdin")?;
+    writeln!(stdin, "create-node adapter {props}").context("команда синка")?;
+    stdin.flush().ok();
+    Ok(HeldSink {
+        child,
+        stdin: Some(stdin),
+    })
 }
 
 fn applet_label(name: &str) -> String {
@@ -104,7 +173,7 @@ pub fn zone_channels(zone_id: &str, name: &str) -> Vec<CaptureChan> {
 struct Running {
     zone_id: String,
     name: String,
-    child: Child,
+    held: HeldSink,
 }
 
 pub struct Cables {
@@ -143,14 +212,24 @@ fn null_sink_id(dump: &str) -> Option<u32> {
     item.get("id")?.as_u64().map(|id| id as u32)
 }
 
-pub(crate) fn cable_ready(dump: &str, sink: &str, source: &str) -> bool {
+fn prop_force_quantum(item: &serde_json::Value) -> Option<u64> {
+    let value = item.pointer("/info/props/node.force-quantum")?;
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    value.as_str()?.parse().ok()
+}
+
+/// Синк готов, когда это наш null-sink и квант группы именно 240.
+/// Старый pw-loopback и linger-синк без этого кванта — не готов.
+pub(crate) fn cable_ready(dump: &str, sink: &str) -> bool {
     let Some(sink_node) = find_node(dump, sink, "Audio/Sink") else {
         return false;
     };
-    if prop_str(&sink_node, "factory.name") == Some(NULL_SINK_FACTORY) {
+    if prop_str(&sink_node, "factory.name") != Some(NULL_SINK_FACTORY) {
         return false;
     }
-    find_node(dump, source, "Audio/Source").is_some()
+    prop_force_quantum(&sink_node) == SINK_QUANTUM.parse().ok()
 }
 
 /// Зона «жива», когда в её sink есть ссылка от клиента, а не от нашего кабеля.
@@ -288,26 +367,14 @@ impl Cables {
     fn spawn(&mut self, zone: &VirtualZone) -> Result<()> {
         let label = applet_label(&zone.name);
         let sink = sink_name(&zone.zone_id);
-        let source = monitor_name(&zone.zone_id);
-        let capture = capture_props(&sink, &label);
-        let playback = playback_props(&source, &format!("{label}Monitor"));
-        let child = Command::new("pw-loopback")
-            .args(loopback_front(&process_name(&zone.zone_id)))
-            .arg("--capture-props")
-            .arg(capture)
-            .arg("--playback-props")
-            .arg(playback)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("pw-loopback не запустился")?;
+        release_loopback(&process_name(&zone.zone_id));
+        let held = spawn_null_sink(&null_sink_props(&sink, &label, true))?;
         let mut slot = Running {
             zone_id: zone.zone_id.clone(),
             name: zone.name.clone(),
-            child,
+            held,
         };
-        wait_ready(&mut slot, &sink, &source)?;
+        wait_ready(&mut slot, &sink)?;
         self.running.push(slot);
         Ok(())
     }
@@ -317,28 +384,34 @@ fn slot_ok(slot: &mut Running, zones: &[VirtualZone], dump: &str) -> bool {
     let Some(zone) = zones.iter().find(|z| z.zone_id == slot.zone_id && z.name == slot.name) else {
         return false;
     };
-    if !child_alive(&mut slot.child) {
+    if !child_alive(&mut slot.held) {
         return false;
     }
-    cable_ready(dump, &sink_name(&zone.zone_id), &monitor_name(&zone.zone_id))
+    cable_ready(dump, &sink_name(&zone.zone_id))
 }
 
-fn child_alive(child: &mut Child) -> bool {
-    matches!(child.try_wait(), Ok(None))
+fn child_alive(held: &mut HeldSink) -> bool {
+    matches!(held.try_wait(), Ok(None))
 }
 
-fn wait_ready(slot: &mut Running, sink: &str, source: &str) -> Result<()> {
+fn release_loopback(process: &str) {
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("pw-loopback --name {process}")])
+        .status();
+}
+
+fn wait_ready(slot: &mut Running, sink: &str) -> Result<()> {
     for _ in 0..40 {
-        if !child_alive(&mut slot.child) {
-            anyhow::bail!("pw-loopback завершился, не создав узлы");
+        if !child_alive(&mut slot.held) {
+            anyhow::bail!("синк завершился, не создав узел");
         }
-        if dump_text().ok().is_some_and(|dumped| cable_ready(&dumped, sink, source)) {
+        if dump_text().ok().is_some_and(|dumped| cable_ready(&dumped, sink)) {
             return Ok(());
         }
         sleep(Duration::from_millis(50));
     }
     stop_slot_in_place(slot);
-    anyhow::bail!("pw-loopback не создал {sink} и {source}");
+    anyhow::bail!("синк не создал {sink}");
 }
 
 fn stop_slot(mut slot: Running) {
@@ -346,10 +419,12 @@ fn stop_slot(mut slot: Running) {
 }
 
 fn stop_slot_in_place(slot: &mut Running) {
-    let _ = slot.child.kill();
-    let _ = slot.child.wait();
-    let pattern = format!("pw-loopback --name {}", process_name(&slot.zone_id));
-    let _ = Command::new("pkill").args(["-f", &pattern]).status();
+    drop(slot.held.stdin.take());
+    if matches!(slot.held.child.try_wait(), Ok(None)) {
+        let _ = slot.held.child.kill();
+        let _ = slot.held.child.wait();
+    }
+    release_loopback(&process_name(&slot.zone_id));
 }
 
 #[cfg(test)]
@@ -358,34 +433,50 @@ mod tests {
     use crate::inputs::virtual_capture_channels;
 
     #[test]
-    fn loopback_front_passes_three_millisecond_latency() {
-        let front = loopback_front("zvucast-zone-hall");
-        assert_eq!(LOOPBACK_LATENCY_MS, "3");
-        assert!(
-            front.windows(2).any(|pair| pair == ["--latency", "3"]),
-            "{front:?}"
-        );
+    fn sink_forces_its_own_quantum_and_does_not_lock_the_graph() {
+        let sink = null_sink_props("zvucast-hall", "Zvucast: Зал", true);
+        assert!(sink.contains("\"factory.name\":\"support.null-audio-sink\""), "{sink}");
+        assert!(sink.contains("\"node.force-quantum\":240"), "{sink}");
+        assert!(sink.contains("\"priority.session\":50"), "{sink}");
+        assert!(sink.contains("\"session.suspend-timeout-seconds\":0"), "{sink}");
+        assert!(!sink.contains("lock-quantum"), "{sink}");
+        assert!(!sink.contains("node.latency"), "{sink}");
+        assert!(!sink.contains("priority.driver"), "{sink}");
+        assert!(!sink.contains("object.linger"), "{sink}");
+        assert_eq!(SINK_QUANTUM, "240");
     }
 
     #[test]
-    fn cable_props_lock_the_quantum() {
-        let sink = capture_props("zvucast-hall", "Zvucast: Зал");
-        let source = playback_props("zvucast-hall-monitor", "Zvucast: ЗалMonitor");
-        assert!(sink.contains("node.lock-quantum=true"), "{sink}");
-        assert!(source.contains("node.lock-quantum=true"), "{source}");
-        assert!(sink.contains("node.latency=128/48000"), "{sink}");
-        assert!(source.contains("node.latency=128/48000"), "{source}");
+    fn feed_capture_reads_the_sink_monitor() {
+        let args = feed_capture_args("zvucast-sendspin-hall-monitor");
+        assert_eq!(feed_capture_target("zvucast-hall-monitor"), "zvucast-hall");
+        assert_eq!(feed_capture_target("alsa_input.usb"), "alsa_input.usb");
+        assert!(
+            args.windows(2).any(|pair| pair == ["--target", "zvucast-sendspin-hall"]),
+            "{args:?}"
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--latency", "240"]), "{args:?}");
+        let props = args
+            .windows(2)
+            .find(|pair| pair[0] == "--properties")
+            .map(|pair| pair[1].as_str())
+            .unwrap_or("");
+        assert!(props.contains("\"stream.capture.sink\":\"true\""), "{props}");
+        assert!(props.contains("\"node.latency\":\"240/48000\""), "{props}");
+        assert!(props.contains("\"node.passive\":\"true\""), "{props}");
+        assert!(props.contains("\"node.dont-fallback\":\"true\""), "{props}");
+        assert!(!props.contains("lock-quantum"), "{props}");
+        assert!(!props.contains("force-quantum"), "{props}");
     }
 
     #[test]
     fn sink_is_visible_to_the_applet() {
-        let sink = capture_props("zvucast-hall", "Zvucast: Зал");
-        let source = playback_props("zvucast-hall-monitor", "Zvucast: ЗалMonitor");
-        assert!(sink.contains("node.virtual=false"));
-        assert!(source.contains("node.virtual=true"));
-        assert!(source.contains("node.passive=true"));
-        assert!(!sink.contains("node.virtual=true"));
-        assert!(sink.contains("node.description=\"Zvucast: Зал\""));
+        let sink = null_sink_props("zvucast-hall", "Zvucast: Зал", true);
+        let hidden = null_sink_props("zvucast-sendspin-hall", "ZvucastSendspin", false);
+        assert!(sink.contains("\"node.virtual\":false"), "{sink}");
+        assert!(!sink.contains("\"node.virtual\":true"), "{sink}");
+        assert!(hidden.contains("\"node.virtual\":true"), "{hidden}");
+        assert!(sink.contains("\"node.description\":\"Zvucast: Зал\""), "{sink}");
         assert_eq!(applet_label("Зал"), "Zvucast: Зал");
     }
 
@@ -394,13 +485,15 @@ mod tests {
         let dump = r#"[
             {"id": 7, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "alsa_output.pci", "media.class": "Audio/Sink"}}},
             {"id": 42, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "zvucast", "media.class": "Audio/Sink", "factory.name": "support.null-audio-sink"}}},
-            {"id": 43, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "zvucast-hall", "media.class": "Audio/Sink"}}},
-            {"id": 44, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "zvucast-hall-monitor", "media.class": "Audio/Source"}}}
+            {"id": 43, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "zvucast-hall", "media.class": "Audio/Sink", "factory.name": "support.null-audio-sink", "node.force-quantum": 240}}},
+            {"id": 45, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "zvucast-bed", "media.class": "Audio/Sink", "factory.name": "support.null-audio-sink", "node.force-quantum": "240"}}}
         ]"#;
         assert_eq!(null_sink_id(dump), Some(42));
-        assert!(!cable_ready(dump, "zvucast", "zvucast-monitor"));
-        assert!(cable_ready(dump, "zvucast-hall", "zvucast-hall-monitor"));
-        assert!(!cable_ready("[]", "zvucast-hall", "zvucast-hall-monitor"));
+        assert!(!cable_ready(dump, "zvucast"));
+        assert!(cable_ready(dump, "zvucast-hall"));
+        assert!(cable_ready(dump, "zvucast-bed"));
+        assert!(!cable_ready(dump, "alsa_output.pci"));
+        assert!(!cable_ready("[]", "zvucast-hall"));
     }
 
     #[test]

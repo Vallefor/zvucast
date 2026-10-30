@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use zproto::CaptureChan;
 
 pub const VIRTUAL_DEVICE_KEY: &str = "zvucast";
-/// Источник кабеля pw-loopback. pipewiresrc целится сюда, не в монитор sink.
+/// Старое имя источника pw-loopback. Фиды читают монитор своего синка
+/// и сюда не целятся. pipewiresrc line-in по-прежнему дописывает `-monitor`.
 pub const VIRTUAL_SOURCE_KEY: &str = "zvucast-monitor";
 
 /// Старый общий выход и выходы зон (`zvucast-{id}`) — наше пространство имён.
@@ -404,6 +405,20 @@ pub fn sink_nodes_from_dump(json: &str) -> Vec<SinkNode> {
     out
 }
 
+/// Имя для сопоставления с `alsa.card_name`, пока нет `node.name`.
+///
+/// У USB-кодека монитор устройств отдаёт длинный путь шины, а не имя карты.
+/// По этому пути узел PipeWire не находится, и `pw-play` не запускается.
+pub fn playback_key_seed(node_name: &str, card_name: &str, display_name: &str) -> String {
+    if !node_name.is_empty() {
+        return node_name.to_string();
+    }
+    if !card_name.is_empty() {
+        return card_name.to_string();
+    }
+    display_name.to_string()
+}
+
 pub fn resolve_playback_key(key: &str, device_name: &str, sinks: &[SinkNode]) -> String {
     if sinks.iter().any(|s| s.node_name == key) {
         return key.to_string();
@@ -443,8 +458,17 @@ fn discover_channels(kind: &str, playback: bool) -> Vec<CaptureChan> {
     for dev in mon.devices() {
         let device_name = dev.display_name().to_string();
         let props = dev.properties();
-        let device_key = device_key_from_props(props.as_ref(), playback)
-            .unwrap_or_else(|| device_name.clone());
+        let device_key = if playback {
+            let node = device_key_from_props(props.as_ref(), true).unwrap_or_default();
+            let card = props
+                .as_ref()
+                .and_then(|p| p.get::<String>("alsa.card_name").ok())
+                .filter(|card| !card.is_empty())
+                .unwrap_or_default();
+            playback_key_seed(&node, &card, &device_name)
+        } else {
+            device_key_from_props(props.as_ref(), false).unwrap_or_else(|| device_name.clone())
+        };
         let n = dev.caps().as_ref().map(channel_count).unwrap_or(2);
         for index in 0..n {
             out.push(CaptureChan {
@@ -768,6 +792,18 @@ mod tests {
             "нет такой карты"
         );
         assert!(sink_nodes_from_dump("не json").is_empty());
+    }
+
+    #[test]
+    fn usb_codec_bus_path_resolves_through_the_card_name() {
+        let display = "Burr-Brown from TI USB Audio CODEC at usb-0000:01:00.0-1.2, full speed";
+        let seed = playback_key_seed("", "USB Audio CODEC", display);
+        assert_eq!(seed, "USB Audio CODEC");
+        assert_ne!(seed, display);
+        let node = "alsa_output.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo-output";
+        let sinks = vec![SinkNode { node_name: node.into(), card_name: "USB Audio CODEC".into() }];
+        assert_eq!(resolve_playback_key(&seed, &seed, &sinks), node);
+        assert_eq!(playback_key_seed(node, "USB Audio CODEC", display), node);
     }
 
     #[test]

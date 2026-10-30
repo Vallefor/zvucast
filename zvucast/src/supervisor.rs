@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use gstreamer as gst;
@@ -82,21 +83,17 @@ struct MonitorCapture {
 
 impl MonitorCapture {
     fn start(appsrc: gst::Element, node: &str) -> Result<Self> {
+        Self::spawn(appsrc, source_capture_args(node))
+    }
+
+    /// Монитор своего синка. Цель — сам синк, `stream.capture.sink`.
+    fn start_feed(appsrc: gst::Element, monitor: &str) -> Result<Self> {
+        Self::spawn(appsrc, crate::virtual_output::feed_capture_args(monitor))
+    }
+
+    fn spawn(appsrc: gst::Element, args: Vec<String>) -> Result<Self> {
         let mut child = Command::new("pw-record")
-            .args([
-                "--target",
-                node,
-                "--rate",
-                "48000",
-                "--channels",
-                "2",
-                "--format",
-                "s16",
-                "--latency",
-                PW_LATENCY,
-                "--raw",
-                "-",
-            ])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -110,7 +107,16 @@ impl MonitorCapture {
         let stop_thread = stop.clone();
         let thread = std::thread::Builder::new()
             .name("zvucast-capture".into())
-            .spawn(move || feed_capture(stdout, appsrc, stop_thread))
+            .spawn(move || {
+                feed_capture(
+                    CaptureSource {
+                        inner: stdout,
+                        pending: child_stdout_queued,
+                    },
+                    appsrc,
+                    stop_thread,
+                )
+            })
             .context("поток захвата")?;
         Ok(Self {
             stop,
@@ -208,10 +214,13 @@ fn play_desktop(
             tracing::warn!("pw-play: выбранные выходы не совпали с живыми sink");
         }
     }
+    // Соседний журнал: пауза между записями и нули в байтах. На звук не влияет.
+    let mut tap = PlayTap::start();
     while !stop.load(Ordering::Relaxed) {
         let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(200)) else {
             // Нет RTP — процесс не должен висеть suspended со ссылками.
             // В Null try_pull возвращается сразу, без паузы это был бы пустой цикл.
+            tap.mark(b'E', &[], None);
             for slot in &players {
                 close_player(slot);
             }
@@ -227,14 +236,23 @@ fn play_desktop(
         match &route {
             crate::inputs::PlaybackRoute::Fallback => {
                 if let Some(slot) = players.first() {
-                    if !write_player(slot, bytes, None) {
+                    let fate = write_player(slot, bytes, None);
+                    let alive = fate.alive();
+                    tap.mark(fate.kind(), bytes, fate.queued());
+                    if !alive {
                         close_player(slot);
                     }
                 }
             }
             crate::inputs::PlaybackRoute::Nodes(names) => {
-                for (slot, name) in players.iter().zip(names.iter()) {
-                    if !write_player(slot, bytes, Some(name.as_str())) {
+                for (index, (slot, name)) in players.iter().zip(names.iter()).enumerate() {
+                    let fate = write_player(slot, bytes, Some(name.as_str()));
+                    let alive = fate.alive();
+                    // Один и тот же буфер уходит во все слоты. Журнал ведём по первому.
+                    if index == 0 {
+                        tap.mark(fate.kind(), bytes, fate.queued());
+                    }
+                    if !alive {
                         close_player(slot);
                     }
                 }
@@ -251,36 +269,298 @@ fn play_desktop(
 /// Мьютекс слота держится только на spawn и на дублирование дескриптора.
 /// Запись идёт в клон, уже без guard: процесс, который перестал читать,
 /// не блокирует остальные слоты и не мешает `DesktopPlay::shutdown` убить
-/// его. `false` — слот надо закрыть и идти к следующему в том же буфере.
-fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> bool {
+/// его. `false` — процесс умер, слот надо закрыть. Полный пайп — не смерть:
+/// лишний буфер сбрасывается, `pw-play` остаётся.
+fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&str>) -> PushFate {
     let owned = {
-        let Ok(mut guard) = slot.lock() else { return false };
+        let Ok(mut guard) = slot.lock() else {
+            return PushFate::Dead;
+        };
         if guard.is_none() {
             match spawn_player(sink_node) {
                 Ok(child) => *guard = Some(child),
                 Err(e) => {
                     tracing::warn!("pw-play: {e:#}");
-                    return false;
+                    return PushFate::Dead;
                 }
             }
         }
-        let Some(child) = guard.as_mut() else { return false };
-        let Some(stdin) = child.stdin.as_ref() else { return false };
+        let Some(child) = guard.as_mut() else {
+            return PushFate::Dead;
+        };
+        let Some(stdin) = child.stdin.as_ref() else {
+            return PushFate::Dead;
+        };
         match stdin.as_fd().try_clone_to_owned() {
             Ok(owned) => owned,
             Err(e) => {
                 tracing::warn!("pw-play: stdin: {e}");
-                return false;
+                return PushFate::Dead;
             }
         }
     };
     if let Err(e) = set_fd_nonblocking(&owned, true) {
         tracing::warn!("pw-play: stdin: {e}");
-        return false;
+        return PushFate::Dead;
     }
-    let mut pipe = std::fs::File::from(owned);
+    let pipe = std::fs::File::from(owned);
     probe_stdin_unlocked(slot);
-    pipe.write_all(bytes).is_ok()
+    push_playback(pipe, bytes)
+}
+
+/// Хватает ли в пайпе ядра места на весь буфер.
+///
+/// Сколько звука уже лежит в очереди, значения не имеет: потолок в 40 мс
+/// вырезал щелчок, хотя ядро запись ещё принимало. Короткий хвост тоже
+/// отказ — кусок кадра разъедет каналы.
+fn playback_chunk_fits(free: usize, len: usize) -> bool {
+    len > 0 && free >= len
+}
+
+/// Слот жив во всех ветках, кроме смерти процесса. Буфер мог не лечь,
+/// только если пайп ядра не вмещает его целиком.
+fn push_playback(mut pipe: std::fs::File, bytes: &[u8]) -> PushFate {
+    if bytes.is_empty() {
+        return PushFate::Written { queued_before: None };
+    }
+    let room = pipe_room(&pipe);
+    if let Some((_, free)) = room {
+        if !playback_chunk_fits(free, bytes.len()) {
+            return PushFate::Dropped {
+                queued_before: room.map(|(queued, _)| queued),
+            };
+        }
+    }
+    let queued_before = room.map(|(queued, _)| queued);
+    match pipe.write_all(bytes) {
+        Ok(()) => PushFate::Written { queued_before },
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => PushFate::Blocked { queued_before },
+        Err(_) => PushFate::Dead,
+    }
+}
+
+enum PushFate {
+    Written { queued_before: Option<usize> },
+    Dropped { queued_before: Option<usize> },
+    Blocked { queued_before: Option<usize> },
+    Dead,
+}
+
+impl PushFate {
+    fn alive(&self) -> bool {
+        !matches!(self, PushFate::Dead)
+    }
+
+    fn kind(&self) -> u8 {
+        match self {
+            PushFate::Written { .. } => b'W',
+            PushFate::Dropped { .. } => b'D',
+            PushFate::Blocked { .. } => b'B',
+            PushFate::Dead => b'X',
+        }
+    }
+
+    fn queued(&self) -> Option<usize> {
+        match self {
+            PushFate::Written { queued_before }
+            | PushFate::Dropped { queued_before }
+            | PushFate::Blocked { queued_before } => *queued_before,
+            PushFate::Dead => None,
+        }
+    }
+}
+
+/// Журнал байтов, которые поток отдаёт в pw-play.
+///
+/// Строка пишется в другом потоке: файловый ввод здесь сам стал бы паузой,
+/// которую измеряем. Канал короткий, при переполнении звук не ждёт.
+struct PlayTap {
+    tx: Option<mpsc::SyncSender<TapRec>>,
+    logger: Option<JoinHandle<()>>,
+    last: Option<Instant>,
+    at_frame: u64,
+}
+
+struct TapRec {
+    kind: u8,
+    unix_us: u64,
+    gap_us: u32,
+    frames: u32,
+    at_frame: u64,
+    queued: u32,
+    zero_frames: u32,
+    longest_zero: u32,
+    lead: u32,
+    tail: u32,
+}
+
+impl PlayTap {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::sync_channel(1024);
+        let logger = std::thread::Builder::new()
+            .name("play-tap".to_string())
+            .spawn(move || play_tap_logger(rx))
+            .ok();
+        Self {
+            tx: logger.as_ref().map(|_| tx),
+            logger,
+            last: None,
+            at_frame: 0,
+        }
+    }
+
+    fn mark(&mut self, kind: u8, bytes: &[u8], queued: Option<usize>) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let gap_us = self
+            .last
+            .map(|prev| {
+                now.duration_since(prev)
+                    .as_micros()
+                    .min(u128::from(u32::MAX)) as u32
+            })
+            .unwrap_or(0);
+        self.last = Some(now);
+        let unix_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_micros() as u64)
+            .unwrap_or(0);
+        let frames = (bytes.len() / 4) as u32;
+        let (zero_frames, longest_zero, lead, tail) = silence_in_s16le(bytes);
+        let queued = queued.map(|n| n.min(u32::MAX as usize) as u32).unwrap_or(u32::MAX);
+        let rec = TapRec {
+            kind,
+            unix_us,
+            gap_us,
+            frames,
+            at_frame: self.at_frame,
+            queued,
+            zero_frames,
+            longest_zero,
+            lead,
+            tail,
+        };
+        if kind == b'W' {
+            self.at_frame = self.at_frame.saturating_add(u64::from(frames));
+        }
+        let _ = tx.try_send(rec);
+    }
+}
+
+impl Drop for PlayTap {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(logger) = self.logger.take() {
+            let _ = logger.join();
+        }
+    }
+}
+
+fn play_tap_logger(rx: mpsc::Receiver<TapRec>) {
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o644)
+        .open("/tmp/zvucast-play-tap.log")
+    {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!("журнал проигрывателя не открылся: {e}");
+            return;
+        }
+    };
+    let _ = writeln!(
+        file,
+        "# kind unix_us gap_us frames at_frame queued zero_frames longest_zero lead tail"
+    );
+    let mut lines = 0u32;
+    while let Ok(rec) = rx.recv() {
+        if lines >= 200_000 {
+            continue;
+        }
+        let queued = if rec.queued == u32::MAX {
+            -1
+        } else {
+            rec.queued as i64
+        };
+        if writeln!(
+            file,
+            "{} {} {} {} {} {} {} {} {} {}",
+            rec.kind as char,
+            rec.unix_us,
+            rec.gap_us,
+            rec.frames,
+            rec.at_frame,
+            queued,
+            rec.zero_frames,
+            rec.longest_zero,
+            rec.lead,
+            rec.tail
+        )
+        .is_err()
+        {
+            return;
+        }
+        lines += 1;
+        if lines % 64 == 0 {
+            let _ = file.flush();
+        }
+    }
+    let _ = file.flush();
+}
+
+/// Кадры, где оба канала тише порога, и самая длинная такая серия в буфере.
+///
+/// Порог 200 — тот же, что у разбора монитора. Тон в этот пайп приходит
+/// с пиком около тысячи, так что серия длиннее кванта — уже дыра в байтах,
+/// а не нуль на пересечении волны.
+fn silence_in_s16le(bytes: &[u8]) -> (u32, u32, u32, u32) {
+    const THRESH: u16 = 200;
+    let mut zeros = 0u32;
+    let mut run = 0u32;
+    let mut longest = 0u32;
+    let mut lead = 0u32;
+    let mut tail = 0u32;
+    let mut seen_loud = false;
+    let mut index = 0;
+    while index + 4 <= bytes.len() {
+        let left = i16::from_le_bytes([bytes[index], bytes[index + 1]]);
+        let right = i16::from_le_bytes([bytes[index + 2], bytes[index + 3]]);
+        if left.unsigned_abs() < THRESH && right.unsigned_abs() < THRESH {
+            zeros += 1;
+            run += 1;
+            if run > longest {
+                longest = run;
+            }
+            if !seen_loud {
+                lead = run;
+            }
+            tail = run;
+        } else {
+            seen_loud = true;
+            run = 0;
+            tail = 0;
+        }
+        index += 4;
+    }
+    (zeros, longest, lead, tail)
+}
+
+fn pipe_room(fd: &impl AsFd) -> Option<(usize, usize)> {
+    let mut queued = 0;
+    let raw = fd.as_fd().as_raw_fd();
+    let read = unsafe { libc::ioctl(raw, libc::FIONREAD, &mut queued) };
+    if read == -1 || queued < 0 {
+        return None;
+    }
+    let size = unsafe { libc::fcntl(raw, libc::F_GETPIPE_SZ) };
+    if size <= 0 {
+        return None;
+    }
+    Some((queued as usize, (size as usize).saturating_sub(queued as usize)))
 }
 
 fn set_fd_nonblocking(fd: &impl std::os::fd::AsFd, nonblocking: bool) -> std::io::Result<()> {
@@ -326,21 +606,13 @@ fn spawn_player(sink_node: Option<&str>) -> Result<Child> {
         }
         None => crate::pipeline::desktop_playback_target().context("нет sink кроме zvucast")?,
     };
+    let ms = configured_play_ms();
+    let stock = play_stock_frames(ms);
+    apply_device_stock(&target, stock);
+    tracing::info!(ms, stock, quantum = PLAY_QUANTUM, target = %target, "pw-play: запас колонки");
+    let args = player_args(&target);
     Command::new("pw-play")
-        .args([
-            "--raw",
-            "--rate",
-            "48000",
-            "--channels",
-            "2",
-            "--format",
-            "s16",
-            "--latency",
-            PW_LATENCY,
-            "--target",
-            &target,
-            "-",
-        ])
+        .args(args.iter().map(String::as_str))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -356,56 +628,412 @@ fn close_player(slot: &Mutex<Option<Child>>) {
     let _ = child.wait();
 }
 
-/// Кадры для `pw-cat --latency` (число без единицы — это кадры, не миллисекунды).
-/// 128 @ 48 кГц = 2.7 мс: период UCA202 и HiFiBerry. 20 мс раньше сидели
-/// сверху кванта и не отдавались в звук.
-const PW_LATENCY: &str = "128";
+/// Просьба line-in, кадры. Граф этим не запирается. Захват фида
+/// просит 240 и читает монитор своего синка. Чтение остаётся по 128 кадров:
+/// кадр провода 5 мс собирается из этих кусков.
+const CAPTURE_LATENCY: &str = "256";
+/// Один read pw-record. Квант захвата больше, пайсер режет по 512 байт.
 const CAPTURE_BYTES: usize = 128 * 2 * 2;
 
-fn feed_capture(mut stdout: impl Read, appsrc: gst_app::AppSrc, stop: Arc<AtomicBool>) {
-    // Квант приходит пачкой кусков по 128 кадров. do-timestamp ставит
-    // им один PTS: на приёме куски лежат друг на друге. Монотонная метка
-    // лечит хрип, но труба pw-record уже держит сотни миллисекунд. Если
-    // разметить весь затор вперёд от «сейчас», колонка доигрывает его:
-    // задержка около полусекунды. Дальше одного кванта кадр не ставим.
+fn source_capture_args(node: &str) -> Vec<String> {
+    [
+        "--target",
+        node,
+        "--rate",
+        "48000",
+        "--channels",
+        "2",
+        "--format",
+        "s16",
+        "--latency",
+        CAPTURE_LATENCY,
+        "--raw",
+        "-",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// Запас проигрывателя по умолчанию, миллисекунды.
+/// `ZVUCAST_PLAY_MS`: 40, 20 или 5, затем перезапуск агента.
+/// Это глубина кольца карты, не цикл всего графа. Граф не заперт.
+const PLAY_MS_DEFAULT: u32 = 40;
+const PLAY_MS_MAX: u32 = 200;
+/// Период HiFiBerry. Кольцо карты считается этими квантами.
+/// `pw-play` просит тот же размер у группы карты и не ставит замок.
+const PLAY_QUANTUM: u32 = 256;
+const PLAY_LATENCY: &str = "256";
+
+fn play_ms(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return PLAY_MS_DEFAULT;
+    };
+    match raw.parse::<u32>() {
+        Ok(ms) if ms >= 1 => ms.min(PLAY_MS_MAX),
+        _ => PLAY_MS_DEFAULT,
+    }
+}
+
+/// Миллисекунды в кадры при 48 кГц. 1 мс = 48 кадров.
+fn play_latency_frames(ms: u32) -> u32 {
+    ms.saturating_mul(48)
+}
+
+/// Кадры в кольце карты: целое число квантов по 256.
+/// 40 мс → 2048, это 8 квантов. Середина кванта округляется вверх.
+fn play_stock_frames(ms: u32) -> u32 {
+    let frames = play_latency_frames(ms);
+    let quanta = frames.saturating_add(PLAY_QUANTUM / 2) / PLAY_QUANTUM;
+    quanta.max(1) * PLAY_QUANTUM
+}
+
+fn player_args(target: &str) -> Vec<String> {
+    [
+        "--raw",
+        "--rate",
+        "48000",
+        "--channels",
+        "2",
+        "--format",
+        "s16",
+        "--latency",
+        PLAY_LATENCY,
+        "--target",
+        target,
+        "-",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// `pw-cli ls Node`: строка `id N, type ...`, ниже `node.name = "..."`.
+fn node_id_from_list(text: &str, name: &str) -> Option<String> {
+    let mut id = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("id ") {
+            id = rest.split_once(',').map(|(num, _)| num.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("node.name = ") {
+            if rest.trim().trim_matches('"') == name {
+                return id;
+            }
+        }
+    }
+    None
+}
+
+/// Ставит запас в кольцо уже открытой карты. Файл WirePlumber задаёт то же
+/// значение по умолчанию; ручка может его сменить без перезапуска PipeWire.
+/// Ошибка не роняет плеер: без команды остаётся запас из файла.
+fn apply_device_stock(node_name: &str, frames: u32) {
+    let listed = Command::new("timeout")
+        .args(["3", "pw-cli", "ls", "Node"])
+        .output();
+    let Ok(listed) = listed else {
+        tracing::warn!(node = node_name, "запас колонки: pw-cli не запустился");
+        return;
+    };
+    if !listed.status.success() {
+        tracing::warn!(node = node_name, "запас колонки: список узлов пуст");
+        return;
+    }
+    let text = String::from_utf8_lossy(&listed.stdout);
+    let Some(id) = node_id_from_list(&text, node_name) else {
+        tracing::warn!(node = node_name, "запас колонки: узел не найден");
+        return;
+    };
+    let param = format!("{{ params = [ \"api.alsa.headroom\" {frames} ] }}");
+    let set = Command::new("timeout")
+        .args(["3", "pw-cli", "set-param", &id, "Props", &param])
+        .output();
+    match set {
+        Ok(out) if out.status.success() => {
+            tracing::info!(node = node_name, id, frames, "запас колонки: кольцо");
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!(node = node_name, frames, %err, "запас колонки: кольцо не встало");
+        }
+        Err(e) => {
+            tracing::warn!(node = node_name, "запас колонки: {e}");
+        }
+    }
+}
+
+fn configured_play_ms() -> u32 {
+    play_ms(std::env::var("ZVUCAST_PLAY_MS").ok().as_deref())
+}
+
+/// Когда слать уже готовый кусок.
+///
+/// Срок в прошлом не догоняем пачкой: иначе квант PipeWire (пачка кусков,
+/// прочитанная сразу после ожидания) уходит в сокет одним залпом. Следующий
+/// кусок ждёт полный период. Живой захват этим больше не пользуется:
+/// слоты считает [`FeedPacer`].
+#[cfg(test)]
+fn pace_deadline(previous: Option<Instant>, now: Instant, period: Duration) -> (Option<Duration>, Instant) {
+    match previous {
+        Some(at) if at > now => (Some(at - now), at + period),
+        _ => (None, now + period),
+    }
+}
+
+/// Кадр на проводе. 5 мс, 240 отсчётов на канал, 960 байт. С RTP-заголовком
+/// это меньше MTU 1400. Квант захвата остаётся 128: его копим, а не шлём.
+const FRAME_BYTES: usize = 240 * 2 * 2;
+const FRAME_NS: u64 = 5_000_000;
+/// Дольше этого один слот не ждём. Труба захвата конечная.
+const PACE_MAX_SLEEP: Duration = Duration::from_millis(10);
+/// Долг старше этого не отдаём пачкой. Срок слота начинается заново.
+const PACE_REANCHOR: Duration = Duration::from_millis(100);
+
+/// Что слот отдаёт на провод. Тишину в микшер не кладём: нули там и есть хрип.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaceSlot {
+    Wait,
+    Frame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaceRelease {
+    slot: PaceSlot,
+    /// Срок был старше [`PACE_REANCHOR`] и начался заново.
+    reanchored: bool,
+}
+
+/// Слоты по часам стены. Один кадр за слот. Второй кадр в том же слоте — только
+/// если срок уже был и после этого кадра осталось больше последнего куска
+/// захвата плюс ещё один кадр. Третьего нет. Первый кадр сессии бонус не берёт:
+/// срок ещё не стоял, сразу ставится «сейчас плюс интервал».
+struct FeedPacer {
+    due: Option<Instant>,
+    interval: Duration,
+    frame_len: usize,
+    /// Последний увиденный кусок захвата, байт. Порог бонуса — он плюс кадр.
+    max_chunk: usize,
+    bonus_taken: bool,
+}
+
+impl FeedPacer {
+    fn new(frame_len: usize, interval: Duration) -> FeedPacer {
+        FeedPacer {
+            due: None,
+            interval,
+            frame_len,
+            max_chunk: 0,
+            bonus_taken: false,
+        }
+    }
+
+    fn on_chunk(&mut self, len: usize) {
+        self.max_chunk = self.max_chunk.max(len);
+    }
+
+    fn wake(&mut self) {
+        self.bonus_taken = false;
+    }
+
+    fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    fn release(&mut self, now: Instant, queued: usize) -> PaceRelease {
+        let mut reanchored = false;
+        match self.due {
+            Some(due) if due > now => {
+                return PaceRelease {
+                    slot: PaceSlot::Wait,
+                    reanchored: false,
+                };
+            }
+            Some(due) if now.duration_since(due) > PACE_REANCHOR => {
+                reanchored = true;
+                self.due = None;
+            }
+            Some(_) | None => {}
+        }
+        if queued < self.frame_len {
+            return PaceRelease {
+                slot: PaceSlot::Wait,
+                reanchored,
+            };
+        }
+        let left = queued - self.frame_len;
+        // Бонус держит срок на месте. Пока срока не было, даже толстый хвост
+        // уходит одним кадром: второй вызов в то же мгновение уже ждёт.
+        let bonus = self.due.is_some()
+            && !self.bonus_taken
+            && left >= self.max_chunk.saturating_add(self.frame_len);
+        self.due = match self.due {
+            Some(due) if bonus => Some(due),
+            other => Some(other.unwrap_or(now) + self.interval),
+        };
+        self.bonus_taken = bonus;
+        PaceRelease {
+            slot: PaceSlot::Frame,
+            reanchored,
+        }
+    }
+}
+
+/// Метка кадра — якорь плюс число отсчётов. Якорь двигается только вперёд,
+/// иначе уже отданный кадр получил бы ту же метку ещё раз.
+struct PtsClock {
+    base_ns: u64,
+    samples: usize,
+}
+
+impl PtsClock {
+    fn pts_ns(&self) -> u64 {
+        const PER_SEC: usize = 48_000 * 2;
+        self.base_ns + (self.samples as u64) * 1_000_000_000 / PER_SEC as u64
+    }
+
+    fn advance(&mut self, interleaved: usize) {
+        const PER_SEC: usize = 48_000 * 2;
+        self.samples += interleaved;
+        if self.samples >= PER_SEC {
+            let secs = self.samples / PER_SEC;
+            self.base_ns += secs as u64 * 1_000_000_000;
+            self.samples -= secs * PER_SEC;
+        }
+    }
+
+    fn reanchor(&mut self, anchor_ns: u64) {
+        if anchor_ns > self.pts_ns() {
+            self.base_ns = anchor_ns;
+            self.samples = 0;
+        }
+    }
+}
+
+struct CaptureSource<R> {
+    inner: R,
+    /// Глубина трубы. Чтение её не смотрит: ноль не значит, что квант ещё не пришёл.
+    #[allow(dead_code)]
+    pending: fn(&R) -> usize,
+}
+
+impl<R: Read> Read for CaptureSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+fn child_stdout_queued(stdout: &std::process::ChildStdout) -> usize {
+    pipe_room(stdout).map(|(queued, _)| queued).unwrap_or(0)
+}
+
+fn push_capture_chunk(appsrc: &gst_app::AppSrc, raw: &[u8], pts: u64, dur_ns: u64) -> bool {
+    let mut gstbuf = match gst::Buffer::with_size(raw.len()) {
+        Ok(buf) => buf,
+        Err(_) => return false,
+    };
+    {
+        let Some(gstbuf) = gstbuf.get_mut() else {
+            return false;
+        };
+        {
+            let Ok(mut map) = gstbuf.map_writable() else {
+                return false;
+            };
+            map.as_mut().copy_from_slice(raw);
+        }
+        gstbuf.set_pts(gst::ClockTime::from_nseconds(pts));
+        gstbuf.set_duration(gst::ClockTime::from_nseconds(dur_ns));
+    }
+    !matches!(
+        appsrc.push_buffer(gstbuf),
+        Err(gst::FlowError::Flushing) | Err(gst::FlowError::Eos)
+    )
+}
+
+fn feed_capture(
+    mut stdout: CaptureSource<impl Read>,
+    appsrc: gst_app::AppSrc,
+    stop: Arc<AtomicBool>,
+) {
+    // Квант PipeWire — не кадр. Читаем по 128 кадров и копим. На провод уходит
+    // кадр 5 мс. Пачку не размечаем одной меткой и не вычитываем в копилку
+    // целиком: иначе каждый слот берёт бонус. За пробуждение — один квант и
+    // не больше двух кадров. Срок впереди — ждём его, но не дольше 10 мс.
+    // Срок позади дополнительно не спим: чтение кванта уже ждало звук, второй
+    // сон уводит слот за 100 мс и шкала начинается заново на каждом кадре.
+    // Старше 100 мс долг прощается. Метка — время прихода минус то, что ещё
+    // лежит в копилке, и только вперёд. Дальше 32 мс впереди часов пайплайна
+    // кадр не ставим, ждём. Тишину в микшер не пишем.
     appsrc.set_property("do-timestamp", false);
     appsrc.set_property("max-buffers", 32u64);
     let mut raw = [0u8; CAPTURE_BYTES];
-    let mut next_ns: Option<u64> = None;
-    let frames = (CAPTURE_BYTES / 4) as u64;
-    let dur_ns = frames * 1_000_000_000 / 48_000;
-    /// 1024 кадра @ 48 кГц ≈ 21 мс. Запас сверху — дрожание чтения.
+    let mut acc = Vec::<u8>::with_capacity(FRAME_BYTES * 4);
+    let mut pacer = FeedPacer::new(FRAME_BYTES, Duration::from_nanos(FRAME_NS));
+    let mut clock = PtsClock {
+        base_ns: 0,
+        samples: 0,
+    };
+    /// 256 кадров @ 48 кГц ≈ 5.3 мс. Запас сверху — дрожание чтения.
     const MAX_LEAD_NS: u64 = 32_000_000;
     while !stop.load(Ordering::Relaxed) {
         if stdout.read_exact(&mut raw).is_err() {
             break;
         }
-        let now = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
-        let mut pts = next_ns.unwrap_or(now);
-        if now > pts && now - pts > 20_000_000 {
-            pts = now;
-        }
-        if pts > now.saturating_add(MAX_LEAD_NS) {
-            continue;
-        }
-        let mut gstbuf = match gst::Buffer::with_size(raw.len()) {
-            Ok(buf) => buf,
-            Err(_) => break,
-        };
-        {
-            let Some(gstbuf) = gstbuf.get_mut() else { break };
-            {
-                let Ok(mut map) = gstbuf.map_writable() else { break };
-                map.as_mut().copy_from_slice(&raw);
+        acc.extend_from_slice(&raw);
+        pacer.on_chunk(raw.len());
+        let running = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
+        let queued_frames = (acc.len() / 4) as u64;
+        let anchor = running.saturating_sub(queued_frames * 1_000_000_000 / 48_000);
+        clock.reanchor(anchor);
+        pacer.wake();
+        let mut sent_frames = 0u32;
+        loop {
+            let rel = pacer.release(Instant::now(), acc.len());
+            if rel.reanchored {
+                tracing::info!("захват фида: долг слота больше 100 мс, шкала заново");
             }
-            gstbuf.set_pts(gst::ClockTime::from_nseconds(pts));
-            gstbuf.set_duration(gst::ClockTime::from_nseconds(dur_ns));
+            if rel.slot != PaceSlot::Frame || acc.len() < FRAME_BYTES {
+                break;
+            }
+            let mut frame = [0u8; FRAME_BYTES];
+            frame.copy_from_slice(&acc[..FRAME_BYTES]);
+            acc.drain(..FRAME_BYTES);
+            let pts = clock.pts_ns();
+            let now_run = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
+            if pts > now_run.saturating_add(MAX_LEAD_NS) {
+                let wait = Duration::from_nanos(pts - now_run - MAX_LEAD_NS);
+                if wait.as_nanos() >= 5_000_000 {
+                    tracing::info!(
+                        wait_ns = wait.as_nanos() as u64,
+                        "захват фида: кусок ждал потолок метки"
+                    );
+                }
+                std::thread::sleep(wait);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            if !push_capture_chunk(&appsrc, &frame, pts, FRAME_NS) {
+                return;
+            }
+            clock.advance(FRAME_BYTES / 2);
+            sent_frames += 1;
+            if sent_frames >= 2 {
+                break;
+            }
         }
-        next_ns = Some(pts + dur_ns);
-        match appsrc.push_buffer(gstbuf) {
-            Ok(_) => {}
-            Err(gst::FlowError::Flushing) | Err(gst::FlowError::Eos) => break,
-            Err(_) => {}
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = Instant::now();
+        let wait = match pacer.due() {
+            Some(due) if due > now => (due - now).min(PACE_MAX_SLEEP),
+            _ => Duration::ZERO,
+        };
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
         }
     }
 }
@@ -514,7 +1142,7 @@ impl Runner {
             let Some(src) = self.pipeline.by_name(&name) else {
                 continue;
             };
-            match MonitorCapture::start(src, &feed.monitor) {
+            match MonitorCapture::start_feed(src, &feed.monitor) {
                 Ok(capture) => self.feed_captures.push(FeedCapture { capture }),
                 Err(e) => tracing::warn!(monitor = %feed.monitor, "pw-record вида: {e:#}"),
             }
@@ -978,6 +1606,109 @@ appl_ptr    : 313632\n";
     }
 
     #[test]
+    fn pace_deadline_does_not_catch_up_in_a_burst() {
+        let period = Duration::from_millis(3);
+        let now = Instant::now();
+        let (wait, next) = pace_deadline(None, now, period);
+        assert!(wait.is_none());
+        assert_eq!(next, now + period);
+
+        let future = now + Duration::from_millis(2);
+        let (wait, next) = pace_deadline(Some(future), now, period);
+        assert_eq!(wait, Some(Duration::from_millis(2)));
+        assert_eq!(next, future + period);
+
+        let past = now - Duration::from_millis(10);
+        let (wait, next) = pace_deadline(Some(past), now, period);
+        assert!(wait.is_none(), "опоздавший срок не выплёвывает пачку");
+        assert_eq!(next, now + period);
+    }
+
+    #[test]
+    fn pacer_releases_one_frame_a_slot_and_one_bonus_when_the_tail_is_thick() {
+        let t0 = Instant::now();
+        let frame = FRAME_BYTES;
+        let mut pacer = FeedPacer::new(frame, Duration::from_millis(5));
+        assert_eq!(pacer.release(t0, 0).slot, PaceSlot::Wait);
+        pacer.on_chunk(frame);
+        pacer.wake();
+        assert_eq!(pacer.release(t0, frame).slot, PaceSlot::Frame);
+        assert_eq!(
+            pacer.release(t0, frame).slot,
+            PaceSlot::Wait,
+            "следующий слот через 5 мс"
+        );
+
+        let t1 = t0 + Duration::from_millis(5);
+        pacer.wake();
+        assert_eq!(pacer.release(t1, 10 * frame).slot, PaceSlot::Frame);
+        assert_eq!(
+            pacer.release(t1, 9 * frame).slot,
+            PaceSlot::Frame,
+            "второй кадр того же слота"
+        );
+        assert_eq!(
+            pacer.release(t1, 8 * frame).slot,
+            PaceSlot::Wait,
+            "третьего кадра в слоте нет"
+        );
+    }
+
+    #[test]
+    fn pacer_does_not_bonus_the_first_frame() {
+        let t0 = Instant::now();
+        let frame = FRAME_BYTES;
+        let mut pacer = FeedPacer::new(frame, Duration::from_millis(5));
+        pacer.on_chunk(frame);
+        pacer.wake();
+        assert_eq!(pacer.release(t0, 10 * frame).slot, PaceSlot::Frame);
+        assert_eq!(
+            pacer.release(t0, 9 * frame).slot,
+            PaceSlot::Wait,
+            "первый кадр сессии не берёт бонус"
+        );
+    }
+
+    #[test]
+    fn pacer_forgives_a_stall_past_100ms_without_a_burst() {
+        let t0 = Instant::now();
+        let frame = FRAME_BYTES;
+        let mut pacer = FeedPacer::new(frame, Duration::from_millis(5));
+        pacer.on_chunk(frame);
+        pacer.wake();
+        assert_eq!(pacer.release(t0, frame).slot, PaceSlot::Frame);
+        let stalled = t0 + Duration::from_millis(185);
+        pacer.wake();
+        let rel = pacer.release(stalled, 10 * frame);
+        assert!(rel.reanchored, "долг старше 100 мс прощается");
+        assert_eq!(rel.slot, PaceSlot::Frame);
+        assert_eq!(
+            pacer.release(stalled, 9 * frame).slot,
+            PaceSlot::Wait,
+            "после прощения пачки нет"
+        );
+    }
+
+    #[test]
+    fn pts_clock_reanchors_only_forward() {
+        let mut clock = PtsClock {
+            base_ns: 0,
+            samples: 0,
+        };
+        clock.reanchor(1_000_000_000);
+        assert_eq!(clock.pts_ns(), 1_000_000_000);
+        clock.advance(480);
+        let after = clock.pts_ns();
+        assert_eq!(after, 1_005_000_000);
+        clock.reanchor(1_000_000_000);
+        assert_eq!(clock.pts_ns(), after, "якорь позади шкалу не тянет");
+        clock.reanchor(after + 1_000_000);
+        assert_eq!(clock.pts_ns(), after + 1_000_000);
+        clock.advance(480);
+        assert_eq!(clock.pts_ns(), after + 6_000_000);
+    }
+
+    #[test]
     fn queue_ms_is_minus_one_for_unknown_card() {
         assert_eq!(read_alsa_queue_ms("NoSuchCardZvucast"), -1);
     }
@@ -1099,40 +1830,50 @@ appl_ptr    : 313632\n";
                 Ok(n)
             }
         }
+        fn no_tail(_: &Bursts) -> usize {
+            0
+        }
         feed_capture(
-            Bursts {
-                left: CAPTURE_BYTES * quanta * per,
-                in_burst: 0,
+            CaptureSource {
+                inner: Bursts {
+                    left: CAPTURE_BYTES * quanta * per,
+                    in_burst: 0,
+                },
+                pending: no_tail,
             },
             src,
             Arc::new(AtomicBool::new(false)),
         );
-        let want = quanta * per;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let total = CAPTURE_BYTES * quanta * per;
+        let want = total / FRAME_BYTES;
+        assert!(total % FRAME_BYTES < FRAME_BYTES);
+        assert_eq!(want, 34, "32768 байт — это 34 кадра по 5 мс и остаток");
+        let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && rows.lock().unwrap().len() < want {
             std::thread::sleep(Duration::from_millis(20));
         }
         let got = rows.lock().unwrap().clone();
         let _ = tx.set_state(gst::State::Null);
-        assert_eq!(got.len(), want, "пачка кванта потерялась по дороге к payloader");
+        assert_eq!(got.len(), want, "кадры пачки потерялись по дороге к payloader");
         for pair in got.windows(2) {
             let (p0, d0) = pair[0];
             let (p1, _) = pair[1];
             let p0 = p0.expect("pts");
             let d0 = d0.expect("duration");
             let p1 = p1.expect("pts");
-            assert_eq!(
-                p1.nseconds(),
-                p0.nseconds() + d0.nseconds(),
-                "метки кусков должны идти встык"
+            assert_eq!(d0.nseconds(), FRAME_NS, "на провод уходит кадр 5 мс");
+            let step = p1.nseconds() - p0.nseconds();
+            assert!(
+                step >= FRAME_NS,
+                "метки налегли: шаг {step}"
             );
         }
     }
 
-    /// Затор в трубе (сотни миллисекунд сразу) не размечается вперёд:
-    /// на payloader уходит только окно около кванта.
+    /// Затор в трубе не размечается вперёд одним окном и не выбрасывается.
+    /// Куски выходят по периоду, метки остаются встык.
     #[test]
-    fn backlog_stays_inside_one_quantum() {
+    fn backlog_is_paced_instead_of_stamped_ahead() {
         gst::init().unwrap();
         let zone_id = "hall";
         let tx = crate::pipeline::build_tx_unicast_pw(
@@ -1161,7 +1902,7 @@ appl_ptr    : 313632\n";
             &mut crate::pipeline::LoopbackUdp,
         )
         .unwrap();
-        let rows: Arc<Mutex<Vec<gst::ClockTime>>> = Arc::new(Mutex::new(Vec::new()));
+        let rows: Arc<Mutex<Vec<(Instant, gst::ClockTime)>>> = Arc::new(Mutex::new(Vec::new()));
         let slot = rows.clone();
         tx.by_name("fpay-virtual-hall")
             .unwrap()
@@ -1171,7 +1912,7 @@ appl_ptr    : 313632\n";
                 if let Some(buf) = info.buffer() {
                     if let Some(pts) = buf.pts() {
                         if let Ok(mut guard) = slot.lock() {
-                            guard.push(pts);
+                            guard.push((Instant::now(), pts));
                         }
                     }
                 }
@@ -1192,10 +1933,17 @@ appl_ptr    : 313632\n";
                 Ok(n)
             }
         }
-        // 200 кусков по 128 кадров ≈ 533 мс, если разметить всё.
+        fn no_tail(_: &InstantBacklog) -> usize {
+            0
+        }
+        // 200 кусков по 128 кадров = 102400 байт = 106 кадров по 5 мс и остаток.
+        let started = Instant::now();
         feed_capture(
-            InstantBacklog {
-                left: CAPTURE_BYTES * 200,
+            CaptureSource {
+                inner: InstantBacklog {
+                    left: CAPTURE_BYTES * 200,
+                },
+                pending: no_tail,
             },
             tx.by_name("feed-virtual-hall")
                 .unwrap()
@@ -1203,17 +1951,161 @@ appl_ptr    : 313632\n";
                 .unwrap(),
             Arc::new(AtomicBool::new(false)),
         );
+        let got = rows.lock().unwrap().clone();
+        let elapsed = started.elapsed();
+        let _ = tx.set_state(gst::State::Null);
+        let total = CAPTURE_BYTES * 200;
+        let want = total / FRAME_BYTES;
+        assert_eq!(want, 106);
+        assert!(
+            got.len() == want,
+            "кадры затора потерялись: {} из {want}",
+            got.len()
+        );
+        for pair in got.windows(2) {
+            let step = pair[1].1.nseconds() - pair[0].1.nseconds();
+            assert!(
+                (FRAME_NS..FRAME_NS + 1_500_000).contains(&step),
+                "шаг метки затора {step}"
+            );
+        }
+        let mut zero_run = 0usize;
+        let mut longest_zero_run = 0usize;
+        for pair in got.windows(2) {
+            let gap = pair[1].0.saturating_duration_since(pair[0].0);
+            if gap < Duration::from_millis(1) {
+                zero_run += 1;
+                longest_zero_run = longest_zero_run.max(zero_run);
+            } else {
+                zero_run = 0;
+            }
+        }
+        assert!(
+            longest_zero_run <= 1,
+            "в один слот ушло больше двух кадров"
+        );
+        assert!(
+            elapsed > Duration::from_millis(200),
+            "затор ушёл залпом за {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "затор читался медленнее периода: {elapsed:?}"
+        );
+    }
+
+    /// Пауза 40 мс короче прощения в 100 мс. Хвост не сливается залпом:
+    /// кадр 5 мс, в один слот не больше двух.
+    #[test]
+    fn late_quantum_drains_two_chunks_per_slot() {
+        gst::init().unwrap();
+        let zone_id = "hall";
+        let tx = crate::pipeline::build_tx_unicast_pw(
+            &crate::config::PipelineCfg::default_tx(),
+            &[],
+            0,
+            None,
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        tx.set_state(gst::State::Playing).unwrap();
+        let _ = tx.state(gst::ClockTime::from_seconds(2));
+        let feeds = vec![zproto::FeedSend {
+            zone_id: zone_id.into(),
+            kind: zproto::FeedKind::Virtual,
+            monitor: format!("zvucast-{zone_id}-monitor"),
+            endpoints: vec![zproto::Endpoint {
+                ip: "127.0.0.1".into(),
+                port: 41989,
+            }],
+        }];
+        crate::pipeline::reconcile_feed_tails(
+            &tx,
+            &feeds,
+            0,
+            &mut crate::pipeline::LoopbackUdp,
+        )
+        .unwrap();
+        let rows: Arc<Mutex<Vec<(Instant, gst::ClockTime)>>> = Arc::new(Mutex::new(Vec::new()));
+        let slot = rows.clone();
+        tx.by_name("fpay-virtual-hall")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if let Some(buf) = info.buffer() {
+                    if let Some(pts) = buf.pts() {
+                        if let Ok(mut guard) = slot.lock() {
+                            guard.push((Instant::now(), pts));
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        struct TwoQuanta {
+            left: usize,
+            stalled: bool,
+        }
+        impl std::io::Read for TwoQuanta {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Ok(0);
+                }
+                if self.left == CAPTURE_BYTES * 8 && !self.stalled {
+                    self.stalled = true;
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                let n = buf.len().min(self.left);
+                buf[..n].fill(0);
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        fn tail(src: &TwoQuanta) -> usize {
+            src.left
+        }
+        feed_capture(
+            CaptureSource {
+                inner: TwoQuanta {
+                    left: CAPTURE_BYTES * 16,
+                    stalled: false,
+                },
+                pending: tail,
+            },
+            tx.by_name("feed-virtual-hall")
+                .unwrap()
+                .dynamic_cast::<gst_app::AppSrc>()
+                .unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let want = (CAPTURE_BYTES * 16) / FRAME_BYTES;
+        assert_eq!(want, 8);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && rows.lock().unwrap().len() < 8 {
+        while Instant::now() < deadline && rows.lock().unwrap().len() < want {
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(80));
         let got = rows.lock().unwrap().clone();
         let _ = tx.set_state(gst::State::Null);
-        assert!(!got.is_empty(), "окно кванта не дошло до payloader");
-        assert!(got.len() < 40, "затор ушёл целиком: {} буферов", got.len());
-        let span = got.last().unwrap().nseconds() - got.first().unwrap().nseconds();
-        assert!(span < 60_000_000, "окно длиннее кванта: {span} нс");
+        assert_eq!(got.len(), want, "опоздавший квант потерял кадры");
+        for pair in got.windows(2) {
+            let step = pair[1].1.nseconds() - pair[0].1.nseconds();
+            assert!(step >= FRAME_NS, "метки налегли: шаг {step}");
+        }
+        // Восемь квантов до паузы — четыре кадра. Пятый выходит после 40 мс.
+        let stall_gap = got[4].0.saturating_duration_since(got[3].0);
+        assert!(
+            stall_gap >= Duration::from_millis(30),
+            "пауза чтения не дошла до провода: {stall_gap:?}"
+        );
+        // Долг 40 мс меньше 100 мс, поэтому хвост, уже лежащий в чтении,
+        // догоняется сразу, а не второй паузой.
+        let late = &got[4..];
+        let span = late.last().unwrap().0.saturating_duration_since(late[0].0);
+        assert!(
+            span < Duration::from_millis(80),
+            "хвост после короткой паузы не догнал слот: {span:?}"
+        );
     }
 
     #[test]
@@ -1303,6 +2195,44 @@ appl_ptr    : 313632\n";
     }
 
     #[test]
+    fn play_ms_defaults_to_forty_and_scales_down() {
+        assert_eq!(play_ms(None), 40);
+        assert_eq!(play_ms(Some("")), 40);
+        assert_eq!(play_ms(Some("нет")), 40);
+        assert_eq!(play_ms(Some("0")), 40);
+        assert_eq!(play_latency_frames(play_ms(None)), 1920);
+        assert_eq!(play_stock_frames(40), 2048);
+        assert_eq!(play_ms(Some("20")), 20);
+        assert_eq!(play_latency_frames(20), 960);
+        assert_eq!(play_stock_frames(20), 1024);
+        assert_eq!(play_ms(Some(" 5 ")), 5);
+        assert_eq!(play_latency_frames(5), 240);
+        assert_eq!(play_stock_frames(5), 256);
+        assert_eq!(play_stock_frames(1), 256);
+        assert_eq!(play_ms(Some("400")), 200);
+        let args = player_args("alsa_output.usb-test");
+        let latency_at = args.iter().position(|arg| arg == "--latency").expect("latency");
+        assert_eq!(args[latency_at + 1], PLAY_LATENCY);
+        assert!(!args.iter().any(|arg| arg.contains("lock-quantum")));
+        assert!(!args.iter().any(|arg| arg == "2048"));
+    }
+
+    #[test]
+    fn node_id_from_list_finds_the_named_node() {
+        let text = "\
+\tid 59, type PipeWire:Interface:Node/3
+\t\tnode.name = \"alsa_output.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo-output\"
+\tid 101, type PipeWire:Interface:Node/3
+\t\tnode.name = \"pw-play\"
+";
+        assert_eq!(
+            node_id_from_list(text, "alsa_output.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo-output").as_deref(),
+            Some("59")
+        );
+        assert_eq!(node_id_from_list(text, "нет").as_deref(), None);
+    }
+
+    #[test]
     fn stutter_count_adds_underruns_and_late_packets() {
         assert_eq!(stutter_count(0, 0, 0), 0);
         assert_eq!(stutter_count(1, 2, 4), 7);
@@ -1355,8 +2285,8 @@ appl_ptr    : 313632\n";
                     release: release_rx,
                 }));
             });
-            let wrote_stuck = write_player(&stuck_write, b"pcm!", None);
-            let wrote_live = write_player(&live_write, b"pcm!", None);
+            let wrote_stuck = write_player(&stuck_write, b"pcm!", None).alive();
+            let wrote_live = write_player(&live_write, b"pcm!", None).alive();
             let _ = result_tx.send((wrote_stuck, wrote_live));
         });
 
@@ -1385,7 +2315,14 @@ appl_ptr    : 313632\n";
             }
         };
         worker.join().expect("поток записи");
-        assert!(!wrote_stuck, "полный stdin не принимает буфер");
+        assert!(
+            wrote_stuck,
+            "полный stdin сбрасывает буфер и оставляет процесс"
+        );
+        assert!(
+            stuck.lock().expect("слот").is_some(),
+            "полный пайп не повод закрывать pw-play"
+        );
         assert!(wrote_live, "следующий слот того же буфера должен получить байты");
 
         let mut got = [0u8; 4];
@@ -1398,6 +2335,19 @@ appl_ptr    : 313632\n";
         drop(reap_live);
         assert!(stuck.lock().expect("слот").is_none());
         assert!(live.lock().expect("слот").is_none());
+    }
+
+    #[test]
+    fn playback_chunk_fits_ignores_a_long_queue() {
+        let chunk = 48_000 * 4 * 10 / 1_000;
+        assert!(
+            playback_chunk_fits(60_000, chunk),
+            "40 мс в очереди не повод выбрасывать кусок, если место есть"
+        );
+        assert!(
+            !playback_chunk_fits(chunk - 1, chunk),
+            "кусок кадра не пишем"
+        );
     }
 
     fn join_writer(worker: std::thread::JoinHandle<()>) -> ! {

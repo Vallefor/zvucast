@@ -330,10 +330,7 @@ fn run_zone(
         sleep_stop(&stop, backoff);
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
-    if let Some(mut child) = cable {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    drop(cable);
 }
 
 fn sleep_stop(stop: &AtomicBool, total: Duration) {
@@ -346,47 +343,31 @@ fn sleep_stop(stop: &AtomicBool, total: Duration) {
     }
 }
 
-fn loopback_args(zone_id: &str) -> Vec<String> {
-    let sink = sink_name(zone_id);
-    let source = monitor_name(zone_id);
-    let mut args = virtual_output::loopback_front(&process_name(zone_id));
-    args.push("--capture-props".into());
-    args.push(format!(
-        "media.class=Audio/Sink node.name={sink} node.description=ZvucastSpotify audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.virtual=true"
-    ));
-    args.push("--playback-props".into());
-    args.push(format!(
-        "media.class=Audio/Source node.name={source} node.description=ZvucastSpotifyMonitor audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.passive=true node.virtual=true"
-    ));
-    args
+fn sink_props(zone_id: &str) -> String {
+    virtual_output::null_sink_props(&sink_name(zone_id), "ZvucastSpotify", false)
 }
 
-fn ensure_cable(zone_id: &str) -> Result<Option<Child>> {
+fn ensure_cable(zone_id: &str) -> Result<Option<virtual_output::HeldSink>> {
     let sink = sink_name(zone_id);
-    let source = monitor_name(zone_id);
-    if virtual_output::dump_text().ok().is_some_and(|dump| cable_ready(&dump, &sink, &source)) {
+    if virtual_output::dump_text().ok().is_some_and(|dump| cable_ready(&dump, &sink)) {
         return Ok(None);
     }
-    let _ = Command::new("pkill").args(["-f", &format!("pw-loopback --name {}", process_name(zone_id))]).status();
-    let mut child = Command::new("pw-loopback")
-        .args(loopback_args(zone_id))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("pw-loopback для soloist не запустился")?;
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("pw-loopback --name {}", process_name(zone_id))])
+        .status();
+    let mut child = virtual_output::spawn_null_sink(&sink_props(zone_id))
+        .context("синк для soloist не запустился")?;
     for _ in 0..40 {
         if child.try_wait().ok().flatten().is_some() {
-            anyhow::bail!("pw-loopback soloist завершился");
+            anyhow::bail!("синк soloist завершился");
         }
-        if virtual_output::dump_text().ok().is_some_and(|dump| cable_ready(&dump, &sink, &source)) {
+        if virtual_output::dump_text().ok().is_some_and(|dump| cable_ready(&dump, &sink)) {
             return Ok(Some(child));
         }
         thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    anyhow::bail!("pw-loopback не создал {sink}")
+    drop(child);
+    anyhow::bail!("синк не создал {sink}")
 }
 
 const IFACE_SO: &str = "/usr/local/lib/zvucast-soloist-iface.so";
@@ -545,22 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn spotify_cable_is_three_milliseconds_and_locks_quantum() {
-        let args = loopback_args("hall");
-        assert!(
-            args.windows(2).any(|pair| pair == ["--latency", "3"]),
-            "{args:?}"
-        );
-        assert_eq!(args[1], process_name("hall"));
-        for flag in ["--capture-props", "--playback-props"] {
-            let props = args
-                .windows(2)
-                .find(|pair| pair[0] == flag)
-                .map(|pair| pair[1].as_str())
-                .unwrap_or("");
-            assert!(props.contains("node.lock-quantum=true"), "{flag}: {props}");
-            assert!(props.contains("node.latency=128/48000"), "{flag}: {props}");
-        }
+    fn spotify_sink_owns_its_quantum() {
+        let props = sink_props("hall");
+        assert!(props.contains("\"node.name\":\"zvucast-spotify-hall\""), "{props}");
+        assert!(props.contains("\"node.force-quantum\":240"), "{props}");
+        assert!(props.contains("\"node.virtual\":true"), "{props}");
+        assert!(!props.contains("lock-quantum"), "{props}");
+        assert!(!props.contains("node.latency"), "{props}");
+        assert!(!props.contains("priority.driver"), "{props}");
     }
 
     #[test]

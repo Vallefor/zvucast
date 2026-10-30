@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -248,7 +248,7 @@ pub fn friendly_name(zone_name: &str) -> String {
 }
 
 pub fn should_advertise(dump: &str, zone_id: &str) -> bool {
-    virtual_output::cable_ready(dump, &sink_name(zone_id), &monitor_name(zone_id))
+    virtual_output::cable_ready(dump, &sink_name(zone_id))
 }
 
 /// Первая IPv4 из вывода `ip -4 -o addr show dev <iface>`. Нет строки `inet` — None.
@@ -595,7 +595,7 @@ fn dispatch_external(
 
 async fn run_zone(mut ctx: ZoneCtx) {
     let mut backoff = RETRY_MIN;
-    let mut cable: Option<Child> = None;
+    let mut cable: Option<virtual_output::HeldSink> = None;
     loop {
         if ctx.stop.load(Ordering::Relaxed) {
             kill_loopback(&ctx.zone_id, &mut cable);
@@ -615,7 +615,7 @@ async fn run_zone(mut ctx: ZoneCtx) {
     }
 }
 
-async fn run_session(ctx: &mut ZoneCtx, cable: &mut Option<Child>) -> SessionEnd {
+async fn run_session(ctx: &mut ZoneCtx, cable: &mut Option<virtual_output::HeldSink>) -> SessionEnd {
     if let Err(err) = ensure_cable(&ctx.zone_id, cable, &ctx.stop, &ctx.wake).await {
         if ctx.stop.load(Ordering::Relaxed) {
             kill_loopback(&ctx.zone_id, cable);
@@ -659,7 +659,7 @@ async fn run_session(ctx: &mut ZoneCtx, cable: &mut Option<Child>) -> SessionEnd
 
 async fn connection_loop(
     ctx: &mut ZoneCtx,
-    cable: &mut Option<Child>,
+    cable: &mut Option<virtual_output::HeldSink>,
     manager: &mut ConnectionManager,
     announcer: &mut Announcer,
     baseline: u64,
@@ -711,7 +711,7 @@ async fn shutdown_slot(
     manager: &ConnectionManager,
     announcer: &mut Announcer,
     zone_id: &str,
-    cable: &mut Option<Child>,
+    cable: &mut Option<virtual_output::HeldSink>,
 ) {
     say_goodbye(manager, announcer, zone_id).await;
     kill_loopback(zone_id, cable);
@@ -724,22 +724,22 @@ async fn say_goodbye(manager: &ConnectionManager, announcer: &mut Announcer, zon
     announcer.unpublish();
 }
 
-/// Ребёнок pw-loopback завершился. Если ребёнка нет, принятый кабель
+/// Ребёнок pw-cli завершился. Если ребёнка нет, принятый кабель
 /// проверяется примерно каждые 200 мс. Дамп идёт в `spawn_blocking`.
 /// Ошибка `pw-dump` кабель не гасит; сессия рвётся только когда успешный
 /// дамп больше не проходит `should_advertise`.
-async fn cable_stopped(cable: &mut Option<Child>, zone_id: &str) -> String {
+async fn cable_stopped(cable: &mut Option<virtual_output::HeldSink>, zone_id: &str) -> String {
     loop {
         let status = cable.as_mut().map(|child| child.try_wait());
         match status {
             Some(Ok(Some(code))) => {
                 cable.take();
-                return format!("pw-loopback завершился: {code}");
+                return format!("синк завершился: {code}");
             }
             Some(Ok(None)) => tokio::time::sleep(Duration::from_millis(200)).await,
             Some(Err(err)) => {
                 cable.take();
-                return format!("pw-loopback: {err}");
+                return format!("синк: {err}");
             }
             None => {
                 let still_up = match tokio::task::spawn_blocking(virtual_output::dump_text).await {
@@ -1221,24 +1221,13 @@ fn adopted_cable_still_up<E>(dump: Result<&str, E>, zone_id: &str) -> bool {
     }
 }
 
-fn loopback_args(zone_id: &str) -> Vec<String> {
-    let sink = sink_name(zone_id);
-    let source = monitor_name(zone_id);
-    let mut args = virtual_output::loopback_front(&sink);
-    args.push("--capture-props".into());
-    args.push(format!(
-        "media.class=Audio/Sink node.name={sink} node.description=ZvucastSendspin audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.virtual=true"
-    ));
-    args.push("--playback-props".into());
-    args.push(format!(
-        "media.class=Audio/Source node.name={source} node.description=ZvucastSendspinMonitor audio.rate=48000 node.latency=128/48000 node.lock-quantum=true node.passive=true node.virtual=true"
-    ));
-    args
+fn sink_props(zone_id: &str) -> String {
+    virtual_output::null_sink_props(&sink_name(zone_id), "ZvucastSendspin", false)
 }
 
 async fn ensure_cable(
     zone_id: &str,
-    cable: &mut Option<Child>,
+    cable: &mut Option<virtual_output::HeldSink>,
     stop: &AtomicBool,
     wake: &Notify,
 ) -> Result<(), String> {
@@ -1246,36 +1235,31 @@ async fn ensure_cable(
         return Ok(());
     }
     if let Some(old) = cable.take() {
-        kill_child(old);
+        drop(old);
     }
     let sink = sink_name(zone_id);
     let _ = Command::new("pkill")
         .args(["-f", &loopback_pkill_pattern(zone_id)])
         .status();
-    let mut child = Command::new("pw-loopback")
-        .args(loopback_args(zone_id))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("pw-loopback не запустился: {err}"))?;
+    let mut child = virtual_output::spawn_null_sink(&sink_props(zone_id))
+        .map_err(|err| format!("синк не запустился: {err}"))?;
     let deadline = tokio::time::Instant::now() + CABLE_WAIT;
     loop {
         if stop.load(Ordering::Relaxed) {
-            kill_child(child);
+            drop(child);
             return Err("остановка".into());
         }
         match child.try_wait() {
-            Ok(Some(status)) => return Err(format!("pw-loopback завершился: {status}")),
+            Ok(Some(status)) => return Err(format!("синк завершился: {status}")),
             Ok(None) => {}
-            Err(err) => return Err(format!("pw-loopback: {err}")),
+            Err(err) => return Err(format!("синк: {err}")),
         }
         if cable_is_up(zone_id) {
             *cable = Some(child);
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            kill_child(child);
+            drop(child);
             return Err(format!("кабель {sink} не появился за 2 секунды"));
         }
         tokio::select! {
@@ -1285,18 +1269,13 @@ async fn ensure_cable(
     }
 }
 
-fn kill_loopback(zone_id: &str, cable: &mut Option<Child>) {
+fn kill_loopback(zone_id: &str, cable: &mut Option<virtual_output::HeldSink>) {
     if let Some(child) = cable.take() {
-        kill_child(child);
+        drop(child);
     }
     let _ = Command::new("pkill")
         .args(["-f", &loopback_pkill_pattern(zone_id)])
         .status();
-}
-
-fn kill_child(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 async fn wait_flag(stop: &AtomicBool, wake: &Notify) {
@@ -1497,10 +1476,8 @@ mod tests {
     fn the_player_is_advertised_only_when_its_cable_exists() {
         let dump = r#"[
         {"id": 1, "type": "PipeWire:Interface:Node", "info": {"props": {
-            "node.name": "zvucast-sendspin-hall", "media.class": "Audio/Sink"
-        }}},
-        {"id": 2, "type": "PipeWire:Interface:Node", "info": {"props": {
-            "node.name": "zvucast-sendspin-hall-monitor", "media.class": "Audio/Source"
+            "node.name": "zvucast-sendspin-hall", "media.class": "Audio/Sink",
+            "factory.name": "support.null-audio-sink", "node.force-quantum": 240
         }}}
     ]"#;
         assert!(should_advertise(dump, "hall"));
@@ -1512,10 +1489,8 @@ mod tests {
     fn a_failed_dump_keeps_an_adopted_cable() {
         let present = r#"[
         {"id": 1, "type": "PipeWire:Interface:Node", "info": {"props": {
-            "node.name": "zvucast-sendspin-hall", "media.class": "Audio/Sink"
-        }}},
-        {"id": 2, "type": "PipeWire:Interface:Node", "info": {"props": {
-            "node.name": "zvucast-sendspin-hall-monitor", "media.class": "Audio/Source"
+            "node.name": "zvucast-sendspin-hall", "media.class": "Audio/Sink",
+            "factory.name": "support.null-audio-sink", "node.force-quantum": 240
         }}}
     ]"#;
         let failed: Result<&str, ()> = Err(());
@@ -1605,22 +1580,14 @@ mod tests {
     }
 
     #[test]
-    fn sendspin_cable_is_three_milliseconds_and_locks_quantum() {
-        let args = loopback_args("z1");
-        assert!(
-            args.windows(2).any(|pair| pair == ["--latency", "3"]),
-            "{args:?}"
-        );
-        assert_eq!(args[1], sink_name("z1"));
-        for flag in ["--capture-props", "--playback-props"] {
-            let props = args
-                .windows(2)
-                .find(|pair| pair[0] == flag)
-                .map(|pair| pair[1].as_str())
-                .unwrap_or("");
-            assert!(props.contains("node.lock-quantum=true"), "{flag}: {props}");
-            assert!(props.contains("node.latency=128/48000"), "{flag}: {props}");
-        }
+    fn sendspin_sink_owns_its_quantum() {
+        let props = sink_props("z1");
+        assert!(props.contains("\"node.name\":\"zvucast-sendspin-z1\""), "{props}");
+        assert!(props.contains("\"node.force-quantum\":240"), "{props}");
+        assert!(props.contains("\"node.virtual\":true"), "{props}");
+        assert!(!props.contains("lock-quantum"), "{props}");
+        assert!(!props.contains("node.latency"), "{props}");
+        assert!(!props.contains("priority.driver"), "{props}");
     }
 
     #[test]

@@ -3656,6 +3656,8 @@ dependencies = [
  "gio",
  "gstreamer",
  "gstreamer-app",
+ "gstreamer-base",
+ "libc",
  "mdns-sd",
  "mime_guess",
  "reqwest",

@@ -15,11 +15,11 @@ const QUANTUM_CONF: &str = "/etc/pipewire/pipewire.conf.d/99-zvucast-quantum.con
 const LATENCY_CONF: &str = "/etc/wireplumber/wireplumber.conf.d/99-zvucast-latency.conf";
 
 const QUANTUM_MARKS: &[&str] = &[
-    "default.clock.quantum = 128",
-    "default.clock.min-quantum = 32",
-    "default.clock.max-quantum = 128",
+    "Часы машины не запираем",
+    "default.clock.rate = 48000",
+    "default.clock.allowed-rates = [ 48000 ]",
 ];
-/// Общий период 128 и отдельное правило только для карты bcm2835 Headphones.
+/// Общий период 128, период 256 у HiFiBerry, запас наушников bcm2835.
 const LATENCY_MARKS: &[&str] = &[
     "api.alsa.period-size = 128",
     "api.alsa.headroom = 0",
@@ -28,6 +28,14 @@ const LATENCY_MARKS: &[&str] = &[
     "api.alsa.period-size = 1024",
     "api.alsa.headroom = 2048",
     "api.alsa.disable-batch = false",
+    "alsa.card_name = \"snd_rpi_hifiberry_dac\"",
+    "HiFiBerry ест период 256",
+    "api.alsa.period-num = 20",
+    "api.alsa.headroom = 1920",
+    "alsa.card_name = \"USB Audio CODEC\"",
+    "api.alsa.period-size = 960",
+    "api.alsa.period-num = 16",
+    "api.alsa.headroom = 1920",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,8 +311,9 @@ fn marks_ok(text: &str, marks: &[&str]) -> bool {
     marks.iter().all(|mark| text.contains(mark))
 }
 
-/// Дропы установщика на месте: квант 128 у всего графа, а большой буфер
-/// только у встроенного джека Pi. Старый файл без правила Headphones — нет.
+/// Дропы установщика на месте: часы машины не заперты, частота 48 кГц,
+/// период 256 у HiFiBerry, большой буфер у встроенного джека Pi.
+/// Старый файл с `clock.quantum` или без правила Headphones — нет.
 fn quanta_ok(quantum: Option<&str>, latency: Option<&str>) -> bool {
     match (quantum, latency) {
         (Some(quantum), Some(latency)) => {
@@ -779,6 +788,24 @@ mod tests {
             "sudo -u audio XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service"
         ));
         assert!(!command.contains("install.sh"));
+    }
+
+    #[test]
+    fn locked_machine_quantum_is_reported() {
+        let mut host = healthy_debian();
+        host.files.insert(
+            QUANTUM_CONF.into(),
+            "default.clock.rate = 48000\n\
+             default.clock.allowed-rates = [ 48000 ]\n\
+             default.clock.quantum = 256\n\
+             default.clock.min-quantum = 256\n\
+             default.clock.max-quantum = 256\n"
+                .into(),
+        );
+        assert!(inspect(&host)
+            .setup
+            .iter()
+            .any(|issue| issue.id == "pipewire-quantum"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod mix;
 pub mod pipeline;
 pub mod registry;
+pub mod rx_tap;
 pub mod silence;
 pub mod sendspin;
 pub mod setup;
