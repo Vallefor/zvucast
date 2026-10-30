@@ -51,9 +51,13 @@ pub fn feed_capture_target(monitor: &str) -> &str {
 /// `pw-record` монитора своего синка. `stream.capture.sink` читает
 /// порты монитора. Квант просит поток, замок и `force-quantum` — нет:
 /// квант группы задаёт сам синк.
+///
+/// `node.dont-move` держит цель из `--target`. После линка WirePlumber
+/// пишет её в metadata и следующим проходом подменяет имя синка. Тогда
+/// `node.dont-fallback` уничтожает захват: «defined target not found».
 pub fn feed_capture_args(monitor: &str) -> Vec<String> {
     let props = format!(
-        "{{\"stream.capture.sink\":\"true\",\"node.latency\":\"{q}/48000\",\"node.passive\":\"true\",\"node.dont-fallback\":\"true\"}}",
+        "{{\"stream.capture.sink\":\"true\",\"node.latency\":\"{q}/48000\",\"node.passive\":\"true\",\"node.dont-fallback\":\"true\",\"node.dont-move\":\"true\"}}",
         q = SINK_QUANTUM,
     );
     vec![
@@ -465,6 +469,7 @@ mod tests {
         assert!(props.contains("\"node.latency\":\"240/48000\""), "{props}");
         assert!(props.contains("\"node.passive\":\"true\""), "{props}");
         assert!(props.contains("\"node.dont-fallback\":\"true\""), "{props}");
+        assert!(props.contains("\"node.dont-move\":\"true\""), "{props}");
         assert!(!props.contains("lock-quantum"), "{props}");
         assert!(!props.contains("force-quantum"), "{props}");
     }
