@@ -212,16 +212,11 @@ pub async fn run(cfg: AgentConfig, node_id: String, version: String) -> Result<(
         roles.contains(&Role::Tx) && cfg.playback_backend == crate::config::Backend::PipeWire;
     let pending_finished = take_apply_result(Path::new(APPLY_STATUS_PATH));
     let (setup_tx, setup_rx) = watch::channel(crate::setup::SetupSnapshot::pending());
+    // Осмотр раз в минуту форкает gst-inspect и systemctl и дырявит воспроизведение.
+    // Отправитель остаётся жив: иначе watch::changed сразу Err и select крутится без паузы.
     tokio::spawn(async move {
-        loop {
-            let snap =
-                tokio::task::spawn_blocking(|| crate::setup::inspect(&crate::setup::SystemHost))
-                    .await;
-            if let Ok(snap) = snap {
-                let _ = setup_tx.send(snap);
-            }
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
+        let _hold = setup_tx;
+        std::future::pending::<()>().await;
     });
     ws_client::run(
         cfg,
