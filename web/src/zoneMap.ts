@@ -100,6 +100,12 @@ export function sameChannelMap(a: ChannelMap, b: ChannelMap): boolean {
   return a.out_l === b.out_l && a.out_r === b.out_r
 }
 
+/// Оба выхода меняются одним объектом, чтобы второй селект не прочитал
+/// карту до первой правки.
+export function swapMapSides(map: ChannelMap): ChannelMap {
+  return { out_l: map.out_r, out_r: map.out_l }
+}
+
 /// `pending` — локальная правка, которую полл ещё не подтвердил.
 /// Нет её — база это карта с сервера, иначе стерео.
 export function applyMapSide(
@@ -225,12 +231,9 @@ export function sourceMapKey(source: ZoneSource): string {
   return source.kind === 'line' ? source.node_id : `${source.kind}:${source.node_id}`
 }
 
-/// Подпись окна «Каналы». Один вид — та же короткая фраза, что у нескольких
-/// источников: у вида нет входов узла.
+/// Подпись окна «Каналы». Окно уже открыто на одну зону, поэтому линия,
+/// вид и пустой список читаются одной фразой.
 export function channelMapLead(sources: readonly ZoneSource[]): string {
-  const singleLine = sources.length === 1 && sources[0].kind === 'line'
-  if (sources.length === 0 || singleLine) {
-    return 'Каждый включённый выход колонки берёт канал из включённых входов источника.'
-  }
-  return 'У каждого источника своя карта: выход колонки берёт канал этого источника.'
+  void sources
+  return 'Слева — откуда звук. Справа — выход, который его играет.'
 }

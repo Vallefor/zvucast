@@ -6,6 +6,7 @@ import {
   canSendZoneMap,
   channelMapLead,
   DEFAULT_ZONE_MAP,
+  swapMapSides,
   feedChannelLabel,
   feedChoiceLabel,
   selectFeed,
@@ -76,14 +77,21 @@ test('откат к поллу во время сохранения всё ра�
   assert.equal(shouldSendZoneMap(reverted, polled, reverted), false)
 })
 
-test('один вид не обещает канал из входов узла', () => {
+test('окно каналов одной фразой читается слева направо', () => {
   const feed = [{ kind: 'spotify' as const, node_id: 'pc' }]
   const line = [{ kind: 'line' as const, node_id: 'pc' }]
   const both = [...line, ...feed]
-  assert.equal(channelMapLead(feed), channelMapLead(both))
-  assert.match(channelMapLead(line), /входов/)
-  assert.doesNotMatch(channelMapLead(feed), /входов/)
-  assert.equal(channelMapLead([]), channelMapLead(line))
+  const lead = 'Слева — откуда звук. Справа — выход, который его играет.'
+  assert.equal(channelMapLead(feed), lead)
+  assert.equal(channelMapLead(line), lead)
+  assert.equal(channelMapLead(both), lead)
+  assert.equal(channelMapLead([]), lead)
+})
+
+test('поменять стороны меняет оба выхода одним объектом', () => {
+  assert.deepEqual(swapMapSides({ out_l: 'l', out_r: 'r' }), { out_l: 'r', out_r: 'l' })
+  assert.deepEqual(swapMapSides({ out_l: null, out_r: 'l' }), { out_l: 'l', out_r: null })
+  assert.deepEqual(swapMapSides(DEFAULT_ZONE_MAP), { out_l: 'r', out_r: 'l' })
 })
 
 test('подписи вида короткие, выбор хозяина с именем узла', () => {

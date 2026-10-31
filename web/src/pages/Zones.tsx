@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { api, NodeView, ZoneView } from '../api'
 import { Badge, Button, Popup, useRun, useUi } from '../ui'
 import {
@@ -19,6 +20,7 @@ import {
   shouldSendZoneMap,
   sourceMapKey,
   speakerOutputRows,
+  swapMapSides,
   ZoneSource,
 } from '../zoneMap'
 
@@ -71,52 +73,156 @@ function storedMap(zone: ZoneView, member: string, sourceId: string | null): Cha
   return zone.maps[member]
 }
 
-function ChanSelect({
-  group,
+let chanSelectSeq = 0
+
+function shownChoice(value: ChanSel | null, picked: string | null, options: MappingChoice[]): string {
+  if (value == null) return ''
+  const held = options.find((o) => o.id === picked && o.side === value)
+  return held?.id ?? options.find((o) => o.side === value)?.id ?? ''
+}
+
+function menuBox(btn: HTMLButtonElement, count: number): { top: number; left: number; width: number } {
+  const rect = btn.getBoundingClientRect()
+  const est = Math.min(240, count * 40 + 10)
+  const spaceBelow = window.innerHeight - rect.bottom - 8
+  const top = spaceBelow >= Math.min(est, 120) || spaceBelow >= rect.top
+    ? rect.bottom + 4
+    : Math.max(8, rect.top - 4 - est)
+  return { top, left: rect.left, width: rect.width }
+}
+
+function ChanSourceSelect({
   value,
   label,
   options,
   onChange,
 }: {
-  group: string
   value: ChanSel | null
   label: string
   options: MappingChoice[]
   onChange: (v: ChanSel | null) => void
 }) {
-  // Несколько каналов могут быть одной стороной (линейный вход и кабель).
-  // Список всегда раскрыт: закрытый селект показывал только микрофон,
-  // и кабель было видно лишь когда обычные каналы выключены.
+  // Карта хранит только сторону. Имя входа помним, пока несколько входов
+  // делят одну сторону: иначе «ноутбук: левая» и «микрофон: левый» схлопнутся.
   const [picked, setPicked] = useState<string | null>(null)
-  const held = value != null ? options.find((o) => o.id === picked && o.side === value) : undefined
-  const shown = held?.id ?? (value == null ? '' : options.find((o) => o.side === value)?.id ?? '')
+  const [open, setOpen] = useState(false)
+  const openRef = useRef(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const mine = useRef(0)
+  const [box, setBox] = useState<{ top: number; left: number; width: number } | null>(null)
+  if (mine.current === 0) mine.current = ++chanSelectSeq
+  const shown = shownChoice(value, picked, options)
+  const off = value == null
+  const labelText = off
+    ? 'выключен'
+    : (options.find((o) => o.id === shown)?.label ?? (value === 'l' ? 'левый' : 'правый'))
+
+  const setSolo = (next: boolean) => {
+    openRef.current = next
+    setOpen(next)
+    if (next) window.dispatchEvent(new CustomEvent('zvucast-chan-select', { detail: mine.current }))
+  }
+
+  useEffect(() => {
+    const onSolo = (event: Event) => {
+      if ((event as CustomEvent<number>).detail === mine.current) return
+      if (!openRef.current) return
+      openRef.current = false
+      setOpen(false)
+    }
+    window.addEventListener('zvucast-chan-select', onSolo)
+    return () => window.removeEventListener('zvucast-chan-select', onSolo)
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!open) return
+    const place = () => {
+      const btn = btnRef.current
+      if (!btn) return
+      setBox(menuBox(btn, options.length + 1))
+    }
+    place()
+    const onDoc = (event: MouseEvent) => {
+      const target = event.target
+      if (!(target instanceof Node)) return
+      if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return
+      openRef.current = false
+      setOpen(false)
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      openRef.current = false
+      setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    window.addEventListener('keydown', onKey, true)
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      window.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place, true)
+    }
+  }, [open, options.length])
+
   const choose = (id: string) => {
     setPicked(id || null)
     const choice = options.find((o) => o.id === id)
     onChange(choice ? choice.side : null)
+    openRef.current = false
+    setOpen(false)
   }
+
   return (
-    <div role="radiogroup" aria-label={label} className="stack" style={{ gap: '0.2rem' }}>
-      {options.map((o) => (
-        <label key={o.id} className="inline">
-          <input
-            type="radio"
-            name={group}
-            checked={shown === o.id}
-            onChange={() => choose(o.id)}
-          />
-          {o.label}
-        </label>
-      ))}
-      <label className="inline">
-        <input
-          type="radio"
-          name={group}
-          checked={shown === ''}
-          onChange={() => choose('')}
-        />
-        —
-      </label>
+    <div ref={rootRef} className={`chan-select${off ? ' off' : ''}${open ? ' open' : ''}`}>
+      <button
+        ref={btnRef}
+        type="button"
+        className="chan-select-btn"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={label}
+        onClick={() => setSolo(!openRef.current)}
+      >
+        <span className="value">{labelText}</span>
+        <i className={open ? 'chan-chev open' : 'chan-chev'} />
+      </button>
+      {open && box && createPortal(
+        <div
+          ref={menuRef}
+          className="chan-menu"
+          role="listbox"
+          aria-label={label}
+          style={{ top: box.top, left: box.left, width: box.width }}
+        >
+          {options.map((o) => (
+            <button
+              key={o.id}
+              type="button"
+              role="option"
+              aria-selected={shown === o.id}
+              className={shown === o.id ? 'on' : undefined}
+              onClick={() => choose(o.id)}
+            >
+              {o.label}
+            </button>
+          ))}
+          <button
+            type="button"
+            role="option"
+            aria-selected={off}
+            className={off ? 'on' : undefined}
+            onClick={() => choose('')}
+          >
+            выключен
+          </button>
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }
@@ -241,6 +347,16 @@ function ZoneCard({
       side,
       v,
     )
+    const overrides = { ...mapOverridesRef.current, [key]: nextMap }
+    mapOverridesRef.current = overrides
+    setMapOverrides(overrides)
+    flushMap(key)
+  }
+
+  const swapSides = (nodeId: string, sourceId: string | null) => {
+    const key = mapStorageKey(nodeId, sourceId)
+    const current = mapOverridesRef.current[key] ?? storedMap(zone, nodeId, sourceId) ?? DEFAULT_ZONE_MAP
+    const nextMap = swapMapSides(current)
     const overrides = { ...mapOverridesRef.current, [key]: nextMap }
     mapOverridesRef.current = overrides
     setMapOverrides(overrides)
@@ -378,52 +494,67 @@ function ZoneCard({
         <Popup title="Каналы" wide onClose={() => setPopup(null)}>
           <p>{channelMapLead(sources)}</p>
           {effective.length === 0 && <p>Сначала добавьте колонку.</p>}
-          <div>
-            {effective.map((id) => {
-              const n = byId.get(id)
-              const label = n ? nodeLabel(n) : id
-              const rows = speakerOutputRows(n?.outputs ?? [])
-              const silentOut = (n?.outputs ?? []).filter((o) => o.enabled && o.stream == null)
-              return (
-                <div key={id} className="stack" style={{ marginBottom: '0.8rem' }}>
-                  <strong>{label}</strong>
-                  {rows.length === 0 && <p className="hint">У колонки нет включённых выходов в стереопотоке.</p>}
-                  {sources.map((source) => {
-                    const src = byId.get(source.node_id)
-                    const srcName = sourceCaption(source, byId)
-                    const srcOptions = source.kind === 'line'
-                      ? mappingChoices(src?.inputs ?? [])
-                      : feedMappingChoices(source.kind)
-                    const mapKey = sourceMapKey(source)
-                    const sourceKey = manySources ? mapKey : null
-                    const map = mapOverrides[mapStorageKey(id, sourceKey)]
-                      ?? storedMap(zone, id, sourceKey)
-                      ?? DEFAULT_ZONE_MAP
-                    return (
-                      <div key={mapKey}>
-                        {manySources && <div className="device-name">{srcName}</div>}
-                        {rows.map((row) => (
-                          <div key={`${mapKey}-${row.id}`} className="stack" style={{ gap: '0.25rem', marginTop: '0.45rem' }}>
-                            <div>{row.label}</div>
-                            <ChanSelect
-                              group={`${id}-${mapKey}-${row.id}`}
-                              label={`${row.label}, ${label}, ${srcName}`}
+          {effective.map((id) => {
+            const n = byId.get(id)
+            const label = n ? nodeLabel(n) : id
+            const rows = speakerOutputRows(n?.outputs ?? [])
+            const silentOut = (n?.outputs ?? []).filter((o) => o.enabled && o.stream == null)
+            return (
+              <section key={id} className="chan-speaker">
+                <h3>{label} <span>колонка</span></h3>
+                {rows.length === 0 && <p className="hint">У колонки нет включённых выходов в стереопотоке.</p>}
+                {sources.map((source, sourceIndex) => {
+                  const src = byId.get(source.node_id)
+                  const srcName = sourceCaption(source, byId)
+                  const srcOptions = source.kind === 'line'
+                    ? mappingChoices(src?.inputs ?? [])
+                    : feedMappingChoices(source.kind)
+                  const mapKey = sourceMapKey(source)
+                  const sourceKey = manySources ? mapKey : null
+                  const map = mapOverrides[mapStorageKey(id, sourceKey)]
+                    ?? storedMap(zone, id, sourceKey)
+                    ?? DEFAULT_ZONE_MAP
+                  return (
+                    <div key={mapKey} className="chan-source">
+                      <div className="chan-source-name">{srcName}</div>
+                      {sourceIndex === 0 && rows.length > 0 && (
+                        <div className="chan-heads">
+                          <span>Источник</span>
+                          <span>Играет</span>
+                        </div>
+                      )}
+                      {rows.map((row) => {
+                        const value = row.side === 'out_l' ? map.out_l : map.out_r
+                        return (
+                          <div key={`${mapKey}-${row.id}`} className={value == null ? 'chan-route off' : 'chan-route'}>
+                            <ChanSourceSelect
+                              label={`Источник для ${row.label}, ${label}, ${srcName}`}
                               options={srcOptions}
-                              value={row.side === 'out_l' ? map.out_l : map.out_r}
+                              value={value}
                               onChange={(v) => patchMap(id, sourceKey, row.side, v)}
                             />
+                            <div className="chan-arrow" aria-hidden="true">→</div>
+                            <div className="chan-play">
+                              <span className="chan-mark">{row.side === 'out_l' ? 'Л' : 'П'}</span>
+                              <b>{row.label}</b>
+                            </div>
                           </div>
-                        ))}
-                      </div>
-                    )
-                  })}
-                  {silentOut.length > 0 && (
-                    <p className="hint">В стереопоток не входят: {silentOut.map((o) => o.name).join(', ')}.</p>
-                  )}
-                </div>
-              )
-            })}
-          </div>
+                        )
+                      })}
+                      {rows.length >= 2 && (
+                        <button type="button" className="chan-swap" onClick={() => swapSides(id, sourceKey)}>
+                          Поменять стороны
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
+                {silentOut.length > 0 && (
+                  <p className="hint">В стереопоток не входят: {silentOut.map((o) => o.name).join(', ')}.</p>
+                )}
+              </section>
+            )
+          })}
           {sources.map((source) => {
             if (source.kind !== 'line') return null
             const src = byId.get(source.node_id)

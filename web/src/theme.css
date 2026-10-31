@@ -427,6 +427,134 @@ table.data tr:last-child td { border-bottom: 0; }
 .device-name { margin: 0.85rem 0 0.2rem; font-size: 0.95rem; }
 .hint { margin: 0.35rem 0 0; color: var(--text-dim); font-size: 0.85rem; }
 
+.chan-speaker {
+  margin-top: 0.15rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--line);
+}
+.chan-speaker h3 { margin: 0; font-size: 1rem; font-weight: 650; }
+.chan-speaker h3 span { color: var(--text-faint); font-weight: 450; }
+.chan-source { margin-top: 0.8rem; }
+.chan-source-name {
+  margin: 0 0 0.4rem;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+}
+.chan-heads, .chan-route {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) 1.6rem minmax(0, 0.9fr);
+  gap: 0.45rem;
+  align-items: center;
+}
+.chan-heads {
+  margin-bottom: 0.35rem;
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.chan-heads span:last-child { grid-column: 3; }
+.chan-route { margin-top: 0.4rem; }
+.chan-arrow {
+  text-align: center;
+  color: var(--accent);
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.chan-route.off .chan-arrow { color: var(--line-strong); }
+.chan-select { position: relative; min-width: 0; }
+.chan-select-btn {
+  width: 100%;
+  min-height: var(--tap);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  padding: 0.35rem 0.7rem;
+  text-align: left;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--text);
+}
+.chan-select-btn:hover, .chan-select.open .chan-select-btn { border-color: var(--accent); }
+.chan-select-btn .value { min-width: 0; overflow-wrap: anywhere; }
+.chan-select.off .chan-select-btn { color: var(--text-faint); }
+.chan-chev {
+  flex: none;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-right: 1.5px solid var(--text-faint);
+  border-bottom: 1.5px solid var(--text-faint);
+  transform: translateY(-2px) rotate(45deg);
+}
+.chan-chev.open { transform: translateY(2px) rotate(225deg); }
+.chan-menu {
+  position: fixed;
+  z-index: 40;
+  max-height: min(240px, calc(100dvh - 1rem));
+  overflow: auto;
+  padding: 0.3rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+.chan-menu button {
+  display: block;
+  width: 100%;
+  min-height: 36px;
+  padding: 0.35rem 0.55rem;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.chan-menu button:hover, .chan-menu button.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.chan-play {
+  min-height: var(--tap);
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem 0.3rem 0.35rem;
+  border-radius: 10px;
+  background: var(--accent-soft);
+}
+.chan-mark {
+  width: 1.7rem;
+  height: 1.7rem;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+.chan-play b { min-width: 0; font-weight: 650; overflow-wrap: anywhere; }
+.chan-route.off .chan-play {
+  background: var(--bg-sunken);
+  color: var(--text-faint);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.chan-route.off .chan-mark { background: var(--bg-elev); color: var(--text-faint); }
+.chan-swap {
+  margin-top: 0.45rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  min-height: 32px;
+}
+
 .chan-row {
   display: grid;
   grid-template-columns: 1.4rem 1fr;
