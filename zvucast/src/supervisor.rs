@@ -79,33 +79,83 @@ struct MonitorCapture {
     stop: Arc<AtomicBool>,
     child: Mutex<Option<Child>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    appsrc: gst::Element,
+    program: String,
+    args: Vec<String>,
 }
 
 impl MonitorCapture {
     fn start(appsrc: gst::Element, node: &str) -> Result<Self> {
-        Self::spawn(appsrc, source_capture_args(node))
+        Self::spawn(appsrc, "pw-record", source_capture_args(node))
     }
 
     /// Монитор своего синка. Цель — сам синк, `stream.capture.sink`.
     fn start_feed(appsrc: gst::Element, monitor: &str) -> Result<Self> {
-        Self::spawn(appsrc, crate::virtual_output::feed_capture_args(monitor))
+        Self::spawn(
+            appsrc,
+            "pw-record",
+            crate::virtual_output::feed_capture_args(monitor),
+        )
     }
 
-    fn spawn(appsrc: gst::Element, args: Vec<String>) -> Result<Self> {
-        let mut child = Command::new("pw-record")
-            .args(args)
+    fn spawn(appsrc: gst::Element, program: &str, args: Vec<String>) -> Result<Self> {
+        let cap = Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            child: Mutex::new(None),
+            thread: Mutex::new(None),
+            appsrc,
+            program: program.to_string(),
+            args,
+        };
+        cap.launch()?;
+        Ok(cap)
+    }
+
+    /// Stop убивает процесс. Start вызывает это, когда пайплайн уже Playing:
+    /// тот же appsrc и те же аргументы.
+    fn resume(&self) -> Result<()> {
+        if self.is_running() {
+            return Ok(());
+        }
+        self.shutdown();
+        self.launch()
+    }
+
+    fn is_running(&self) -> bool {
+        self.thread
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|thread| !thread.is_finished()))
+            .unwrap_or(false)
+    }
+
+    fn launch(&self) -> Result<()> {
+        self.stop.store(false, Ordering::SeqCst);
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .context("pw-record не запустился")?;
-        let stdout = child.stdout.take().context("pw-record без stdout")?;
-        let appsrc = appsrc
-            .dynamic_cast::<gst_app::AppSrc>()
-            .map_err(|_| anyhow::anyhow!("cap не appsrc"))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-        let thread = std::thread::Builder::new()
+            .with_context(|| format!("{} не запустился", self.program))?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("захват без stdout");
+            }
+        };
+        let appsrc = match self.appsrc.clone().dynamic_cast::<gst_app::AppSrc>() {
+            Ok(appsrc) => appsrc,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("cap не appsrc");
+            }
+        };
+        let stop_thread = self.stop.clone();
+        let thread = match std::thread::Builder::new()
             .name("zvucast-capture".into())
             .spawn(move || {
                 feed_capture(
@@ -116,13 +166,21 @@ impl MonitorCapture {
                     appsrc,
                     stop_thread,
                 )
-            })
-            .context("поток захвата")?;
-        Ok(Self {
-            stop,
-            child: Mutex::new(Some(child)),
-            thread: Mutex::new(Some(thread)),
-        })
+            }) {
+            Ok(thread) => thread,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).context("поток захвата");
+            }
+        };
+        if let Ok(mut slot) = self.child.lock() {
+            *slot = Some(child);
+        }
+        if let Ok(mut slot) = self.thread.lock() {
+            *slot = Some(thread);
+        }
+        Ok(())
     }
 
     fn shutdown(&self) {
@@ -1007,28 +1065,36 @@ fn child_stdout_queued(stdout: &std::process::ChildStdout) -> usize {
     pipe_room(stdout).map(|(queued, _)| queued).unwrap_or(0)
 }
 
-fn push_capture_chunk(appsrc: &gst_app::AppSrc, raw: &[u8], pts: u64, dur_ns: u64) -> bool {
+enum CapturePush {
+    In,
+    /// Пайплайн в Null или ещё не дошёл до Playing. Захват должен пережить это.
+    Flushing,
+    Closed,
+}
+
+fn push_capture_chunk(appsrc: &gst_app::AppSrc, raw: &[u8], pts: u64, dur_ns: u64) -> CapturePush {
     let mut gstbuf = match gst::Buffer::with_size(raw.len()) {
         Ok(buf) => buf,
-        Err(_) => return false,
+        Err(_) => return CapturePush::Closed,
     };
     {
         let Some(gstbuf) = gstbuf.get_mut() else {
-            return false;
+            return CapturePush::Closed;
         };
         {
             let Ok(mut map) = gstbuf.map_writable() else {
-                return false;
+                return CapturePush::Closed;
             };
             map.as_mut().copy_from_slice(raw);
         }
         gstbuf.set_pts(gst::ClockTime::from_nseconds(pts));
         gstbuf.set_duration(gst::ClockTime::from_nseconds(dur_ns));
     }
-    !matches!(
-        appsrc.push_buffer(gstbuf),
-        Err(gst::FlowError::Flushing) | Err(gst::FlowError::Eos)
-    )
+    match appsrc.push_buffer(gstbuf) {
+        Ok(_) => CapturePush::In,
+        Err(gst::FlowError::Flushing) => CapturePush::Flushing,
+        Err(_) => CapturePush::Closed,
+    }
 }
 
 fn feed_capture(
@@ -1099,8 +1165,20 @@ fn feed_capture(
                     break;
                 }
             }
-            if !push_capture_chunk(&appsrc, &frame, pts, FRAME_NS) {
-                return;
+            match push_capture_chunk(&appsrc, &frame, pts, FRAME_NS) {
+                CapturePush::In => {}
+                CapturePush::Flushing => {
+                    // Stop ставит Null раньше, чем гаснет процесс, а Start
+                    // доводит Playing не мгновенно. Выход здесь оставлял
+                    // виртуальную карту без pw-record до нового SetFeeds.
+                    acc.clear();
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    break;
+                }
+                CapturePush::Closed => return,
             }
             clock.advance(FRAME_BYTES / 2);
             sent_frames += 1;
@@ -1357,6 +1435,8 @@ impl Runner {
         // в gst-rs 0.23 set_state возвращает Err при StateChangeReturn::Failure
         self.stop_flag.store(false, Ordering::Relaxed);
         self.pipeline.set_state(gst::State::Playing)?;
+        // pw-record, запущенный в Null, сразу получает Flushing и умирает.
+        let _ = self.pipeline.state(gst::ClockTime::from_seconds(2));
         tracing::info!(
             current = ?self.pipeline.current_state(),
             pending = ?self.pipeline.pending_state(),
@@ -1365,14 +1445,37 @@ impl Runner {
         if let Ok(mut t) = self.started_at.lock() {
             *t = Some(Instant::now());
         }
+        self.resume_captures();
         Ok(())
+    }
+
+    /// Stop гасит pw-record линии, монитора зоны и хвоста вида. Без этого
+    /// старт узла поднимает пайплайн, но виртуальная карта молчит, пока
+    /// зона не пришлёт новый SetFeeds.
+    fn resume_captures(&self) {
+        for capture in &self.captures {
+            if let Err(e) = capture.resume() {
+                tracing::warn!("pw-record линии после Start: {e:#}");
+            }
+        }
+        for monitor in &self.monitors {
+            if let Err(e) = monitor.capture.resume() {
+                tracing::warn!(zone = %monitor.zone_id, "pw-record монитора после Start: {e:#}");
+            }
+        }
+        for cap in &self.feed_captures {
+            if let Err(e) = cap.capture.resume() {
+                tracing::warn!("pw-record вида после Start: {e:#}");
+            }
+        }
     }
 
     pub fn stop(&self) {
         // pw-play не гасим. start() его не создаёт заново: после Stop/Start
         // пайплайн снова Playing, а колонка остаётся без потока. Пока
         // пайплайн в Null, тот же поток сам закрывает pw-play — сэмплов нет.
-        // Поток присоединяется в Drop.
+        // Поток присоединяется в Drop. pw-record гасим: Start поднимает его
+        // заново уже на Playing.
         for capture in &self.captures {
             capture.shutdown();
         }
@@ -1687,6 +1790,82 @@ appl_ptr    : 313632\n";
             .any(|e| std::fs::read_to_string(e.path().join("comm")).ok().is_some_and(|n| n.trim() == "zvucast-play"));
         assert!(alive, "Stop не должен убивать поток pw-play: Start его не поднимает");
         drop(r);
+    }
+
+    /// Стоп узла убивает pw-record виртуальной карты. Старт узла должен
+    /// поднять тот же хвост: иначе звук возвращается только после стоп/старт
+    /// зоны, который заново шлёт SetFeeds.
+    #[test]
+    fn start_respawns_feed_capture_after_stop() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("appsrc name=cap ! fakesink sync=false")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let mut runner = Runner::from_pipeline_for_test(pipeline);
+        let src = runner.pipeline.by_name("cap").unwrap();
+        runner.feed_captures.push(FeedCapture {
+            capture: MonitorCapture::spawn(src, "/bin/sleep", vec!["60".into()]).unwrap(),
+        });
+        assert!(runner.feed_captures[0].capture.is_running());
+        runner.stop();
+        assert!(
+            !runner.feed_captures[0].capture.is_running(),
+            "Stop гасит захват вида"
+        );
+        runner.start().unwrap();
+        assert!(
+            runner.feed_captures[0].capture.is_running(),
+            "Start поднимает pw-record вида"
+        );
+        runner.stop();
+    }
+
+    #[test]
+    fn null_pipeline_does_not_end_the_capture_loop() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("appsrc name=cap ! fakesink sync=false")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let _ = pipeline.set_state(gst::State::Null);
+        let src = pipeline
+            .by_name("cap")
+            .unwrap()
+            .dynamic_cast::<gst_app::AppSrc>()
+            .unwrap();
+        struct Zeros;
+        impl std::io::Read for Zeros {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0);
+                Ok(buf.len())
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || {
+            feed_capture(
+                CaptureSource {
+                    inner: Zeros,
+                    pending: |_| 0,
+                },
+                src,
+                stop_thread,
+            );
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !handle.is_finished(),
+            "Flushing в Null не должен заканчивать захват"
+        );
+        stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(handle.is_finished(), "захват выходит по stop");
+        let _ = handle.join();
+        let _ = pipeline.set_state(gst::State::Null);
     }
 
     #[test]
