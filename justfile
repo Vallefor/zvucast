@@ -94,10 +94,26 @@ release:
       fi
     done
 
+    # Текст релиза: файл RELEASE_NOTES_FILE, иначе коммиты после прошлого тега.
+    notes_file="${RELEASE_NOTES_FILE:-}"
+    cleanup_notes=0
+    if [ -z "$notes_file" ]; then
+      notes_file=$(mktemp)
+      cleanup_notes=1
+      prev=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+      if [ -n "$prev" ]; then
+        git log --reverse --pretty=format:'%s%n%n%b%n' "$prev"..HEAD > "$notes_file"
+      else
+        printf '%s\n' 'Нет описания.' > "$notes_file"
+      fi
+    fi
     (
       cd dist
       sha256sum zvucast-x86_64 zvucast-aarch64 zvucast-armv7-rpi zvucast-armv7-opi > SHA256SUMS
       gh release create "v$ver" \
         zvucast-x86_64 zvucast-aarch64 zvucast-armv7-rpi zvucast-armv7-opi SHA256SUMS \
-        --title "v$ver" --notes "Бинарники четырёх плат."
+        --title "Zvucast $ver" --notes-file "$notes_file"
     )
+    if [ "$cleanup_notes" = 1 ]; then
+      rm -f "$notes_file"
+    fi
