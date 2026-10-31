@@ -173,9 +173,25 @@ export function Popup({
 export function Button({
   variant = 'ghost',
   className,
+  busy = false,
+  disabled,
+  children,
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'ghost' | 'danger' }) {
-  return <button {...props} className={`btn btn-${variant}${className ? ` ${className}` : ''}`} />
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: 'primary' | 'ghost' | 'danger'
+  busy?: boolean
+}) {
+  return (
+    <button
+      {...props}
+      disabled={disabled || busy}
+      aria-busy={busy || undefined}
+      className={`btn btn-${variant}${busy ? ' is-busy' : ''}${className ? ` ${className}` : ''}`}
+    >
+      {busy && <span className="btn-spin" aria-hidden="true" />}
+      {children}
+    </button>
+  )
 }
 
 export function Badge({

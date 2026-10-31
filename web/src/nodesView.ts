@@ -28,6 +28,38 @@ export function showStopAll(nodes: { playing: boolean }[]): boolean {
   return nodes.some((node) => node.playing)
 }
 
+export type PendingCommand = { id: string; cmd: 'start' | 'stop'; at: number }
+
+/// Старт применился, когда узел играет. Стоп — когда молчит.
+/// Офлайн кнопку прячет само меню, ждать телеметрию нечего.
+export function commandApplied(cmd: 'start' | 'stop', online: boolean, playing: boolean): boolean {
+  if (!online) return true
+  return cmd === 'start' ? playing : !playing
+}
+
+/// Снимает команды, которые карточка уже подтвердила или которые
+/// старше limitMs. `late` — живой узел, так и не сменивший состояние.
+export function settleCommands(
+  pending: Record<string, PendingCommand>,
+  nodes: { node_id: string; online: boolean; playing: boolean }[],
+  now: number,
+  limitMs: number,
+): { pending: Record<string, PendingCommand>; late: PendingCommand[] } {
+  const late: PendingCommand[] = []
+  let changed = false
+  const next = { ...pending }
+  for (const [id, wait] of Object.entries(pending)) {
+    const node = nodes.find((item) => item.node_id === id)
+    const applied = node == null || commandApplied(wait.cmd, node.online, node.playing)
+    const expired = now - wait.at >= limitMs
+    if (!applied && !expired) continue
+    delete next[id]
+    changed = true
+    if (!applied && expired) late.push(wait)
+  }
+  return { pending: changed ? next : pending, late }
+}
+
 /// 1, 21, 31… — «канал», кроме 11. 2–4, 22–24… — «канала», кроме 12–14.
 /// Остальное — «каналов».
 export function chanWord(n: number): 'канал' | 'канала' | 'каналов' {

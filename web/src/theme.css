@@ -123,6 +123,10 @@ h1 {
 }
 
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
   min-height: var(--tap);
   padding: 0 0.95rem;
   border-radius: 10px;
@@ -134,6 +138,22 @@ h1 {
 .btn:hover { border-color: var(--text-faint); }
 
 .btn:disabled { opacity: 0.45; cursor: default; }
+
+.btn.is-busy:disabled { opacity: 1; cursor: progress; }
+
+.btn-spin {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex: none;
+  border: 2px solid currentColor;
+  border-bottom-color: transparent;
+  border-radius: 50%;
+  animation: btn-spin 0.7s linear infinite;
+}
+
+@keyframes btn-spin {
+  to { transform: rotate(360deg); }
+}
 
 .btn-primary {
   background: var(--accent);
@@ -937,6 +957,68 @@ table.data tr:last-child td { border-bottom: 0; }
   margin-top: 0.85rem;
   padding-top: 0.75rem;
   border-top: 1px solid var(--line);
+}
+
+.node-settings-pop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.node-settings-pop.is-out { pointer-events: none; }
+
+.node-settings-pop-dim {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: rgba(16, 12, 9, 0.62);
+  cursor: pointer;
+}
+
+.node-settings-pop-panel {
+  position: relative;
+  z-index: 1;
+  width: min(1120px, 100%);
+  max-height: calc(100dvh - 2rem);
+  overflow: auto;
+}
+
+.node-settings-pop.is-in .node-settings-pop-dim {
+  animation: node-pop-dim 250ms linear both;
+}
+
+.node-settings-pop.is-out .node-settings-pop-dim {
+  animation: node-pop-dim 250ms linear reverse both;
+}
+
+.node-settings-pop.is-in .node-settings-pop-panel {
+  animation: node-pop-panel 250ms cubic-bezier(0.2, 0.85, 0.25, 1) both;
+}
+
+.node-settings-pop.is-out .node-settings-pop-panel {
+  animation: node-pop-panel 250ms cubic-bezier(0.2, 0.85, 0.25, 1) reverse both;
+}
+
+@keyframes node-pop-dim {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes node-pop-panel {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .node-settings-pop-dim,
+  .node-settings-pop-panel {
+    animation: none;
+  }
 }
 
 @media (max-width: 420px) {

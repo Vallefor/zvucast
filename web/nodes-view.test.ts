@@ -8,6 +8,7 @@ import {
   flowDevices,
   groupDevices,
   isPlaying,
+  settleCommands,
   showStartAll,
   showStopAll,
   deviceVolume,
@@ -49,6 +50,44 @@ test('транспорт зависит от сети и воспроизвед�
   assert.equal(transport(false, true), 'none')
   assert.equal(transport(true, false), 'start')
   assert.equal(transport(true, true), 'stop')
+})
+
+test('прелодер гаснет, когда узел догнал команду', () => {
+  const pending = {
+    a: { id: 'a', cmd: 'start' as const, at: 0 },
+    b: { id: 'b', cmd: 'stop' as const, at: 0 },
+  }
+  const waiting = settleCommands(pending, [
+    { node_id: 'a', online: true, playing: false },
+    { node_id: 'b', online: true, playing: true },
+  ], 1_000, 20_000)
+  assert.equal(waiting.pending, pending)
+  assert.deepEqual(waiting.late, [])
+
+  const done = settleCommands(pending, [
+    { node_id: 'a', online: true, playing: true },
+    { node_id: 'b', online: true, playing: false },
+  ], 1_000, 20_000)
+  assert.deepEqual(done.pending, {})
+  assert.deepEqual(done.late, [])
+
+  const late = settleCommands(
+    { a: pending.a },
+    [{ node_id: 'a', online: true, playing: false }],
+    20_000,
+    20_000,
+  )
+  assert.deepEqual(late.pending, {})
+  assert.deepEqual(late.late, [pending.a])
+
+  const offline = settleCommands(
+    { a: pending.a },
+    [{ node_id: 'a', online: false, playing: false }],
+    1_000,
+    20_000,
+  )
+  assert.deepEqual(offline.pending, {})
+  assert.deepEqual(offline.late, [])
 })
 
 test('общие кнопки следуют за узлами', () => {

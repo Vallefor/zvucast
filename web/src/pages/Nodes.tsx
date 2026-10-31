@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
-import { addableDevices, chanWord, deviceVolume, enableDevice, flowDevices, groupDevices, isPlaying, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent } from '../nodesView'
+import { addableDevices, chanWord, deviceVolume, enableDevice, flowDevices, groupDevices, isPlaying, settleCommands, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent, type PendingCommand } from '../nodesView'
 import { offer, updateWait } from '../update'
 import { Badge, Button, useRun, useUi } from '../ui'
 
@@ -8,6 +8,10 @@ const POLL_MS = 2000
 /// Свой POST: «не вернулся», если за это время узел так и остался offline.
 /// Живой узел на старой версии к этому сроку — «не установилось».
 const UPDATE_WAIT_MS = 90_000
+/// Старт/стоп: крутилка на кнопке, пока телеметрия не подтвердит команду.
+const CMD_WAIT_MS = 20_000
+/// Попап настроек. Короче обычного «плавного» появления.
+const SETTINGS_POP_MS = 250
 
 type ReleaseView = Awaited<ReturnType<typeof api.release>>
 type PendingUpdate = { at: number; version: string; note: string | null }
@@ -370,6 +374,8 @@ function NodeSettings({
   const [volumeDraft, setVolumeDraft] = useState<Record<string, number>>({})
   const [captureDraft, setCaptureDraft] = useState<number | null>(null)
   const [playbackDraft, setPlaybackDraft] = useState<number | null>(null)
+  const [saving, setSaving] = useState(false)
+  const savingRef = useRef(false)
   const perDevice = (node.telemetry?.device_volumes?.length ?? 0) > 0
   const captureShown = !perDevice && showVolumeSlider(isTx, node.telemetry?.capture_volume)
   const playbackShown = !perDevice && showVolumeSlider(isRx, node.telemetry?.playback_volume)
@@ -384,6 +390,7 @@ function NodeSettings({
   }
 
   const save = () => {
+    if (savingRef.current) return
     const body: {
       display_name: string | null
       dscp?: number
@@ -432,8 +439,14 @@ function NodeSettings({
       if (isRx) take('out', outRows)
       if (device_volumes.length > 0) body.device_volumes = device_volumes
     }
+    savingRef.current = true
+    setSaving(true)
     void run(api.patchNode(node.node_id, body), 'настройки узла').then((ok) => {
       if (ok) onClose()
+      else {
+        savingRef.current = false
+        setSaving(false)
+      }
     })
   }
 
@@ -626,9 +639,52 @@ function NodeSettings({
       )}
       <div className="node-sheet-foot">
         <Button onClick={onClose}>Отмена</Button>
-        <Button variant="primary" onClick={save}>Сохранить</Button>
+        <Button variant="primary" busy={saving} onClick={save}>Сохранить</Button>
       </div>
     </article>
+  )
+}
+
+function settingsPopMs(): number {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return 0
+  return SETTINGS_POP_MS
+}
+
+function SettingsPop({
+  onClose,
+  children,
+}: {
+  onClose: () => void
+  children: (close: () => void) => ReactNode
+}) {
+  const [phase, setPhase] = useState<'in' | 'out'>('in')
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+  const close = useCallback(() => {
+    setPhase((current) => (current === 'out' ? current : 'out'))
+  }, [])
+
+  useEffect(() => {
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = prev
+    }
+  }, [])
+
+  useEffect(() => {
+    if (phase !== 'out') return
+    const timer = window.setTimeout(() => onCloseRef.current(), settingsPopMs())
+    return () => window.clearTimeout(timer)
+  }, [phase])
+
+  return (
+    <div className={`node-settings-pop is-${phase}`}>
+      <button type="button" className="node-settings-pop-dim" aria-label="Закрыть настройки" onClick={close} />
+      <div className="node-settings-pop-panel" role="dialog" aria-modal="true" aria-label="Настройки узла">
+        {children(close)}
+      </div>
+    </div>
   )
 }
 
@@ -648,6 +704,13 @@ export default function Nodes() {
   const [now, setNow] = useState(() => Date.now())
   const [movedTo, setMovedTo] = useState<string | null>(null)
   const [settingsId, setSettingsId] = useState<string | null>(null)
+  const [cmd, setCmd] = useState<Record<string, PendingCommand>>({})
+  const [posting, setPosting] = useState<Record<string, true>>({})
+  const cmdRef = useRef(cmd)
+  const postingRef = useRef(posting)
+  const toldLate = useRef(new Set<string>())
+  cmdRef.current = cmd
+  postingRef.current = posting
 
   useEffect(() => {
     let alive = true
@@ -671,6 +734,22 @@ export default function Nodes() {
           }
         }
         return changed ? next : prev
+      })
+      setCmd((prev) => {
+        const settled = settleCommands(
+          prev,
+          ns.map((n) => ({ node_id: n.node_id, online: n.online, playing: isPlaying(n.telemetry) })),
+          Date.now(),
+          CMD_WAIT_MS,
+        )
+        for (const item of settled.late) {
+          const key = `${item.id}:${item.at}`
+          if (toldLate.current.has(key)) continue
+          toldLate.current.add(key)
+          const text = item.cmd === 'start' ? 'старт: не применилось' : 'стоп: не применилось'
+          queueMicrotask(() => toast(text))
+        }
+        return settled.pending
       })
       try {
         const rel = await api.release()
@@ -750,8 +829,34 @@ export default function Nodes() {
   }
 
   const updateOne = (n: NodeView) => {
-    void run(api.updateNode(n.node_id), 'обновление').then((ok) => {
-      if (ok) void pinInstalled([n.node_id])
+    if (postingRef.current[n.node_id] || pending[n.node_id]) return
+    postingRef.current = { ...postingRef.current, [n.node_id]: true }
+    setPosting(postingRef.current)
+    void run(api.updateNode(n.node_id), 'обновление').then(async (ok) => {
+      if (ok) await pinInstalled([n.node_id])
+      const next = { ...postingRef.current }
+      delete next[n.node_id]
+      postingRef.current = next
+      setPosting(next)
+    })
+  }
+
+  const runTransport = (id: string, command: 'start' | 'stop') => {
+    if (cmdRef.current[id]) return
+    const wait: PendingCommand = { id, cmd: command, at: Date.now() }
+    cmdRef.current = { ...cmdRef.current, [id]: wait }
+    setCmd((prev) => (prev[id] ? prev : { ...prev, [id]: wait }))
+    void run(api.nodeCmd(id, command), command === 'start' ? 'старт' : 'стоп').then((ok) => {
+      if (ok) return
+      const next = { ...cmdRef.current }
+      delete next[id]
+      cmdRef.current = next
+      setCmd((prev) => {
+        if (!prev[id]) return prev
+        const cleared = { ...prev }
+        delete cleared[id]
+        return cleared
+      })
     })
   }
 
@@ -800,8 +905,14 @@ export default function Nodes() {
         {phase.failed && !phase.updating && <span>не установилось</span>}
         {phase.rolledBack && <span>откат</span>}
         {kind === 'missing' && <span>нет файла в релизе</span>}
-        {kind === 'ready' && !phase.updating && (
-          <Button className={compact ? 'btn-compact' : undefined} onClick={() => updateOne(n)}>Обновить</Button>
+        {(kind === 'ready' || phase.updating) && (
+          <Button
+            className={compact ? 'btn-compact' : undefined}
+            busy={phase.updating || Boolean(posting[n.node_id])}
+            onClick={() => updateOne(n)}
+          >
+            Обновить
+          </Button>
         )}
       </div>
     )
@@ -813,10 +924,10 @@ export default function Nodes() {
       <>
         <Button onClick={() => setSettingsId(n.node_id)}>Настройки</Button>
         {mode === 'start' && (
-          <Button onClick={() => void run(api.nodeCmd(n.node_id, 'start'), 'старт')}>Старт</Button>
+          <Button busy={cmd[n.node_id]?.cmd === 'start'} onClick={() => runTransport(n.node_id, 'start')}>Старт</Button>
         )}
         {mode === 'stop' && (
-          <Button onClick={() => void run(api.nodeCmd(n.node_id, 'stop'), 'стоп')}>Стоп</Button>
+          <Button busy={cmd[n.node_id]?.cmd === 'stop'} onClick={() => runTransport(n.node_id, 'stop')}>Стоп</Button>
         )}
       </>
     )
@@ -867,16 +978,20 @@ export default function Nodes() {
       {setupBlock(nodes)}
 
       {settingsNode && (
-        <NodeSettings
-          key={settingsNode.node_id}
-          node={settingsNode}
-          master={masterNodeId === settingsNode.node_id}
-          transfer={() => void transfer(settingsNode)}
-          onClose={() => setSettingsId(null)}
-        />
+        <SettingsPop onClose={() => setSettingsId(null)}>
+          {(close) => (
+            <NodeSettings
+              key={settingsNode.node_id}
+              node={settingsNode}
+              master={masterNodeId === settingsNode.node_id}
+              transfer={() => void transfer(settingsNode)}
+              onClose={close}
+            />
+          )}
+        </SettingsPop>
       )}
 
-      {!settingsNode && <div className="node-cards">
+      <div className="node-cards">
         {nodes.map((n) => {
           const inputs = n.roles.includes('tx') ? flowDevices(n.inputs ?? []) : []
           const outputs = n.roles.includes('rx') ? flowDevices(n.outputs ?? []) : []
@@ -930,7 +1045,7 @@ export default function Nodes() {
             </article>
           )
         })}
-      </div>}
+      </div>
     </main>
   )
 }
