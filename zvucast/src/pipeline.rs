@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::fd::OwnedFd;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gstreamer::prelude::*;
@@ -452,6 +453,8 @@ fn add_rtp_branch(
         // Сетка на таких паузах прыгает и микшер пишет тишину. none считает
         // метку прямо из RTP, шаг там ровно квант. На часы приёма кусок
         // сажает сетка ниже, иначе none начинает шкалу с нуля.
+        // Срок none на уже идущем пайплайне в прошлом: latency сам звук не
+        // держит. Цифру запаса читает сетка и держит кусок до своей метки.
         .property_from_str("mode", "none")
         .build()?;
     let depay = gst::ElementFactory::make("rtpL16depay")
@@ -475,8 +478,13 @@ fn add_rtp_branch(
         .property("name", format!("caps{port}"))
         .property("caps", gst::Caps::from_str(MIX_CAPS)?)
         .build()?;
+    // Сетка спит на src этой очереди, пока не наберётся запас зоны.
+    // Потолок в 2 с вмещает максимум зоны (500 мс) и пачку сверху.
     let queue = gst::ElementFactory::make("queue")
         .property("name", format!("uq{port}"))
+        .property("max-size-buffers", 0u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 2_000_000_000u64)
         .build()?;
     if let Some(pad) = jb.static_pad("sink") {
         crate::rx_tap::watch_rtp(&pad);
@@ -527,14 +535,22 @@ fn add_silence_branch(pipe: &gst::Pipeline, mixer: &gst::Element) -> Result<()> 
     Ok(())
 }
 
-/// Запас посадки, 20 мс. Короткая пауза съедает его и не рвёт шкалу.
-/// Кусок, который уже целиком позади, сажает тот же запас заново:
-/// одна дыра на провал, а не нулевая подушка на каждый следующий квант.
+/// Запас, если у ветки не прочитался `latency`. Зона меньше этого не
+/// подменяет: цифра зоны и есть подушка.
 const GRID_LEAD_NS: u64 = 20_000_000;
 
-struct QuantumGrid {
+/// Отдаём микшеру кусок на 2 мс раньше метки. Столько у него своего latency,
+/// и поздний wakeup не делает кусок уже просроченным.
+const GRID_EARLY_NS: u64 = 2_000_000;
+
+/// Шкала посадки. `lead_ns == 0` — запас ещё не прочитан.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridPlan {
     /// Следующая метка в running time приёма. `None` — сетка ещё не сидит.
     next_running: Option<u64>,
+    lead_ns: u64,
+    /// Сколько звука выкинуть, когда запас ужали. Очередь уже держит старый.
+    skip_ns: u64,
 }
 
 /// Куда поставить кусок, чтобы шкала не копила микросекунды slave.
@@ -545,12 +561,38 @@ struct QuantumGrid {
 /// целиком позади, сажается снова на `now` плюс запас. Посадка на сами часы
 /// оставляла подушку в один квант, и каждая следующая дырка становилась нулями.
 /// `true` — запас посажен заново, не обычный шаг.
-fn quantum_grid_pts(scheduled: Option<u64>, now: u64, duration: u64) -> (u64, bool) {
+fn quantum_grid_pts(scheduled: Option<u64>, now: u64, duration: u64, lead_ns: u64) -> (u64, bool) {
     match scheduled {
         Some(pts) if pts.saturating_add(duration) > now => (pts, false),
-        Some(_) => (now.saturating_add(GRID_LEAD_NS), true),
-        None => (now.saturating_add(GRID_LEAD_NS), false),
+        Some(_) => (now.saturating_add(lead_ns), true),
+        None => (now.saturating_add(lead_ns), false),
     }
+}
+
+/// Один шаг сетки. `None` — кусок выкинуть: запас стал меньше, лишнее
+/// уже лежит в очереди перед микшером. Иначе метка, до которой надо дождаться,
+/// и флаг пересадки.
+fn grid_step(mut plan: GridPlan, now: u64, duration: u64, desired_lead: u64) -> (GridPlan, Option<(u64, bool)>) {
+    if plan.lead_ns == 0 {
+        plan.lead_ns = desired_lead;
+    } else if desired_lead > plan.lead_ns {
+        let extra = desired_lead - plan.lead_ns;
+        if let Some(next) = plan.next_running {
+            plan.next_running = Some(next.saturating_add(extra));
+        }
+        plan.lead_ns = desired_lead;
+    } else if desired_lead < plan.lead_ns {
+        plan.skip_ns = plan.skip_ns.saturating_add(plan.lead_ns - desired_lead);
+        plan.lead_ns = desired_lead;
+    }
+    if plan.skip_ns > 0 {
+        let step = duration.min(plan.skip_ns);
+        plan.skip_ns -= step;
+        return (plan, None);
+    }
+    let (running, reseat) = quantum_grid_pts(plan.next_running, now, duration, plan.lead_ns);
+    plan.next_running = Some(running.saturating_add(duration));
+    (plan, Some((running, reseat)))
 }
 
 /// Метка буфера, чьё running time равно `running_ns` в сегменте этого пэда.
@@ -562,9 +604,32 @@ fn running_to_buffer_pts(pad: &gst::Pad, running_ns: u64) -> Option<u64> {
         .map(|time| time.nseconds())
 }
 
-/// Ровная сетка меток на входе микшера. Проба не блокирует и не выбрасывает куски.
+/// `latency` ветки в наносекундах. Свойство элемента — миллисекунды.
+fn jitter_lead_ns(mixer_sink: &gst::Pad) -> Option<u64> {
+    let mut element = mixer_sink.peer()?.parent_element()?;
+    for _ in 0..16 {
+        let is_jb = element
+            .factory()
+            .map(|factory| factory.name() == "rtpjitterbuffer")
+            .unwrap_or(false);
+        if is_jb {
+            let ms = element.property::<u32>("latency");
+            return Some(u64::from(ms).saturating_mul(1_000_000));
+        }
+        element = element.static_pad("sink")?.peer()?.parent_element()?;
+    }
+    None
+}
+
+/// Ровная сетка на входе микшера. appsink с sync=false метку не ждёт,
+/// поэтому проба сама держит кусок до посадки: так запас зоны становится
+/// задержкой. Ужатие запаса выкидывает уже накопленное лишнее.
 fn stamp_quantum_grid(pad: &gst::Pad) {
-    let grid = Arc::new(Mutex::new(QuantumGrid { next_running: None }));
+    let grid = Arc::new(Mutex::new(GridPlan {
+        next_running: None,
+        lead_ns: 0,
+        skip_ns: 0,
+    }));
     let _ = pad.add_probe(
         gst::PadProbeType::BUFFER
             | gst::PadProbeType::EVENT_DOWNSTREAM
@@ -575,6 +640,7 @@ fn stamp_quantum_grid(pad: &gst::Pad) {
                 if kind == gst::EventType::FlushStart || kind == gst::EventType::FlushStop {
                     if let Ok(mut state) = grid.lock() {
                         state.next_running = None;
+                        state.skip_ns = 0;
                     }
                 }
                 return gst::PadProbeReturn::Ok;
@@ -597,15 +663,43 @@ fn stamp_quantum_grid(pad: &gst::Pad) {
                 let Ok(mut state) = grid.lock() else {
                     return gst::PadProbeReturn::Ok;
                 };
-                let first = state.next_running.is_none();
-                let (running, reseat) = quantum_grid_pts(state.next_running, now, duration);
+                let desired = jitter_lead_ns(pad).unwrap_or(if state.lead_ns == 0 {
+                    GRID_LEAD_NS
+                } else {
+                    state.lead_ns
+                });
+                let before_lead = state.lead_ns;
+                let before_skip = state.skip_ns;
+                let first = state.next_running.is_none() && state.skip_ns == 0 && before_lead == 0;
+                let (plan, play) = grid_step(*state, now, duration, desired);
+                *state = plan;
+                let Some((running, reseat)) = play else {
+                    if before_skip == 0 {
+                        tracing::info!(
+                            skip_ms = before_lead.saturating_sub(plan.lead_ns) / 1_000_000,
+                            "сетка приёма: запас ужат, лишнее снято"
+                        );
+                    }
+                    return gst::PadProbeReturn::Drop;
+                };
                 let Some(pts) = running_to_buffer_pts(pad, running) else {
                     return gst::PadProbeReturn::Ok;
                 };
-                state.next_running = Some(running.saturating_add(duration));
-                (pts, running, first, reseat)
+                (
+                    pts,
+                    running,
+                    plan.lead_ns,
+                    first,
+                    reseat,
+                    before_lead,
+                    before_skip,
+                    plan.skip_ns,
+                )
             };
-            let (pts, running, first, reseat) = placed;
+            let (pts, running, lead, first, reseat, before_lead, _before_skip, _skip_left) = placed;
+            if before_lead != 0 && lead > before_lead {
+                tracing::info!(lead_ms = lead / 1_000_000, "сетка приёма: запас вырос");
+            }
             let Some(buffer) = info.buffer_mut() else {
                 return gst::PadProbeReturn::Ok;
             };
@@ -621,6 +715,7 @@ fn stamp_quantum_grid(pad: &gst::Pad) {
                 tracing::info!(
                     running_ns = running,
                     now_ns = now,
+                    lead_ms = lead / 1_000_000,
                     "сетка приёма: первый кусок посажен на часы"
                 );
             } else if reseat {
@@ -628,8 +723,14 @@ fn stamp_quantum_grid(pad: &gst::Pad) {
                     running_ns = running,
                     now_ns = now,
                     duration_ns = duration,
+                    lead_ms = lead / 1_000_000,
                     "сетка приёма: кусок был позади часов, запас посажен заново"
                 );
+            }
+            let wait = running.saturating_sub(now).min(lead);
+            let sleep_ns = wait.saturating_sub(GRID_EARLY_NS);
+            if sleep_ns >= 1_000_000 {
+                std::thread::sleep(Duration::from_nanos(sleep_ns));
             }
             gst::PadProbeReturn::Ok
         },
@@ -1004,6 +1105,23 @@ fn feed_root_names(pipe: &gst::Pipeline) -> Vec<String> {
     names
 }
 
+fn env_ms(name: &str, default_ms: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(default_ms)
+}
+
+/// Потолок `fsinkq` в наносекундах. `ZVUCAST_FSINKQ_MS=stock` — умолчания
+/// GStreamer, как до урезания. Пустая переменная — 20 мс.
+fn fsinkq_time_ns() -> Option<u64> {
+    match std::env::var("ZVUCAST_FSINKQ_MS") {
+        Ok(raw) if raw.trim() == "stock" => None,
+        Ok(raw) => Some(raw.trim().parse::<u64>().unwrap_or(20) * 1_000_000),
+        Err(_) => Some(20_000_000),
+    }
+}
+
 fn attach_feed_tail(
     pipe: &gst::Pipeline,
     feed: &zproto::FeedSend,
@@ -1020,7 +1138,7 @@ fn attach_feed_tail(
         .property("name", format!("fhold-{tag}"))
         .property("max-size-buffers", 0u32)
         .property("max-size-bytes", 0u32)
-        .property("max-size-time", 40_000_000u64)
+        .property("max-size-time", env_ms("ZVUCAST_FHOLD_MS", 20) * 1_000_000)
         .build()?;
     let conv = gst::ElementFactory::make("audioconvert")
         .property("name", format!("fconv-{tag}"))
@@ -1108,9 +1226,18 @@ fn attach_named_pay_tail(
             .tx()
             .with_context(|| format!("udpsink {}:{}", ep.ip, ep.port))?;
         let gio_socket = gio_from_udp(sock)?;
-        let queue = gst::ElementFactory::make("queue")
-            .property("name", format!("fsinkq-{tag}-{index}"))
-            .build()?;
+        let queue_name = format!("fsinkq-{tag}-{index}");
+        let queue = match fsinkq_time_ns() {
+            Some(limit) => gst::ElementFactory::make("queue")
+                .property("name", &queue_name)
+                .property("max-size-buffers", 0u32)
+                .property("max-size-bytes", 0u32)
+                .property("max-size-time", limit)
+                .build()?,
+            None => gst::ElementFactory::make("queue")
+                .property("name", &queue_name)
+                .build()?,
+        };
         // async=false: живой пайплайн иначе ждёт preroll этого сокета и
         // оставляет appsrc в Paused. Кадры не выходят, level молчит.
         let sink = gst::ElementFactory::make("udpsink")
@@ -1919,7 +2046,7 @@ mod tests {
         assert_eq!(ports, vec![5004, 5010]);
         let hold = pipe.by_name("fhold-spotify-hall").expect("очередь хвоста");
         assert_eq!(hold.property::<u32>("max-size-buffers"), 0);
-        assert_eq!(hold.property::<u64>("max-size-time"), 40_000_000);
+        assert_eq!(hold.property::<u64>("max-size-time"), 20_000_000);
         let leaky = hold.property_value("leaky").serialize().expect("leaky");
         assert_ne!(leaky.as_str(), "downstream");
 
@@ -1983,7 +2110,7 @@ update: id:0 key:'default.audio.sink' value:'{\"name\":\"zvucast-hall\"}' type:'
         let mut prev = None;
         let mut reseats = 0u32;
         for _ in 0..22_500 {
-            let (pts, reseat) = quantum_grid_pts(scheduled, now, dur);
+            let (pts, reseat) = quantum_grid_pts(scheduled, now, dur, GRID_LEAD_NS);
             if reseat {
                 reseats += 1;
             }
@@ -2000,29 +2127,80 @@ update: id:0 key:'default.audio.sink' value:'{\"name\":\"zvucast-hall\"}' type:'
         assert_eq!(reseats, 0, "ровный приход не пересаживает сетку");
 
         // Пауза короче запаса съедает запас, но метку не рвёт.
-        let (pts, reseat) = quantum_grid_pts(scheduled, now + 8_000_000, dur);
+        let (pts, reseat) = quantum_grid_pts(scheduled, now + 8_000_000, dur, GRID_LEAD_NS);
         assert!(!reseat);
         assert_eq!(pts, scheduled.unwrap());
 
         // Пауза длиннее запаса: кусок сажается на часы плюс тот же запас.
         let stalled = now + 30_000_000;
-        let (jumped, reseat) = quantum_grid_pts(scheduled, stalled, dur);
+        let (jumped, reseat) = quantum_grid_pts(scheduled, stalled, dur, GRID_LEAD_NS);
         assert!(reseat);
         assert_eq!(jumped, stalled + GRID_LEAD_NS);
         let next = Some(jumped + dur);
-        let (followed, reseat) = quantum_grid_pts(next, stalled + dur, dur);
+        let (followed, reseat) = quantum_grid_pts(next, stalled + dur, dur, GRID_LEAD_NS);
         assert!(!reseat);
         assert_eq!(followed, jumped + dur);
 
         // Конец ровно на часах — кусок уже целиком позади, запас сажается заново.
-        let (on_clock, reseat) = quantum_grid_pts(Some(stalled - dur), stalled, dur);
+        let (on_clock, reseat) = quantum_grid_pts(Some(stalled - dur), stalled, dur, GRID_LEAD_NS);
         assert!(reseat);
         assert_eq!(on_clock, stalled + GRID_LEAD_NS);
 
         // Вторая пауза длиннее уже возвращённого запаса сажает его ещё раз.
         let stalled_again = stalled + 40_000_000;
-        let (again, reseat) = quantum_grid_pts(Some(followed + dur), stalled_again, dur);
+        let (again, reseat) = quantum_grid_pts(Some(followed + dur), stalled_again, dur, GRID_LEAD_NS);
         assert!(reseat);
         assert_eq!(again, stalled_again + GRID_LEAD_NS);
+    }
+
+    /// Запас зоны — подушка сетки. Первый кусок сажается на now+запас.
+    /// Рост отодвигает уже сидящую метку на разницу. Ужатие выкидывает
+    /// ровно разницу и оставляет следующую метку на месте.
+    #[test]
+    fn quantum_grid_lead_follows_the_zone_stock() {
+        let dur = 5_000_000u64;
+        let now = 1_000_000_000u64;
+        let plan = GridPlan { next_running: None, lead_ns: 0, skip_ns: 0 };
+
+        let (plan, play) = grid_step(plan, now, dur, 100_000_000);
+        let (running, reseat) = play.expect("первый кусок");
+        assert!(!reseat);
+        assert_eq!(running, now + 100_000_000);
+        assert_eq!(plan.next_running, Some(now + 100_000_000 + dur));
+
+        let before = plan.next_running.unwrap();
+        let (plan, play) = grid_step(plan, now, dur, 150_000_000);
+        let (running, reseat) = play.expect("выросший запас");
+        assert!(!reseat);
+        assert_eq!(running, before + 50_000_000);
+        assert_eq!(plan.lead_ns, 150_000_000);
+
+        let kept = plan.next_running.unwrap();
+        let mut plan = plan;
+        let mut dropped = 0u64;
+        let mut played = None;
+        for _ in 0..40 {
+            let (step, play) = grid_step(plan, now, dur, 5_000_000);
+            plan = step;
+            match play {
+                None => dropped += dur,
+                Some(seat) => {
+                    played = Some(seat);
+                    break;
+                }
+            }
+        }
+        let (running, _) = played.expect("после сброса сетка снова сажает");
+        assert_eq!(dropped, 145_000_000);
+        assert_eq!(plan.lead_ns, 5_000_000);
+        assert_eq!(plan.skip_ns, 0);
+        assert_eq!(running, kept);
+
+        // Пауза длиннее нового запаса сажает его заново.
+        let stalled = running + dur + 20_000_000;
+        let (plan, play) = grid_step(plan, stalled, dur, 5_000_000);
+        let (running, reseat) = play.expect("поздний кусок");
+        assert!(reseat);
+        assert_eq!(running, stalled + plan.lead_ns);
     }
 }

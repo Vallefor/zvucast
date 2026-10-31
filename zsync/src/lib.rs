@@ -260,15 +260,25 @@ async fn supervise(
     }
 }
 
+/// Логарифм интервала sync и delay. 9 = 512 с, 0 = 1 с, −2 = 4 раза в секунду.
+/// `ZVUCAST_PTP_LOG2` переключает тест без правки константы. Announce остаётся 2 с.
+fn ptp_log2() -> i8 {
+    std::env::var("ZVUCAST_PTP_LOG2")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(9)
+}
+
 fn port_config() -> PortConfig<AcceptAnyMaster> {
+    let log2 = ptp_log2();
     PortConfig {
         acceptable_master_list: AcceptAnyMaster,
         delay_mechanism: DelayMechanism::E2E {
-            interval: Interval::from_log_2(0),
+            interval: Interval::from_log_2(log2),
         },
         announce_interval: Interval::from_log_2(1),
         announce_receipt_timeout: 3,
-        sync_interval: Interval::from_log_2(0),
+        sync_interval: Interval::from_log_2(log2),
         master_only: false,
         delay_asymmetry: Duration::ZERO,
         minor_ptp_version: PtpMinorVersion::One,

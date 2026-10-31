@@ -216,38 +216,55 @@ fn play_desktop(
     }
     // Соседний журнал: пауза между записями и нули в байтах. На звук не влияет.
     let mut tap = PlayTap::start();
+    let mut held: Option<Vec<u8>> = None;
+    let mut held_done: Vec<bool> = Vec::new();
     while !stop.load(Ordering::Relaxed) {
-        let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(200)) else {
-            // Нет RTP — процесс не должен висеть suspended со ссылками.
-            // В Null try_pull возвращается сразу, без паузы это был бы пустой цикл.
-            tap.mark(b'E', &[], None);
-            for slot in &players {
-                close_player(slot);
+        if held.is_none() {
+            let Some(sample) = appsink.try_pull_sample(gst::ClockTime::from_mseconds(200)) else {
+                // Нет RTP — процесс не должен висеть suspended со ссылками.
+                // В Null try_pull возвращается сразу, без паузы это был бы пустой цикл.
+                tap.mark(b'E', &[], None);
+                for slot in &players {
+                    close_player(slot);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            let Some(buffer) = sample.buffer() else { continue };
+            let Ok(map) = buffer.map_readable() else { continue };
+            if map.is_empty() {
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        };
-        let Some(buffer) = sample.buffer() else { continue };
-        let Ok(map) = buffer.map_readable() else { continue };
-        if map.is_empty() {
-            continue;
+            held = Some(map.as_slice().to_vec());
+            held_done = vec![false; players.len()];
         }
-        let bytes = map.as_slice();
+        let bytes = held.as_deref().unwrap_or(&[]);
+        let mut waiting = false;
         match &route {
             crate::inputs::PlaybackRoute::Fallback => {
                 if let Some(slot) = players.first() {
-                    let fate = write_player(slot, bytes, None);
-                    let alive = fate.alive();
-                    tap.mark(fate.kind(), bytes, fate.queued());
-                    if !alive {
-                        close_player(slot);
+                    if !held_done.first().copied().unwrap_or(true) {
+                        let fate = write_player(slot, bytes, None);
+                        let alive = fate.alive();
+                        waiting = matches!(fate, PushFate::Early { .. });
+                        tap.mark(fate.kind(), bytes, fate.queued());
+                        if !alive {
+                            close_player(slot);
+                        }
+                        if !waiting {
+                            held_done[0] = true;
+                        }
                     }
                 }
             }
             crate::inputs::PlaybackRoute::Nodes(names) => {
                 for (index, (slot, name)) in players.iter().zip(names.iter()).enumerate() {
+                    if held_done.get(index).copied().unwrap_or(true) {
+                        continue;
+                    }
                     let fate = write_player(slot, bytes, Some(name.as_str()));
                     let alive = fate.alive();
+                    let early = matches!(fate, PushFate::Early { .. });
                     // Один и тот же буфер уходит во все слоты. Журнал ведём по первому.
                     if index == 0 {
                         tap.mark(fate.kind(), bytes, fate.queued());
@@ -255,9 +272,19 @@ fn play_desktop(
                     if !alive {
                         close_player(slot);
                     }
+                    if early {
+                        waiting = true;
+                    } else {
+                        held_done[index] = true;
+                    }
                 }
             }
         }
+        if waiting && !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(PLAY_PIPE_WAIT);
+            continue;
+        }
+        held = None;
     }
     for slot in &players {
         close_player(slot);
@@ -308,13 +335,14 @@ fn write_player(slot: &Mutex<Option<Child>>, bytes: &[u8], sink_node: Option<&st
     push_playback(pipe, bytes)
 }
 
-/// Хватает ли в пайпе ядра места на весь буфер.
+/// Можно ли положить весь кусок, не раздувая пайп сверх запаса.
 ///
-/// Сколько звука уже лежит в очереди, значения не имеет: потолок в 40 мс
-/// вырезал щелчок, хотя ядро запись ещё принимало. Короткий хвост тоже
-/// отказ — кусок кадра разъедет каналы.
-fn playback_chunk_fits(free: usize, len: usize) -> bool {
-    len > 0 && free >= len
+/// `queued` уже не меньше запаса — кусок ждёт, даже если ядро примет его.
+/// Выброс здесь и был щелчком. Свободного места меньше куска — тоже нельзя:
+/// хвост разрежет каналы.
+fn playback_chunk_fits(queued: usize, free: usize, len: usize) -> bool {
+    let under_cap = !pipe_cap_enabled() || queued < play_pipe_bytes();
+    len > 0 && under_cap && free >= len
 }
 
 /// Слот жив во всех ветках, кроме смерти процесса. Буфер мог не лечь,
@@ -324,10 +352,15 @@ fn push_playback(mut pipe: std::fs::File, bytes: &[u8]) -> PushFate {
         return PushFate::Written { queued_before: None };
     }
     let room = pipe_room(&pipe);
-    if let Some((_, free)) = room {
-        if !playback_chunk_fits(free, bytes.len()) {
+    if let Some((queued, free)) = room {
+        if pipe_cap_enabled() && queued >= play_pipe_bytes() {
+            return PushFate::Early {
+                queued_before: Some(queued),
+            };
+        }
+        if !playback_chunk_fits(queued, free, bytes.len()) {
             return PushFate::Dropped {
-                queued_before: room.map(|(queued, _)| queued),
+                queued_before: Some(queued),
             };
         }
     }
@@ -342,6 +375,8 @@ fn push_playback(mut pipe: std::fs::File, bytes: &[u8]) -> PushFate {
 enum PushFate {
     Written { queued_before: Option<usize> },
     Dropped { queued_before: Option<usize> },
+    /// Запас пайпа уже набран. Байты не записаны, вызывающий повторит их.
+    Early { queued_before: Option<usize> },
     Blocked { queued_before: Option<usize> },
     Dead,
 }
@@ -355,6 +390,7 @@ impl PushFate {
         match self {
             PushFate::Written { .. } => b'W',
             PushFate::Dropped { .. } => b'D',
+            PushFate::Early { .. } => b'H',
             PushFate::Blocked { .. } => b'B',
             PushFate::Dead => b'X',
         }
@@ -364,6 +400,7 @@ impl PushFate {
         match self {
             PushFate::Written { queued_before }
             | PushFate::Dropped { queued_before }
+            | PushFate::Early { queued_before }
             | PushFate::Blocked { queued_before } => *queued_before,
             PushFate::Dead => None,
         }
@@ -609,7 +646,15 @@ fn spawn_player(sink_node: Option<&str>) -> Result<Child> {
     let ms = configured_play_ms();
     let stock = play_stock_frames(ms);
     apply_device_stock(&target, stock);
-    tracing::info!(ms, stock, quantum = PLAY_QUANTUM, target = %target, "pw-play: запас колонки");
+    tracing::info!(
+        ms,
+        stock,
+        quantum = PLAY_QUANTUM,
+        cap = pipe_cap_enabled(),
+        pipe_ms = pipe_cap_ms(),
+        target = %target,
+        "pw-play: запас колонки"
+    );
     let args = player_args(&target);
     Command::new("pw-play")
         .args(args.iter().map(String::as_str))
@@ -657,8 +702,10 @@ fn source_capture_args(node: &str) -> Vec<String> {
 
 /// Запас проигрывателя по умолчанию, миллисекунды.
 /// `ZVUCAST_PLAY_MS`: 40, 20 или 5, затем перезапуск агента.
-/// Это глубина кольца карты, не цикл всего графа. Граф не заперт.
+/// Глубина кольца карты и потолок пайпа перед `pw-play`. Граф не заперт.
 const PLAY_MS_DEFAULT: u32 = 40;
+/// Пауза, пока пайп перед `pw-play` уже держит запас. Кусок не выбрасываем.
+const PLAY_PIPE_WAIT: Duration = Duration::from_millis(5);
 const PLAY_MS_MAX: u32 = 200;
 /// Период HiFiBerry. Кольцо карты считается этими квантами.
 /// `pw-play` просит тот же размер у группы карты и не ставит замок.
@@ -766,6 +813,38 @@ fn apply_device_stock(node_name: &str, frames: u32) {
 
 fn configured_play_ms() -> u32 {
     play_ms(std::env::var("ZVUCAST_PLAY_MS").ok().as_deref())
+}
+
+/// Сколько звука держим в пайпе перед `pw-play`, стерео s16, 48 кГц.
+/// Полный пайп ядра — десятки килобайт и сотни миллисекунд.
+/// `ZVUCAST_PIPE_MS` задаёт потолок отдельно от запаса кольца.
+fn play_pipe_bytes() -> usize {
+    let ms = std::env::var("ZVUCAST_PIPE_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|ms| *ms >= 1)
+        .unwrap_or_else(configured_play_ms);
+    48_000 * 4 * ms as usize / 1_000
+}
+
+fn pipe_cap_ms() -> u32 {
+    std::env::var("ZVUCAST_PIPE_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|ms| *ms >= 1)
+        .unwrap_or_else(configured_play_ms)
+}
+
+/// Потолок трубы перед `pw-play`. `ZVUCAST_PIPE_CAP=0` возвращает старое
+/// поведение: писать, пока ядро принимает, не оглядываясь на длину очереди.
+fn pipe_cap_enabled() -> bool {
+    match std::env::var("ZVUCAST_PIPE_CAP") {
+        Ok(raw) => {
+            let raw = raw.trim();
+            raw != "0" && !raw.eq_ignore_ascii_case("off")
+        }
+        Err(_) => true,
+    }
 }
 
 /// Когда слать уже готовый кусок.
@@ -975,8 +1054,13 @@ fn feed_capture(
         base_ns: 0,
         samples: 0,
     };
-    /// 256 кадров @ 48 кГц ≈ 5.3 мс. Запас сверху — дрожание чтения.
-    const MAX_LEAD_NS: u64 = 32_000_000;
+    // 256 кадров @ 48 кГц ≈ 5.3 мс. Запас сверху — дрожание чтения.
+    // `ZVUCAST_MAX_LEAD_MS`: было 32, урезали до 16.
+    let max_lead_ns: u64 = std::env::var("ZVUCAST_MAX_LEAD_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(16)
+        .saturating_mul(1_000_000);
     while !stop.load(Ordering::Relaxed) {
         if stdout.read_exact(&mut raw).is_err() {
             break;
@@ -1002,8 +1086,8 @@ fn feed_capture(
             acc.drain(..FRAME_BYTES);
             let pts = clock.pts_ns();
             let now_run = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
-            if pts > now_run.saturating_add(MAX_LEAD_NS) {
-                let wait = Duration::from_nanos(pts - now_run - MAX_LEAD_NS);
+            if pts > now_run.saturating_add(max_lead_ns) {
+                let wait = Duration::from_nanos(pts - now_run - max_lead_ns);
                 if wait.as_nanos() >= 5_000_000 {
                     tracing::info!(
                         wait_ns = wait.as_nanos() as u64,
@@ -1784,7 +1868,7 @@ appl_ptr    : 313632\n";
         .unwrap();
         let hold = tx.by_name("fhold-virtual-hall").unwrap();
         assert_eq!(hold.property::<u32>("max-size-buffers"), 0);
-        assert_eq!(hold.property::<u64>("max-size-time"), 40_000_000);
+        assert_eq!(hold.property::<u64>("max-size-time"), 20_000_000);
 
         let rows: Arc<Mutex<Vec<(Option<gst::ClockTime>, Option<gst::ClockTime>)>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -2338,14 +2422,20 @@ appl_ptr    : 313632\n";
     }
 
     #[test]
-    fn playback_chunk_fits_ignores_a_long_queue() {
+    fn playback_chunk_fits_waits_when_the_stock_is_full() {
         let chunk = 48_000 * 4 * 10 / 1_000;
+        let cap = play_pipe_bytes();
+        assert_eq!(cap, 48_000 * 4 * 40 / 1_000);
         assert!(
-            playback_chunk_fits(60_000, chunk),
-            "40 мс в очереди не повод выбрасывать кусок, если место есть"
+            playback_chunk_fits(cap - 1, 60_000, chunk),
+            "ниже запаса и при свободном месте кусок пишем"
         );
         assert!(
-            !playback_chunk_fits(chunk - 1, chunk),
+            !playback_chunk_fits(cap, 60_000, chunk),
+            "на запасе кусок ждёт, а не копится"
+        );
+        assert!(
+            !playback_chunk_fits(0, chunk - 1, chunk),
             "кусок кадра не пишем"
         );
     }
