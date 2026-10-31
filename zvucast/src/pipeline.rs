@@ -129,6 +129,10 @@ fn build_mconv(cm: &ChannelMap) -> Result<gst::Element> {
     Ok(e)
 }
 
+/// Вход микшера всегда на полной громкости. Деление на число веток
+/// приглушало играющий источник, даже когда остальные молчали.
+const MIX_PAD_VOLUME: f64 = 1.0;
+
 /// Голова rx: ветки портов (или одна ветка тишины) → audiomixer →
 /// audioconvert (mix-matrix из cm) → audioconvert → audioresample(quality=4) →
 /// level(name="lev"). Пустой список держит sink тишиной, чтобы он не ловил
@@ -163,10 +167,9 @@ fn rx_head(
     if ports.is_empty() {
         add_silence_branch(&pipe, &mix)?;
     } else {
-        let volume = 1.0 / ports.len() as f64;
         for &port in ports {
             let branch = branches.iter().find(|(p, _)| *p == port).map(|(_, map)| map);
-            add_rtp_branch(&pipe, &mix, port, cfg.jb_ms, volume, branch, bind)?;
+            add_rtp_branch(&pipe, &mix, port, cfg.jb_ms, MIX_PAD_VOLUME, branch, bind)?;
         }
     }
     Ok((pipe, lev))
@@ -363,23 +366,12 @@ pub fn reconcile_mix(
             remove_queue_branch(pipeline, &mixer, &format!("uq{port}"))?;
         }
     } else {
-        // Пока уходящая ветка ещё в микшере, сумма не выше 1: все живые
-        // входы (и новые) стоят на 1/|объединение|. До 1/|новый список|
-        // выжившие поднимаются только после отключения уходящих.
-        let mut union_ports = existing.clone();
-        for &port in ports {
-            if !union_ports.contains(&port) {
-                union_ports.push(port);
-            }
-        }
-        let overlap = 1.0 / union_ports.len() as f64;
         let mut new_ports = Vec::new();
         for &port in ports {
             if !new_ports.contains(&port) {
                 new_ports.push(port);
             }
         }
-        let final_volume = 1.0 / new_ports.len() as f64;
         // Снятие uqsilence у уже играющего audiomixer (GStreamer 1.26)
         // останавливает src-задачу микшера, и она не стартует снова:
         // appsink остаётся на одном сэмпле, RTP дальше не слышен.
@@ -387,15 +379,10 @@ pub fn reconcile_mix(
         if pipeline.by_name("uqsilence").is_some() {
             anyhow::bail!("ветка тишины уже в микшере — нужна пересборка приёма");
         }
-        for &port in &existing {
-            if let Some(queue) = pipeline.by_name(&format!("uq{port}")) {
-                set_queue_volume(&queue, overlap);
-            }
-        }
         for &port in &new_ports {
             if pipeline.by_name(&format!("uq{port}")).is_none() {
                 let branch = branches.iter().find(|(p, _)| *p == port).map(|(_, map)| map);
-                add_rtp_branch(pipeline, &mixer, port, jb_ms, overlap, branch, bind)?;
+                add_rtp_branch(pipeline, &mixer, port, jb_ms, MIX_PAD_VOLUME, branch, bind)?;
             }
         }
         for port in existing {
@@ -405,7 +392,7 @@ pub fn reconcile_mix(
         }
         for &port in &new_ports {
             if let Some(queue) = pipeline.by_name(&format!("uq{port}")) {
-                set_queue_volume(&queue, final_volume);
+                set_queue_volume(&queue, MIX_PAD_VOLUME);
             }
         }
         // Новые ветки уже собраны с jb_ms. Оставшиеся тоже получают этот запас,
@@ -1758,6 +1745,45 @@ mod tests {
         reconcile_mix(&pipe, &[port_a, port_b], 80, &[], &mut LoopbackUdp).unwrap();
         assert_eq!(latency(port_a), 80, "оставшаяся ветка получает новый запас вместе с портами");
         assert_eq!(latency(port_b), 80, "новая ветка собрана с переданным jb_ms");
+    }
+
+    /// Три ветки, потом две, потом снова три: громкость каждой остаётся 1.
+    /// Молчащий отправитель не должен приглушать остальных.
+    #[test]
+    fn each_sender_keeps_full_volume() {
+        gst::init().unwrap();
+        let mut cfg = cfg();
+        cfg.port = 17670;
+        let ports = [cfg.port, cfg.port + 1, cfg.port + 2];
+        let pipe = build_rx_ports(
+            &cfg,
+            "null",
+            &ChannelMap::default(),
+            &ports,
+            &[],
+            &mut LoopbackUdp,
+        )
+        .unwrap();
+        let volume = |port: u16| -> f64 {
+            pipe.by_name(&format!("uq{port}"))
+                .unwrap_or_else(|| panic!("нет uq{port}"))
+                .static_pad("src")
+                .and_then(|pad| pad.peer())
+                .unwrap_or_else(|| panic!("нет входа микшера у {port}"))
+                .property("volume")
+        };
+        for port in ports {
+            assert_eq!(volume(port), 1.0, "порт {port} приглушён числом веток");
+        }
+        reconcile_mix(&pipe, &ports[..2], cfg.jb_ms, &[], &mut LoopbackUdp).unwrap();
+        for port in &ports[..2] {
+            assert_eq!(volume(*port), 1.0, "после снятия ветки порт {port}");
+        }
+        reconcile_mix(&pipe, &ports, cfg.jb_ms, &[], &mut LoopbackUdp).unwrap();
+        for port in ports {
+            assert_eq!(volume(port), 1.0, "после возврата ветки порт {port}");
+        }
+        let _ = pipe.set_state(gst::State::Null);
     }
 
     /// Колонка стартует с тишиной и получает порт уже в Playing.
