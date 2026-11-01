@@ -326,6 +326,9 @@ pub mod proto {
             url: String,
             sha256: String,
         },
+        /// Линия gpiochip0 для усилителя. None — отпустить выход.
+        /// Агент держит её высокой, только пока играет приём.
+        SetAmpGpio { line: Option<u32> },
     }
 }
 
@@ -780,6 +783,15 @@ mod tests {
         };
         let wire = serde_json::to_string(&set).unwrap();
         assert_eq!(serde_json::from_str::<CtlMsg>(&wire).unwrap(), set);
+
+        let amp = CtlMsg::SetAmpGpio { line: Some(17) };
+        let amp_wire = serde_json::to_string(&amp).unwrap();
+        assert!(amp_wire.contains("\"type\":\"SetAmpGpio\""), "{amp_wire}");
+        assert_eq!(serde_json::from_str::<CtlMsg>(&amp_wire).unwrap(), amp);
+        assert_eq!(
+            serde_json::from_str::<CtlMsg>(r#"{"type":"SetAmpGpio","line":null}"#).unwrap(),
+            CtlMsg::SetAmpGpio { line: None }
+        );
     }
 
     #[test]

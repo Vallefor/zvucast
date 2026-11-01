@@ -3346,3 +3346,71 @@ async fn node_volume_patch_reaches_the_agent() {
     }).await;
     assert_eq!(node(&nodes, "pi3")["telemetry"]["playback_volume"].as_f64(), Some(1.0));
 }
+
+#[tokio::test]
+async fn amp_gpio_reaches_only_a_node_that_plays() {
+    let path = temp_state_path("amp-gpio");
+    let port = serve(AppState::with_state(&path)).await;
+    let mut spk = MockAgent::connect(port, "spk").await;
+    for _ in 0..8 {
+        if tokio::time::timeout(Duration::from_millis(200), spk.recv_ctl()).await.is_err() {
+            break;
+        }
+    }
+
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":17}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let mut got = None;
+    for _ in 0..8 {
+        let msg = spk.recv_ctl_within(2).await;
+        if let CtlMsg::SetAmpGpio { line } = msg {
+            got = Some(line);
+            break;
+        }
+    }
+    assert_eq!(got, Some(Some(17)));
+    let nodes = wait_for(port, |nodes| node(nodes, "spk")["amp_gpio"].as_u64() == Some(17)).await;
+    assert_eq!(node(&nodes, "spk")["amp_gpio"], 17);
+
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":null}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let mut cleared = None;
+    for _ in 0..8 {
+        let msg = spk.recv_ctl_within(2).await;
+        if let CtlMsg::SetAmpGpio { line } = msg {
+            cleared = Some(line);
+            break;
+        }
+    }
+    assert_eq!(cleared, Some(None));
+    let nodes = wait_for(port, |nodes| node(nodes, "spk")["amp_gpio"].is_null()).await;
+    assert!(node(&nodes, "spk")["amp_gpio"].is_null());
+
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":1}"#).await;
+    assert_eq!(status, 400);
+    let (status, _) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":28}"#).await;
+    assert_eq!(status, 400);
+
+    let mut tx = MockAgent::connect_as(port, "mic", Role::Tx).await;
+    for _ in 0..8 {
+        if tokio::time::timeout(Duration::from_millis(200), tx.recv_ctl()).await.is_err() {
+            break;
+        }
+    }
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/mic", r#"{"amp_gpio":17}"#).await;
+    assert_eq!(status, 400, "{body}");
+    tx.assert_silent_within(1).await;
+
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":18}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let mut again = MockAgent::connect(port, "spk").await;
+    let mut seen = false;
+    for _ in 0..8 {
+        let msg = again.recv_raw_within(2).await;
+        if matches!(msg, CtlMsg::SetAmpGpio { line: Some(18) }) {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "hello не принёс линию усилителя");
+}

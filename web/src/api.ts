@@ -78,6 +78,8 @@ export interface NodeView {
   spotify?: boolean
   sendspin?: boolean
   setup?: SetupIssue[] | null
+  /** Линия gpiochip0. Нет поля или null — усилитель не включён. */
+  amp_gpio?: number | null
 }
 
 export interface MasterInfo {
@@ -108,6 +110,12 @@ export const api = {
   nodes: (): Promise<NodeView[]> => fetch('/api/nodes').then((r) => r.json()),
   release: (): Promise<{ version: string; assets: Record<string, { url: string; sha256: string }> }> =>
     fetch('/api/release').then((r) => r.json()),
+  // Проверка релиза без серверного кэша. Кнопка на странице узлов.
+  releaseFresh: async (): Promise<{ version: string; assets: Record<string, { url: string; sha256: string }> }> => {
+    const r = await fetch('/api/release?fresh=1')
+    if (!r.ok) throw new Error(String(r.status))
+    return r.json()
+  },
   updateNode: (id: string) => fetch(`/api/nodes/${id}/update`, { method: 'POST' }),
   updateAll: () => fetch('/api/update-all', { method: 'POST' }),
   nodeCmd: (id: string, cmd: 'start' | 'stop') =>
@@ -125,6 +133,7 @@ export const api = {
     capture_volume?: number
     playback_volume?: number
     device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
+    amp_gpio?: number | null
   }) =>
     fetch(`/api/nodes/${id}`, {
       method: 'PATCH',

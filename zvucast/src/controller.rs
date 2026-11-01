@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Json, Path, Request, State};
+use axum::extract::{ConnectInfo, Json, Path, Query, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -402,6 +402,8 @@ struct NodeApi {
     spotify: bool,
     /// Галочка «Включить Sendspin».
     sendspin: bool,
+    /// Линия усилителя. `null` — выход не выбран.
+    amp_gpio: Option<u32>,
     /// Сводка установки. `null` — агент отчёт не присылал.
     setup: Option<Vec<SetupIssue>>,
 }
@@ -496,6 +498,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
             let soloist_key = meta.and_then(|m| node_soloist_key_raw(m.soloist_key.as_deref()));
             let spotify = meta.is_some_and(|m| m.spotify);
             let sendspin = meta.is_some_and(|m| m.sendspin);
+            let amp_gpio = meta.and_then(|m| m.amp_gpio);
             let setup = merge_setup(reported, issues, soloist, &command, spotify);
             NodeApi {
                 node,
@@ -507,6 +510,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 soloist_key,
                 spotify,
                 sendspin,
+                amp_gpio,
                 setup,
             }
         })
@@ -626,8 +630,22 @@ fn release_json(rel: &Release) -> Value {
     json!({ "version": rel.version, "assets": Value::Object(assets) })
 }
 
-async fn get_release(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
-    match page_release(&st.releases).await {
+#[derive(Deserialize, Default)]
+struct ReleaseQuery {
+    #[serde(default)]
+    fresh: String,
+}
+
+async fn get_release(
+    State(st): State<AppState>,
+    Query(q): Query<ReleaseQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let load = if q.fresh == "1" || q.fresh == "true" {
+        fresh_release(&st.releases).await
+    } else {
+        page_release(&st.releases).await
+    };
+    match load {
         Ok(rel) => Ok(Json(release_json(&rel))),
         Err(_) => Err((StatusCode::BAD_GATEWAY, "релиз недоступен".into())),
     }
@@ -1666,6 +1684,9 @@ struct PatchNode {
     capture_volume: Option<f64>,
     playback_volume: Option<f64>,
     device_volumes: Option<Vec<zproto::DeviceVolume>>,
+    /// None — не трогать. Some(None) — отпустить выход. Some(Some(n)) — линия.
+    #[serde(default, deserialize_with = "de_touched")]
+    amp_gpio: Option<Option<u32>>,
 }
 
 #[derive(Deserialize)]
@@ -1736,6 +1757,20 @@ async fn patch_node(
             format!("неизвестный узел {id_or_name}"),
         ))?
     };
+    if let Some(pin) = b.amp_gpio {
+        let plays = {
+            let reg = st.reg.lock().await;
+            reg.roles_of(&node_id).is_some_and(|roles| roles.contains(&Role::Rx))
+        };
+        if !plays {
+            return Err((StatusCode::BAD_REQUEST, "gpio только у узла с воспроизведением".into()));
+        }
+        if let Some(line) = pin {
+            if !crate::amp::line_ok(line) {
+                return Err((StatusCode::BAD_REQUEST, format!("gpio {line} вне 2..=27")));
+            }
+        }
+    }
     let mut meta = {
         let store = st.store.lock().await;
         store.state().nodes.get(&node_id).cloned().unwrap_or_default()
@@ -1782,6 +1817,10 @@ async fn patch_node(
     }
     if let Some(enabled) = b.sendspin {
         meta.sendspin = enabled;
+        changed = true;
+    }
+    if let Some(pin) = b.amp_gpio {
+        meta.amp_gpio = pin;
         changed = true;
     }
     let drop_virtual = b.virtual_output == Some(false) && was_virtual;
@@ -1858,6 +1897,9 @@ async fn patch_node(
                     devices: b.device_volumes.unwrap_or_default(),
                 },
             );
+        }
+        if let Some(pin) = b.amp_gpio {
+            let _ = reg.send_cmd(&node_id, CtlMsg::SetAmpGpio { line: pin });
         }
     }
     let reg = st.reg.lock().await;
@@ -2799,8 +2841,20 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     }
 
     if roles.contains(&Role::Rx) {
+        let amp = {
+            let store = st.store.lock().await;
+            store
+                .state()
+                .nodes
+                .get(&node_id)
+                .and_then(|n| n.amp_gpio)
+                .filter(|line| crate::amp::line_ok(*line))
+        };
         let mut reg = st.reg.lock().await;
         push_playback_target(&mut reg, &node_id, &owned.1);
+        if let Some(line) = amp {
+            let _ = reg.send_cmd(&node_id, CtlMsg::SetAmpGpio { line: Some(line) });
+        }
     }
 
     loop {

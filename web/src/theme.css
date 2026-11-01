@@ -1011,10 +1011,31 @@ table.data tr:last-child td { border-bottom: 0; }
 .node-master { width: 100%; margin-top: 0.5rem; }
 
 .node-flow-edit {
+  width: 100%;
+  min-width: 0;
   margin-top: 0.5rem;
   padding-top: 0.75rem;
   border-top: 1px solid var(--line);
   align-items: start;
+}
+
+/* Плашки настроек тянутся до шины и не выталкиваются содержимым за линию. */
+.node-flow-edit .node-flow-in .node-bus,
+.node-flow-edit .node-flow-out .node-bus {
+  align-items: stretch;
+}
+
+.node-flow-edit .flow-port {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.node-flow-edit .chan-pick {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .node-sheet-ident { margin-top: 0.35rem; }
@@ -1049,11 +1070,13 @@ table.data tr:last-child td { border-bottom: 0; }
   margin: 0.2rem 0 0.35rem;
 }
 
-.chan-volume input[type="range"] { width: 100%; accent-color: var(--accent); }
+.chan-volume input[type="range"] { width: 100%; min-width: 0; accent-color: var(--accent); }
 .chan-volume b { text-align: right; font-weight: 500; color: var(--text); }
 
 .node-flow .chan-row { min-width: 0; min-height: 2.25rem; }
-.node-flow .chan-row .field { min-width: 0; width: 8.5rem; max-width: 100%; min-height: 2rem; }
+.node-flow .chan-row .field { min-width: 0; width: 100%; max-width: 100%; min-height: 2rem; }
+
+.node-dscp .select { width: 9.5rem; }
 
 .node-flow-side > .lede {
   align-self: stretch;

@@ -173,6 +173,13 @@ function nodeTitle(n: NodeView) {
   )
 }
 
+const AMP_LINES = Array.from({ length: 26 }, (_, i) => i + 2)
+
+function ampChoice(pin: number | null | undefined): string {
+  if (pin == null || pin < AMP_LINES[0] || pin > AMP_LINES[AMP_LINES.length - 1]) return ''
+  return String(pin)
+}
+
 const SETUP_KEY: Record<string, MessageKey> = {
   pipewire: 'setup.pipewire',
   wireplumber: 'setup.wireplumber',
@@ -381,6 +388,7 @@ function NodeSettings({
   const [volumeDraft, setVolumeDraft] = useState<Record<string, number>>({})
   const [captureDraft, setCaptureDraft] = useState<number | null>(null)
   const [playbackDraft, setPlaybackDraft] = useState<number | null>(null)
+  const [ampLine, setAmpLine] = useState(() => ampChoice(node.amp_gpio))
   const [saving, setSaving] = useState(false)
   const savingRef = useRef(false)
   const perDevice = (node.telemetry?.device_volumes?.length ?? 0) > 0
@@ -410,6 +418,7 @@ function NodeSettings({
       capture_volume?: number
       playback_volume?: number
       device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
+      amp_gpio?: number | null
     } = { display_name: name.trim() || null }
     if (isTx) {
       const n = Number(dscp)
@@ -428,6 +437,7 @@ function NodeSettings({
     }
     if (isRx) {
       body.outputs = outRows.map((row) => ({ id: row.id, name: row.name.trim(), enabled: row.enabled }))
+      body.amp_gpio = ampLine === '' ? null : Number(ampLine)
     }
     if (captureShown) body.capture_volume = volumeFromPercent(capturePct)
     if (playbackShown) body.playback_volume = volumeFromPercent(playbackPct)
@@ -562,6 +572,26 @@ function NodeSettings({
           </section>
         )}
       </div>
+      {isRx && (
+        <section className="node-group node-volume-group" aria-label={t('nodes.amp')}>
+          <h2>{t('nodes.amp')}</h2>
+          <label className="node-dscp">
+            <span>{t('nodes.ampGpio')}</span>
+            <select
+              className="select"
+              aria-label={t('nodes.ampGpio')}
+              value={ampLine}
+              onChange={(e) => setAmpLine(e.target.value)}
+            >
+              <option value="">{t('nodes.ampOff')}</option>
+              {AMP_LINES.map((n) => (
+                <option key={n} value={n}>{t('nodes.ampPin', { n })}</option>
+              ))}
+            </select>
+          </label>
+          <p className="hint">{t('nodes.ampHint')}</p>
+        </section>
+      )}
       {(captureShown || playbackShown) && (
         <section className="node-group node-volume-group" aria-label={t('nodes.volume')}>
           <h2>{t('nodes.volume')}</h2>
@@ -717,6 +747,7 @@ export default function Nodes() {
   const [settingsId, setSettingsId] = useState<string | null>(null)
   const [cmd, setCmd] = useState<Record<string, PendingCommand>>({})
   const [posting, setPosting] = useState<Record<string, true>>({})
+  const [checking, setChecking] = useState(false)
   const cmdRef = useRef(cmd)
   const postingRef = useRef(posting)
   const toldLate = useRef(new Set<string>())
@@ -762,13 +793,6 @@ export default function Nodes() {
         }
         return settled.pending
       })
-      try {
-        const rel = await api.release()
-        if (!alive) return
-        setRelease(rel)
-      } catch (e) {
-        console.error(e)
-      }
     }
     load().catch(console.error)
     const t = setInterval(() => load().catch(console.error), POLL_MS)
@@ -869,6 +893,22 @@ export default function Nodes() {
         return cleared
       })
     })
+  }
+
+  const checkRelease = () => {
+    if (checking) return
+    setChecking(true)
+    void (async () => {
+      try {
+        const rel = await api.releaseFresh()
+        setRelease(rel)
+      } catch (e) {
+        console.error(e)
+        toast(t('toast.noLink', { what: t('nodes.checkWhat') }))
+      } finally {
+        setChecking(false)
+      }
+    })()
   }
 
   const updateAll = async () => {
@@ -982,6 +1022,8 @@ export default function Nodes() {
               {t('nodes.stopAll')}
             </Button>
           )}
+          <Button busy={checking} onClick={checkRelease}>{t('nodes.checkUpdates')}</Button>
+          {release && <span className="num">{t('nodes.releaseFound', { version: release.version })}</span>}
           <Button onClick={() => void updateAll()}>{t('nodes.updateAll')}</Button>
         </div>
       </div>

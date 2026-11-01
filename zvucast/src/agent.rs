@@ -1509,6 +1509,7 @@ fn gst_domain(
         devices: Vec::new(),
     };
     let mut next_vol = std::time::Instant::now();
+    let mut amp = crate::amp::Amp::new();
 
     loop {
         // Sup-события дрейним ДО команд: Stop в командной фазе того же тика
@@ -1831,6 +1832,17 @@ fn gst_domain(
                 // Команду забирает ws-домен и запускает скрипт вне этого cgroup.
                 tracing::warn!("ApplyUpdate в gst-домене — игнорируем")
             }
+            Ok(CtlMsg::SetAmpGpio { line }) => {
+                if rx_half.is_none() {
+                    tracing::debug!("SetAmpGpio: нет rx — игнорируем");
+                } else {
+                    match line {
+                        Some(n) if crate::amp::line_ok(n) => amp.set_line(Some(n)),
+                        Some(n) => tracing::warn!("SetAmpGpio: линия {n} вне 2..=27"),
+                        None => amp.set_line(None),
+                    }
+                }
+            }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -2050,6 +2062,7 @@ fn gst_domain(
                     .unwrap_or_default(),
             });
         }
+        amp.apply(rx_playing(&rx_half));
     }
 
     if let Some(h) = &tx_half {
@@ -2062,7 +2075,16 @@ fn gst_domain(
             r.stop();
         }
     }
+    amp.clear();
     tracing::info!("gst-домен завершён");
+}
+
+/// Усилитель включён, пока приём должен играть или пайплайн ещё в Playing.
+/// Stop снимает want_playing сразу, но хвост пайплайна не роняет пин раньше звука.
+fn rx_playing(half: &Option<RoleHalf>) -> bool {
+    let Some(h) = half else { return false };
+    h.gate.want_playing
+        || matches!(h.runner.as_ref().map(Runner::state), Some(PipelineState::Playing))
 }
 
 /// Собирает Runner через фабрику и ставит в слот (без старта).
@@ -2198,6 +2220,20 @@ mod tests {
     use super::*;
     use gstreamer::prelude::*;
     use zproto::{ChanSel, Endpoint};
+
+    #[test]
+    fn amplifier_follows_playback() {
+        assert!(!rx_playing(&None));
+        let idle = RoleHalf::new();
+        assert!(!rx_playing(&Some(idle)));
+        let mut half = RoleHalf::new();
+        half.gate.on_start();
+        assert!(rx_playing(&Some(half)));
+        let mut stopped = RoleHalf::new();
+        stopped.gate.on_start();
+        stopped.gate.on_stop();
+        assert!(!rx_playing(&Some(stopped)));
+    }
 
     #[test]
     fn overlay_does_not_write_the_feed_into_the_microphone() {

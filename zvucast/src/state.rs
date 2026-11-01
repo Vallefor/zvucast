@@ -27,6 +27,10 @@ pub struct NodeMeta {
     /// Галочка «Включить Sendspin». false — клиенты зон этого передатчика не стартуют.
     #[serde(default)]
     pub sendspin: bool,
+    /// Линия gpiochip0 усилителя. None — выход не используется.
+    /// Пока приём играет, агент держит её высокой.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amp_gpio: Option<u32>,
 }
 
 /// Микрофон узла или вид на узле-хозяине.
@@ -672,6 +676,17 @@ mod tests {
         let raw = r#"{"id":"A","name":"A","tx":"tx1","members":["rx1"],"active":true,"seq":1}"#;
         let zone: Zone = serde_json::from_str(raw).unwrap();
         assert_eq!(zone.jb_ms, 2);
+    }
+
+    #[test]
+    fn node_without_amp_gpio_stays_off() {
+        let raw = r#"{"display_name":"Kitchen"}"#;
+        let meta: NodeMeta = serde_json::from_str(raw).unwrap();
+        assert_eq!(meta.amp_gpio, None);
+        let on = NodeMeta { amp_gpio: Some(17), ..NodeMeta::default() };
+        let s = serde_json::to_string(&on).unwrap();
+        assert!(s.contains("\"amp_gpio\":17"), "{s}");
+        assert_eq!(serde_json::from_str::<NodeMeta>(&s).unwrap().amp_gpio, Some(17));
     }
 
     #[test]

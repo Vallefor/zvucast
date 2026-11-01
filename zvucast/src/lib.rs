@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod amp;
 pub mod bindiface;
 pub mod conceal;
 pub mod conceal_element;
