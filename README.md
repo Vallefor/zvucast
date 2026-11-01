@@ -23,16 +23,16 @@ Run this on each machine, as the user who should own the sound session. The scri
 curl -fsSL https://raw.githubusercontent.com/Vallefor/zvucast/main/install.sh | bash
 ```
 
-The script asks four things. Empty input accepts the default in brackets.
+The script asks four things. Press Enter to accept the default in brackets.
 
-| Prompt | Meaning | Answers |
-|---|---|---|
-| Какой модуль для воспроизведения звука подключен? | Which playback board is attached? | `1` — none. `2` — a PCM5102 board. |
-| Ставить Soloist? [n] | Install Spotify Soloist? | `y` or `n` |
-| Эта машина — контроллер? [n] | Is this machine the controller? | `y` on one machine, `n` on the others |
-| Продолжить? [y] | Go ahead? | `y` or `n` |
+| Prompt | Answers |
+|---|---|
+| Which playback board is connected? | `1` — none. `2` — a PCM5102 board. |
+| Install Soloist? [n] | `y` or `n` |
+| Is this machine the controller? [n] | `y` on one machine, `n` on the others |
+| Continue? [y] | `y` or `n` |
 
-`y`/`yes` and `n`/`no` work, and so do `да` and `нет`.
+`yes` and `no` work as well. `да` and `нет` still work.
 
 Pick **one** controller. That machine serves the panel. The others find it on the LAN. To move the panel later, use **Сделать мастером** on the Nodes page. A PCM5102 answer belongs on a Raspberry Pi that has that board. A PC and an Orange Pi stay on `1`.
 

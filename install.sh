@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Установка Zvucast на плату. Тексты дропов и юнитов вшиты: клон репозитория не нужен.
+# Install Zvucast. Drop-ins and units are embedded, so a git clone is not required.
 set -euo pipefail
 
 cleanup_dirs=()
@@ -158,7 +158,7 @@ resolve_user() {
   current=$(id -u)
   if [[ "$current" -eq 0 ]]; then
     if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == root ]]; then
-      printf '%s\n' 'запусти от обычного пользователя' >&2
+      printf '%s\n' 'run this as a normal user' >&2
       exit 1
     fi
     AUDIO_USER=$SUDO_USER
@@ -197,11 +197,11 @@ ask() {
         return 0
         ;;
     esac
-    printf '%s\n' 'ответь y/yes/д/да или n/no/н/нет' >/dev/tty
+    printf '%s\n' 'answer y or n' >/dev/tty
   done
 }
 
-# Пусто, 0 и 1 — пункт меню «никакого». 2 и pcm5102 — плата.
+# Empty, 0, and 1 mean no board. 2 and pcm5102 mean the PCM5102 board.
 resolve_dac() {
   case "$1" in
     ''|0|1|none|NONE|None)
@@ -220,9 +220,9 @@ ask_playback() {
   local reply
   while true; do
     printf '%s\n' \
-      'Какой модуль для воспроизведения звука подключен?' \
-      '  1. Никакого' \
-      '  2. Плата PCM5102' >/dev/tty
+      'Which playback board is connected?' \
+      '  1. None' \
+      '  2. PCM5102 board' >/dev/tty
     if ! read -r -p '[1] ' reply </dev/tty; then
       printf '%s\n' ZVUCAST_SPOTIFY ZVUCAST_CONTROLLER ZVUCAST_DAC >&2
       exit 2
@@ -230,38 +230,38 @@ ask_playback() {
     if dac=$(resolve_dac "$reply"); then
       return 0
     fi
-    printf '%s\n' 'ответь 1 или 2' >/dev/tty
+    printf '%s\n' 'answer 1 or 2' >/dev/tty
   done
 }
 
 print_plan() {
   local ctrl solo board
   if [[ "$controller" == 1 ]]; then
-    ctrl=да
+    ctrl=yes
   else
-    ctrl=нет
+    ctrl=no
   fi
   if [[ "$spotify" == 1 ]]; then
-    solo=да
+    solo=yes
   else
-    solo=нет
+    solo=no
   fi
   if [[ "$dac" == pcm5102 ]]; then
-    board='плата PCM5102'
+    board='PCM5102 board'
   else
-    board=никакого
+    board=none
   fi
   printf '%s\n' \
-    'Будет установлено:' \
-    "семейство пакетов: ${family}" \
-    'PipeWire, WirePlumber, бинарник zvucast, агент' \
-    "модуль воспроизведения: ${board}" \
-    "контроллер: ${ctrl}" \
+    'Will install:' \
+    "package family: ${family}" \
+    'PipeWire, WirePlumber, the zvucast binary, and the agent' \
+    "playback board: ${board}" \
+    "controller: ${ctrl}" \
     "Soloist: ${solo}"
 }
 
-# ZVUCAST_DAC необязателен. Нет переменной — «никакого».
-# Без терминала по-прежнему обязательны только ZVUCAST_SPOTIFY и ZVUCAST_CONTROLLER.
+# ZVUCAST_DAC is optional. Unset means no board.
+# Without a terminal, ZVUCAST_SPOTIFY and ZVUCAST_CONTROLLER are still required.
 choose_options() {
   local solo_answer ctrl_answer confirm_answer
   if [[ -n "${ZVUCAST_DAC+x}" ]]; then
@@ -286,8 +286,8 @@ choose_options() {
   if [[ -z "${ZVUCAST_DAC+x}" ]]; then
     ask_playback
   fi
-  ask solo_answer 'Ставить Soloist? [n]' n
-  ask ctrl_answer 'Эта машина — контроллер? [n]' n
+  ask solo_answer 'Install Soloist? [n]' n
+  ask ctrl_answer 'Is this machine the controller? [n]' n
   if [[ "$solo_answer" == yes ]]; then
     spotify=1
   else
@@ -299,7 +299,7 @@ choose_options() {
     controller=0
   fi
   print_plan
-  ask confirm_answer 'Продолжить? [y]' y
+  ask confirm_answer 'Continue? [y]' y
   if [[ "$confirm_answer" == no ]]; then
     exit 0
   fi
@@ -371,7 +371,7 @@ trim_line() {
   printf '%s' "$value"
 }
 
-# Bookworm: /boot/firmware/config.txt. Старее — /boot/config.txt.
+# Bookworm and newer: /boot/firmware/config.txt. Older images: /boot/config.txt.
 boot_config_path() {
   local fw boot firmware bootdir
   fw=$(root_path /boot/firmware/config.txt)
@@ -401,7 +401,7 @@ configure_overlay() {
   [[ "$dac" == pcm5102 ]] || return 0
   local path src dest line trimmed need_i2s=1 need_dac=1 found_all=0 inserted=0
   if ! path=$(boot_config_path); then
-    printf '%s\n' 'нет config.txt: оверлей PCM5102 некуда записать' >&2
+    printf '%s\n' 'no config.txt: nowhere to write the PCM5102 overlay' >&2
     exit 1
   fi
   src=$(new_tmp)/config.txt
@@ -419,7 +419,7 @@ configure_overlay() {
     esac
   done < "$src"
   if [[ "$need_i2s" -eq 0 && "$need_dac" -eq 0 ]]; then
-    printf '%s\n' 'Оверлей hifiberry-dac уже в config.txt. ЦАП появится после перезагрузки.'
+    printf '%s\n' 'hifiberry-dac overlay is already in config.txt. The DAC appears after a reboot.'
     return 0
   fi
   dest=$(new_tmp)/config.new
@@ -452,7 +452,7 @@ configure_overlay() {
     fi
   fi
   write_file "$path" < "$dest"
-  printf '%s\n' 'Оверлей hifiberry-dac записан в config.txt. ЦАП появится после перезагрузки.'
+  printf '%s\n' 'Wrote the hifiberry-dac overlay to config.txt. The DAC appears after a reboot.'
 }
 
 install_drops() {
@@ -566,8 +566,8 @@ install_limits() {
 install_session() {
   as_root loginctl enable-linger "$AUDIO_USER"
   as_root systemctl start "user@${AUDIO_UID}.service"
-  # enable --now не перечитывает уже запущенный граф. Рестарт нужен,
-  # чтобы дропы часов и периода карты вступили сразу.
+  # enable --now does not reload a graph that is already running. Restart so
+  # the clock and card-period drop-ins apply immediately.
   sudo -u "$AUDIO_USER" \
     "XDG_RUNTIME_DIR=/run/user/${AUDIO_UID}" \
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${AUDIO_UID}/bus" \
@@ -580,8 +580,8 @@ install_session() {
 
 install_wifi() {
   local conf unit line name type
-  # Юнит выключит power save на следующей загрузке. Сейчас wlan0 ещё в нём,
-  # и PTP с RTP на этом интерфейсе рвутся до рестарта.
+  # The unit turns power save off on the next boot. wlan0 still has it on
+  # now, and PTP and RTP on that interface break until this runs.
   as_root iw dev wlan0 set power_save off || true
   conf=$(root_path /etc/NetworkManager/conf.d/wifi-powersave-off.conf)
   write_file "$conf" <<'EOF'
@@ -636,12 +636,12 @@ release_version() {
   done <<<"$headers"
   prefix='https://github.com/Vallefor/zvucast/releases/tag/v'
   if [[ "$location" != "$prefix"* ]]; then
-    printf '%s\n' 'нет тега' >&2
+    printf '%s\n' 'no release tag' >&2
     return 1
   fi
   version=${location#"$prefix"}
   if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    printf '%s\n' 'нет тега' >&2
+    printf '%s\n' 'no release tag' >&2
     return 1
   fi
   printf '%s\n' "$version"
@@ -663,7 +663,7 @@ install_binary() {
   fi
   line=$(tr -d '\r' < "$tmp/SHA256SUMS" | grep -E "^[0-9a-fA-F]+ [ *]?${asset}\$" || true)
   if [[ -z "$line" ]] || ! (cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null); then
-    printf '%s\n' 'сумма' >&2
+    printf '%s\n' 'checksum mismatch' >&2
     exit 1
   fi
   dest=$(root_path /usr/local/bin/zvucast)

@@ -281,7 +281,7 @@ inst=$(awk '/^install /{print NR; exit}' "$work/apt.log")
 grep -q 'iw dev wlan0 set power_save off' "$work/sudo.log"
 [[ ! -e "$work/boot/firmware/config.txt" ]]
 [[ ! -e "$work/boot/config.txt" ]]
-grep -q 'модуль воспроизведения: никакого' "$work/main.out"
+grep -q 'playback board: none' "$work/main.out"
 grep -q disable "$work/systemctl.log"
 grep -q zvucast-controller "$work/systemctl.log"
 grep -q 'controller = "ws://127.0.0.1:8080/ws"' "$work/etc/zvucast.toml"
@@ -398,7 +398,7 @@ run_install 0 \
   ZVUCAST_SPOTIFY=0 \
   ZVUCAST_CONTROLLER=0 \
   ZVUCAST_DAC=pcm5102
-grep -q 'Оверлей hifiberry-dac записан' "$work/main.out"
+grep -q 'Wrote the hifiberry-dac overlay' "$work/main.out"
 awk '
   $0 == "[all]" { in_all = 1; next }
   in_all && $0 == "dtparam=i2s=on" { got_i2s = 1 }
@@ -413,7 +413,7 @@ run_install 0 \
   ZVUCAST_SPOTIFY=0 \
   ZVUCAST_CONTROLLER=0 \
   ZVUCAST_DAC=2
-grep -q 'Оверлей hifiberry-dac уже в config.txt' "$work/main.out"
+grep -q 'hifiberry-dac overlay is already in config.txt' "$work/main.out"
 [[ "$(grep -c '^dtoverlay=hifiberry-dac$' "$work/boot/firmware/config.txt")" -eq 1 ]]
 
 old=$work/oldroot
