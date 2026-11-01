@@ -75,6 +75,29 @@ a { color: var(--accent); }
 
 .tabs { display: flex; gap: 0.35rem; }
 
+.lang {
+  margin-left: auto;
+  display: flex;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.lang button {
+  min-height: 32px;
+  min-width: 44px;
+  padding: 0 0.75rem;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.lang button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+
 .tab {
   display: inline-flex;
   align-items: center;

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, InputView, MasterInfo, NodeView } from '../api'
-import { addableDevices, chanWord, deviceVolume, enableDevice, flowDevices, groupDevices, isPlaying, settleCommands, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent, type PendingCommand } from '../nodesView'
+import { channelCount, type MessageKey, type Translate } from '../i18n'
+import { useI18n } from '../locale'
+import { addableDevices, deviceVolume, enableDevice, flowDevices, groupDevices, isPlaying, settleCommands, showStartAll, showStopAll, showVolumeSlider, transport, volumeFromPercent, volumePercent, type PendingCommand } from '../nodesView'
 import { offer, updateWait } from '../update'
 import { Badge, Button, useRun, useUi } from '../ui'
 
@@ -35,21 +37,21 @@ function fmtUptime(s: number): string {
   return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
 }
 
-function linkLabel(link: NodeView['link']): string {
+function linkLabel(link: NodeView['link'], t: Translate): string {
   if (link === 'wifi') return 'Wi‑Fi'
-  if (link === 'wired') return 'Провод'
+  if (link === 'wired') return t('link.wired')
   return '—'
 }
 
 /// Нет сети важнее звука: офлайн не бывает «играет», даже если телеметрия старая.
-function presenceWord(n: NodeView): { text: string; tone: 'faint' | 'good' | 'quiet' } {
-  if (!n.online) return { text: 'не в сети', tone: 'faint' }
-  if (isPlaying(n.telemetry)) return { text: 'играет', tone: 'good' }
-  return { text: 'стоит', tone: 'quiet' }
+function presenceWord(n: NodeView, t: Translate): { text: string; tone: 'faint' | 'good' | 'quiet' } {
+  if (!n.online) return { text: t('presence.offline'), tone: 'faint' }
+  if (isPlaying(n.telemetry)) return { text: t('presence.playing'), tone: 'good' }
+  return { text: t('presence.idle'), tone: 'quiet' }
 }
 
 /// Живые метры. Пустое значение не занимает место прочерком.
-function meterFacts(n: NodeView): { key: string; label: string; value: string }[] {
+function meterFacts(n: NodeView, t: Translate): { key: string; label: string; value: string }[] {
   const tm = n.telemetry
   const tx = tm?.tx ?? null
   const rx = tm?.rx ?? null
@@ -64,15 +66,15 @@ function meterFacts(n: NodeView): { key: string; label: string; value: string }[
     })
   }
   if (rx?.state === 'playing' && rx.queue_ms >= 0) {
-    items.push({ key: 'queue', label: 'Очередь', value: String(rx.queue_ms) })
+    items.push({ key: 'queue', label: t('meter.queue'), value: String(rx.queue_ms) })
   }
   if (rx && rx.dropped > 0) {
-    items.push({ key: 'drop', label: 'Заикания', value: String(rx.dropped) })
+    items.push({ key: 'drop', label: t('meter.drops'), value: String(rx.dropped) })
   }
   if (n.online && tm && Math.abs(tm.ptp_offset_ns) <= 1e12) {
     items.push({ key: 'ptp', label: 'PTP', value: (tm.ptp_offset_ns / 1000).toFixed(1) })
   }
-  if (tm) items.push({ key: 'up', label: 'Uptime', value: fmtUptime(tm.uptime_s) })
+  if (tm) items.push({ key: 'up', label: t('meter.uptime'), value: fmtUptime(tm.uptime_s) })
   return items
 }
 
@@ -98,10 +100,11 @@ function NodeBoard() {
 }
 
 function NodeFlags({ node }: { node: NodeView }) {
+  const { t } = useI18n()
   return (
     <>
       {node.virtual_output && (
-        <span className="node-flag node-flag-virtual" role="img" aria-label="Виртуальная колонка">
+        <span className="node-flag node-flag-virtual" role="img" aria-label={t('flag.virtual')}>
           <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
             <path fill="currentColor" d="M2.6 6.5h2.5L8.6 3.5v11L5.1 11.5H2.6V6.5z" />
             <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M10.7 7a2.6 2.6 0 0 1 0 4" />
@@ -141,6 +144,7 @@ function FlowSide({
   label: string
   devices: { key: string; name: string; count: number }[]
 }) {
+  const { lang } = useI18n()
   return (
     <div className={`node-flow-side node-flow-${kind}`}>
       <div className="node-flow-label">{label}</div>
@@ -150,7 +154,7 @@ function FlowSide({
             {kind === 'out' && <span className="flow-stub" aria-hidden="true" />}
             <div className="flow-chip">
               <span className="flow-chip-name" title={device.name}>{device.name}</span>
-              <span className="flow-count" aria-label={`${device.count} ${chanWord(device.count)}`}>{device.count}</span>
+              <span className="flow-count" aria-label={channelCount(lang, device.count)}>{device.count}</span>
             </div>
             {kind === 'in' && <span className="flow-stub" aria-hidden="true" />}
           </div>
@@ -169,19 +173,19 @@ function nodeTitle(n: NodeView) {
   )
 }
 
-const SETUP_TITLE: Record<string, string> = {
-  pipewire: 'Служба PipeWire не запущена',
-  wireplumber: 'WirePlumber не запущен',
-  'pipewire-pulse': 'PipeWire Pulse не запущен',
-  'pw-cat': 'Нет pw-record или pw-play',
-  gstreamer: 'Нет плагинов GStreamer',
-  linger: 'После перезагрузки PipeWire не поднимется',
-  'pipewire-socket': 'Нет сокета PipeWire',
-  'pipewire-quantum': 'Квант PipeWire не тот, что ставит установщик',
-  'rt-limits': 'Нет rtprio для группы audio',
-  'wifi-powersave': 'На Wi-Fi включено энергосбережение',
-  controller: 'Контроллер включён, но не работает',
-  soloist: 'Spotify включён, а Soloist недоступен',
+const SETUP_KEY: Record<string, MessageKey> = {
+  pipewire: 'setup.pipewire',
+  wireplumber: 'setup.wireplumber',
+  'pipewire-pulse': 'setup.pipewirePulse',
+  'pw-cat': 'setup.pwCat',
+  gstreamer: 'setup.gstreamer',
+  linger: 'setup.linger',
+  'pipewire-socket': 'setup.socket',
+  'pipewire-quantum': 'setup.quantum',
+  'rt-limits': 'setup.rt',
+  'wifi-powersave': 'setup.wifi',
+  controller: 'setup.controller',
+  soloist: 'setup.soloist',
 }
 
 async function copyCommand(text: string, el: HTMLElement) {
@@ -199,19 +203,20 @@ async function copyCommand(text: string, el: HTMLElement) {
   }
 }
 
-function setupBlock(nodes: NodeView[]) {
+function setupBlock(nodes: NodeView[], t: Translate) {
   const groups = nodes.filter((n) => n.online).flatMap((n) => {
     const rows: { key: string; title: string; detail: string; command: string }[] = []
     if (n.setup == null) {
-      rows.push({ key: 'old', title: 'Агент не прислал проверку, обновите узел', detail: '', command: '' })
+      rows.push({ key: 'old', title: t('setup.old'), detail: '', command: '' })
       if (n.spotify) {
-        rows.push({ key: 'soloist-old', title: 'Spotify включён, а агент не сообщил про Soloist', detail: '', command: '' })
+        rows.push({ key: 'soloist-old', title: t('setup.soloistOld'), detail: '', command: '' })
       }
     } else {
       n.setup.forEach((issue, i) => {
+        const key = SETUP_KEY[issue.id]
         rows.push({
           key: `${issue.id}-${i}`,
-          title: SETUP_TITLE[issue.id] ?? issue.id,
+          title: key ? t(key) : issue.id,
           detail: issue.detail ?? '',
           command: issue.command,
         })
@@ -223,7 +228,7 @@ function setupBlock(nodes: NodeView[]) {
   if (groups.length === 0) return null
   return (
     <section className="card setup-gap">
-      <h2>Системе не хватает</h2>
+      <h2>{t('setup.missing')}</h2>
       {groups.map((g) => (
         <div key={g.id}>
           <h3 className="device-name">{g.name}</h3>
@@ -263,6 +268,7 @@ function ChanEditor({
   onPatch: (id: string, next: Partial<InputView>) => void
   onEnable: (key: string) => void
 }) {
+  const { t } = useI18n()
   const [adding, setAdding] = useState(false)
   const shown = useMemo(
     () => groupDevices(rows).filter((group) => group.rows.some((row) => row.enabled)),
@@ -286,7 +292,7 @@ function ChanEditor({
                     min={0}
                     max={150}
                     step={1}
-                    aria-label={`Громкость ${group.name}`}
+                    aria-label={t('chan.volume', { name: group.name })}
                     value={drafts[`${kind}:${group.key}`] ?? volumePercent(deviceVolume(volumes, group.key, group.name, kind)?.volume ?? 0)}
                     onChange={(e) => onVolume(`${kind}:${group.key}`, Number(e.target.value))}
                   />
@@ -298,12 +304,12 @@ function ChanEditor({
                   <input
                     type="checkbox"
                     checked={row.enabled}
-                    aria-label={`Использовать ${group.name} ${row.index + 1}`}
+                    aria-label={t('chan.use', { name: group.name, n: row.index + 1 })}
                     onChange={(e) => onPatch(row.id, { enabled: e.target.checked })}
                   />
                   <input
                     className="field"
-                    aria-label={`Имя канала ${group.name} ${row.index + 1}`}
+                    aria-label={t('chan.name', { name: group.name, n: row.index + 1 })}
                     value={row.name}
                     onChange={(e) => onPatch(row.id, { name: e.target.value })}
                   />
@@ -322,7 +328,7 @@ function ChanEditor({
             aria-expanded={adding}
             onClick={() => setAdding((open) => !open)}
           >
-            Добавить
+            {t('chan.add')}
           </button>
           {adding && (
             <div className="node-adder">
@@ -361,6 +367,7 @@ function NodeSettings({
 }) {
   const run = useRun()
   const { toast } = useUi()
+  const { t } = useI18n()
   const isTx = node.roles.includes('tx')
   const isRx = node.roles.includes('rx')
   const [name, setName] = useState(node.display_name ?? '')
@@ -407,7 +414,7 @@ function NodeSettings({
     if (isTx) {
       const n = Number(dscp)
       if (!Number.isInteger(n) || n < 0 || n > 63) {
-        toast('DSCP — целое от 0 до 63')
+        toast(t('nodes.dscpRange'))
         return
       }
       body.dscp = n
@@ -441,7 +448,7 @@ function NodeSettings({
     }
     savingRef.current = true
     setSaving(true)
-    void run(api.patchNode(node.node_id, body), 'настройки узла').then((ok) => {
+    void run(api.patchNode(node.node_id, body), t('nodes.saveWhat')).then((ok) => {
       if (ok) onClose()
       else {
         savingRef.current = false
@@ -458,22 +465,22 @@ function NodeSettings({
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  const state = presenceWord(node)
+  const state = presenceWord(node, t)
   const features = isTx && node.supports_virtual_output
 
   return (
     <article className="node-sheet">
-      <button type="button" className="node-back" onClick={onClose}>К узлам</button>
+      <button type="button" className="node-back" onClick={onClose}>{t('nodes.back')}</button>
       <label className="node-name">
-        Имя
-        <input className="field" aria-label="Имя узла" value={name} onChange={(e) => setName(e.target.value)} />
+        {t('nodes.name')}
+        <input className="field" aria-label={t('nodes.nameAria')} value={name} onChange={(e) => setName(e.target.value)} />
       </label>
-      <p className="hint">Системное имя {node.name}</p>
+      <p className="hint">{t('nodes.systemName', { name: node.name })}</p>
       <div className={`node-groups${features ? '' : ' is-single'}`}>
-        <section className="node-group" aria-label="Сеть">
-          <h2>Сеть</h2>
+        <section className="node-group" aria-label={t('nodes.network')}>
+          <h2>{t('nodes.network')}</h2>
           <div className="node-fact"><span>IP</span><b className="num">{node.ip || '—'}</b></div>
-          <div className="node-fact"><span>Связь</span><b>{linkLabel(node.link)}</b></div>
+          <div className="node-fact"><span>{t('nodes.link')}</span><b>{linkLabel(node.link, t)}</b></div>
           {isTx && (
             <>
               <label className="node-dscp">
@@ -488,7 +495,7 @@ function NodeSettings({
                   onChange={(e) => setDscp(e.target.value)}
                 />
               </label>
-              <div className="seg" role="group" aria-label="Пресеты DSCP">
+              <div className="seg" role="group" aria-label={t('nodes.dscpPresets')}>
                 {DSCP_PRESETS.map((p) => (
                   <button
                     key={p.label}
@@ -503,27 +510,27 @@ function NodeSettings({
             </>
           )}
           {master ? (
-            <p className="hint">Этот узел ведёт панель</p>
+            <p className="hint">{t('nodes.thisMaster')}</p>
           ) : (
-            <Button type="button" className="node-master" disabled={!node.online} onClick={transfer}>Сделать мастером</Button>
+            <Button type="button" className="node-master" disabled={!node.online} onClick={transfer}>{t('nodes.makeMaster')}</Button>
           )}
         </section>
         {features && (
-          <section className="node-group" aria-label="На узле">
-            <h2>На узле</h2>
+          <section className="node-group" aria-label={t('nodes.onNode')}>
+            <h2>{t('nodes.onNode')}</h2>
             <label className="node-check">
               <input
                 type="checkbox"
-                aria-label="Создать виртуальный звуковой выход"
+                aria-label={t('nodes.virtualOut')}
                 checked={virtualOn}
                 onChange={(e) => setVirtualOn(e.target.checked)}
               />
-              Виртуальная колонка
+              {t('nodes.virtual')}
             </label>
             <label className="node-check">
               <input
                 type="checkbox"
-                aria-label="Включить Spotify"
+                aria-label={t('nodes.spotifyOn')}
                 checked={spotifyOn}
                 onChange={(e) => setSpotifyOn(e.target.checked)}
               />
@@ -531,12 +538,12 @@ function NodeSettings({
             </label>
             {spotifyOn && (
               <label className="node-name">
-                Ключ Spotify
+                {t('nodes.spotifyKey')}
                 <input
                   className="field"
                   type="password"
                   autoComplete="off"
-                  aria-label="Ключ Spotify"
+                  aria-label={t('nodes.spotifyKey')}
                   value={soloistKey}
                   onChange={(e) => setSoloistKey(e.target.value)}
                 />
@@ -545,28 +552,28 @@ function NodeSettings({
             <label className="node-check">
               <input
                 type="checkbox"
-                aria-label="Включить Sendspin"
+                aria-label={t('nodes.sendspinOn')}
                 checked={sendspinOn}
                 onChange={(e) => setSendspinOn(e.target.checked)}
               />
               Sendspin
             </label>
-            <p className="hint">Spotify и Sendspin поднимаются на этом передатчике, только пока включены. Ключ нужен для Spotify.</p>
+            <p className="hint">{t('nodes.feedsHint')}</p>
           </section>
         )}
       </div>
       {(captureShown || playbackShown) && (
-        <section className="node-group node-volume-group" aria-label="Громкость">
-          <h2>Громкость</h2>
+        <section className="node-group node-volume-group" aria-label={t('nodes.volume')}>
+          <h2>{t('nodes.volume')}</h2>
           {captureShown && (
             <label className="node-volume">
-              <span>Захват</span>
+              <span>{t('nodes.capture')}</span>
               <input
                 type="range"
                 min={0}
                 max={150}
                 step={1}
-                aria-label="Громкость захвата"
+                aria-label={t('nodes.captureVolume')}
                 value={capturePct}
                 onChange={(e) => setCaptureDraft(Number(e.target.value))}
               />
@@ -575,13 +582,13 @@ function NodeSettings({
           )}
           {playbackShown && (
             <label className="node-volume">
-              <span>Воспроизведение</span>
+              <span>{t('nodes.playback')}</span>
               <input
                 type="range"
                 min={0}
                 max={150}
                 step={1}
-                aria-label="Громкость воспроизведения"
+                aria-label={t('nodes.playbackVolume')}
                 value={playbackPct}
                 onChange={(e) => setPlaybackDraft(Number(e.target.value))}
               />
@@ -595,8 +602,8 @@ function NodeSettings({
           {isTx && (
             <ChanEditor
               kind="in"
-              title="Входы"
-              empty="Агент ещё не прислал устройства захвата."
+              title={t('nodes.inputs')}
+              empty={t('nodes.inputsEmpty')}
               rows={rows}
               volumes={perDevice ? node.telemetry?.device_volumes : []}
               drafts={volumeDraft}
@@ -611,7 +618,7 @@ function NodeSettings({
               <div className="node-card-title">
                 <span>{name.trim() || node.name}</span>
                 {rolesOf(node)}
-                {master && <Badge tone="master">Мастер</Badge>}
+                {master && <Badge tone="master">{t('nodes.master')}</Badge>}
               </div>
               <p className={`node-state is-${state.tone}`}>{state.text}</p>
             </div>
@@ -619,8 +626,8 @@ function NodeSettings({
           {isRx && (
             <ChanEditor
               kind="out"
-              title="Выходы"
-              empty="Агент ещё не прислал устройства воспроизведения."
+              title={t('nodes.outputs')}
+              empty={t('nodes.outputsEmpty')}
               rows={outRows}
               volumes={perDevice ? node.telemetry?.device_volumes : []}
               drafts={volumeDraft}
@@ -632,14 +639,14 @@ function NodeSettings({
         </div>
       )}
       {isTx && (
-        <p className="hint">Отмеченные каналы входят в стереопоток. Виртуальный выход — такой же вход: он подмешивается в зону и раскладывается по выходам колонки в карте зоны.</p>
+        <p className="hint">{t('nodes.inputHint')}</p>
       )}
       {isRx && (
-        <p className="hint">Отмеченные каналы — выходы колонки в карте зоны. Звук играет на устройство этих каналов.</p>
+        <p className="hint">{t('nodes.outputHint')}</p>
       )}
       <div className="node-sheet-foot">
-        <Button onClick={onClose}>Отмена</Button>
-        <Button variant="primary" busy={saving} onClick={save}>Сохранить</Button>
+        <Button onClick={onClose}>{t('common.cancel')}</Button>
+        <Button variant="primary" busy={saving} onClick={save}>{t('common.save')}</Button>
       </div>
     </article>
   )
@@ -657,6 +664,7 @@ function SettingsPop({
   onClose: () => void
   children: (close: () => void) => ReactNode
 }) {
+  const { t } = useI18n()
   const [phase, setPhase] = useState<'in' | 'out'>('in')
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
@@ -680,8 +688,8 @@ function SettingsPop({
 
   return (
     <div className={`node-settings-pop is-${phase}`}>
-      <button type="button" className="node-settings-pop-dim" aria-label="Закрыть настройки" onClick={close} />
-      <div className="node-settings-pop-panel" role="dialog" aria-modal="true" aria-label="Настройки узла">
+      <button type="button" className="node-settings-pop-dim" aria-label={t('nodes.closeSettings')} onClick={close} />
+      <div className="node-settings-pop-panel" role="dialog" aria-modal="true" aria-label={t('nodes.settingsTitle')}>
         {children(close)}
       </div>
     </div>
@@ -697,6 +705,9 @@ function rolesOf(n: NodeView) {
 export default function Nodes() {
   const run = useRun()
   const { confirm, toast } = useUi()
+  const { t } = useI18n()
+  const tRef = useRef(t)
+  tRef.current = t
   const [nodes, setNodes] = useState<NodeView[]>([])
   const [master, setMaster] = useState<MasterInfo | null>(null)
   const [release, setRelease] = useState<ReleaseView | null>(null)
@@ -746,7 +757,7 @@ export default function Nodes() {
           const key = `${item.id}:${item.at}`
           if (toldLate.current.has(key)) continue
           toldLate.current.add(key)
-          const text = item.cmd === 'start' ? 'старт: не применилось' : 'стоп: не применилось'
+          const text = item.cmd === 'start' ? tRef.current('nodes.startMissed') : tRef.current('nodes.stopMissed')
           queueMicrotask(() => toast(text))
         }
         return settled.pending
@@ -779,14 +790,14 @@ export default function Nodes() {
 
   const transfer = async (node: NodeView) => {
     const ok = await confirm({
-      title: 'Передать мастера',
-      body: `Панель откроется на узле «${node.display_name ?? node.name}». Контроллер на этом узле остановится.`,
-      confirmLabel: 'Передать',
+      title: t('nodes.transferTitle'),
+      body: t('nodes.transferBody', { name: node.display_name ?? node.name }),
+      confirmLabel: t('nodes.transferConfirm'),
     })
     if (!ok) return
     const r = await api.transfer(node.node_id)
     if (!r.ok) {
-      toast(`трансфер: HTTP ${r.status}`)
+      toast(`${t('nodes.transferWhat')}: HTTP ${r.status}`)
       return
     }
     const body = await r.json() as { url?: string }
@@ -795,7 +806,7 @@ export default function Nodes() {
       window.location.assign(body.url)
       return
     }
-    toast('Роль мастера передана, но адрес новой панели не пришёл')
+    toast(t('nodes.transferNoUrl'))
   }
 
   const beginWait = (ids: string[], version: string) => {
@@ -832,7 +843,7 @@ export default function Nodes() {
     if (postingRef.current[n.node_id] || pending[n.node_id]) return
     postingRef.current = { ...postingRef.current, [n.node_id]: true }
     setPosting(postingRef.current)
-    void run(api.updateNode(n.node_id), 'обновление').then(async (ok) => {
+    void run(api.updateNode(n.node_id), t('nodes.updateWhat')).then(async (ok) => {
       if (ok) await pinInstalled([n.node_id])
       const next = { ...postingRef.current }
       delete next[n.node_id]
@@ -846,7 +857,7 @@ export default function Nodes() {
     const wait: PendingCommand = { id, cmd: command, at: Date.now() }
     cmdRef.current = { ...cmdRef.current, [id]: wait }
     setCmd((prev) => (prev[id] ? prev : { ...prev, [id]: wait }))
-    void run(api.nodeCmd(id, command), command === 'start' ? 'старт' : 'стоп').then((ok) => {
+    void run(api.nodeCmd(id, command), command === 'start' ? t('nodes.startWhat') : t('nodes.stopWhat')).then((ok) => {
       if (ok) return
       const next = { ...cmdRef.current }
       delete next[id]
@@ -866,11 +877,11 @@ export default function Nodes() {
       response = await api.updateAll()
     } catch (e) {
       console.error(e)
-      toast('обновление: нет связи')
+      toast(t('toast.noLink', { what: t('nodes.updateWhat') }))
       return
     }
     if (!response.ok) {
-      toast(`обновление: HTTP ${response.status}`)
+      toast(`${t('nodes.updateWhat')}: HTTP ${response.status}`)
       return
     }
     let ids: string[] = []
@@ -900,18 +911,18 @@ export default function Nodes() {
     return (
       <div className="row">
         <span className="num">{n.version || '—'}</span>
-        {phase.updating && <span>обновляется</span>}
-        {phase.silent && <span>не вернулся</span>}
-        {phase.failed && !phase.updating && <span>не установилось</span>}
-        {phase.rolledBack && <span>откат</span>}
-        {kind === 'missing' && <span>нет файла в релизе</span>}
+        {phase.updating && <span>{t('nodes.updating')}</span>}
+        {phase.silent && <span>{t('nodes.silent')}</span>}
+        {phase.failed && !phase.updating && <span>{t('nodes.failed')}</span>}
+        {phase.rolledBack && <span>{t('nodes.rolled')}</span>}
+        {kind === 'missing' && <span>{t('nodes.noAsset')}</span>}
         {(kind === 'ready' || phase.updating) && (
           <Button
             className={compact ? 'btn-compact' : undefined}
             busy={phase.updating || Boolean(posting[n.node_id])}
             onClick={() => updateOne(n)}
           >
-            Обновить
+            {t('nodes.update')}
           </Button>
         )}
       </div>
@@ -922,12 +933,12 @@ export default function Nodes() {
     const mode = transport(n.online, isPlaying(n.telemetry))
     return (
       <>
-        <Button onClick={() => setSettingsId(n.node_id)}>Настройки</Button>
+        <Button onClick={() => setSettingsId(n.node_id)}>{t('nodes.settings')}</Button>
         {mode === 'start' && (
-          <Button busy={cmd[n.node_id]?.cmd === 'start'} onClick={() => runTransport(n.node_id, 'start')}>Старт</Button>
+          <Button busy={cmd[n.node_id]?.cmd === 'start'} onClick={() => runTransport(n.node_id, 'start')}>{t('nodes.start')}</Button>
         )}
         {mode === 'stop' && (
-          <Button busy={cmd[n.node_id]?.cmd === 'stop'} onClick={() => runTransport(n.node_id, 'stop')}>Стоп</Button>
+          <Button busy={cmd[n.node_id]?.cmd === 'stop'} onClick={() => runTransport(n.node_id, 'stop')}>{t('nodes.stop')}</Button>
         )}
       </>
     )
@@ -935,16 +946,16 @@ export default function Nodes() {
 
   const marks = (n: NodeView) => (
     <>
-      {n.dup && <Badge tone="dup">Дубликат</Badge>}
-      {masterNodeId === n.node_id && <Badge tone="master">Мастер</Badge>}
+      {n.dup && <Badge tone="dup">{t('nodes.duplicate')}</Badge>}
+      {masterNodeId === n.node_id && <Badge tone="master">{t('nodes.master')}</Badge>}
     </>
   )
 
   if (movedTo) {
     return (
       <main className="page">
-        <h1>Мастер переехал</h1>
-        <p className="lede">Если переход не случился сам, откройте новую панель:</p>
+        <h1>{t('nodes.movedTitle')}</h1>
+        <p className="lede">{t('nodes.movedLead')}</p>
         <p><a href={movedTo}>{movedTo}</a></p>
       </main>
     )
@@ -957,25 +968,25 @@ export default function Nodes() {
     <main className="page">
       <div className="page-head">
         <div>
-          <h1>Узлы</h1>
-          <p className="lede">{online} из {nodes.length} в сети</p>
+          <h1>{t('nodes.title')}</h1>
+          <p className="lede">{t('nodes.online', { online, total: nodes.length })}</p>
         </div>
         <div className="toolbar">
           {showStartAll(presence) && (
-            <Button variant="primary" onClick={() => void run(fetch('/api/start-all', { method: 'POST' }), 'старт всех')}>
-              Старт всех
+            <Button variant="primary" onClick={() => void run(fetch('/api/start-all', { method: 'POST' }), t('nodes.startAllWhat'))}>
+              {t('nodes.startAll')}
             </Button>
           )}
           {showStopAll(presence) && (
-            <Button onClick={() => void run(fetch('/api/stop-all', { method: 'POST' }), 'стоп всех')}>
-              Стоп всех
+            <Button onClick={() => void run(fetch('/api/stop-all', { method: 'POST' }), t('nodes.stopAllWhat'))}>
+              {t('nodes.stopAll')}
             </Button>
           )}
-          <Button onClick={() => void updateAll()}>Обновить все</Button>
+          <Button onClick={() => void updateAll()}>{t('nodes.updateAll')}</Button>
         </div>
       </div>
 
-      {setupBlock(nodes)}
+      {setupBlock(nodes, t)}
 
       {settingsNode && (
         <SettingsPop onClose={() => setSettingsId(null)}>
@@ -995,8 +1006,8 @@ export default function Nodes() {
         {nodes.map((n) => {
           const inputs = n.roles.includes('tx') ? flowDevices(n.inputs ?? []) : []
           const outputs = n.roles.includes('rx') ? flowDevices(n.outputs ?? []) : []
-          const state = presenceWord(n)
-          const meters = meterFacts(n)
+          const state = presenceWord(n, t)
+          const meters = meterFacts(n, t)
           const flagged = Boolean(n.virtual_output || n.spotify || n.sendspin)
           return (
             <article key={`${n.node_id}@${n.ip}`} className="node-card">
@@ -1008,16 +1019,16 @@ export default function Nodes() {
                 </div>
                 <div className="node-card-link">
                   <span className="num">{n.ip || '—'}</span>
-                  <span>{linkLabel(n.link)}</span>
+                  <span>{linkLabel(n.link, t)}</span>
                 </div>
               </header>
               <div className="node-flow">
-                {inputs.length > 0 && <FlowSide kind="in" label="Входы" devices={inputs} />}
+                {inputs.length > 0 && <FlowSide kind="in" label={t('nodes.inputs')} devices={inputs} />}
                 <div className={`node-board-wrap${n.online ? ' is-on' : ''}`}>
                   <NodeBoard />
                   <p className={`node-state is-${state.tone}`}>{state.text}</p>
                 </div>
-                {outputs.length > 0 && <FlowSide kind="out" label="Выходы" devices={outputs} />}
+                {outputs.length > 0 && <FlowSide kind="out" label={t('nodes.outputs')} devices={outputs} />}
               </div>
               {flagged && (
                 <div className="node-flags">

@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { api, NodeView, ZoneView } from '../api'
+import { type Lang } from '../i18n'
+import { useI18n } from '../locale'
 import { Badge, Button, Popup, useRun, useUi } from '../ui'
 import {
   afterMapAttempt,
@@ -36,10 +38,10 @@ function zoneSources(zone: ZoneView): ZoneSource[] {
   return zone.sources ?? []
 }
 
-function sourceCaption(src: ZoneSource, byId: Map<string, NodeView>): string {
+function sourceCaption(src: ZoneSource, byId: Map<string, NodeView>, lang: Lang): string {
   const node = byId.get(src.node_id)
   const label = node ? nodeLabel(node) : src.node_id
-  return src.kind === 'line' ? label : feedChoiceLabel(label, src.kind)
+  return src.kind === 'line' ? label : feedChoiceLabel(label, src.kind, lang)
 }
 
 function feedHosts(nodes: readonly NodeView[], kind: FeedKind): NodeView[] {
@@ -102,6 +104,7 @@ function ChanSourceSelect({
   options: MappingChoice[]
   onChange: (v: ChanSel | null) => void
 }) {
+  const { t } = useI18n()
   // Карта хранит только сторону. Имя входа помним, пока несколько входов
   // делят одну сторону: иначе «ноутбук: левая» и «микрофон: левый» схлопнутся.
   const [picked, setPicked] = useState<string | null>(null)
@@ -116,8 +119,8 @@ function ChanSourceSelect({
   const shown = shownChoice(value, picked, options)
   const off = value == null
   const labelText = off
-    ? 'выключен'
-    : (options.find((o) => o.id === shown)?.label ?? (value === 'l' ? 'левый' : 'правый'))
+    ? t('chan.off')
+    : (options.find((o) => o.id === shown)?.label ?? (value === 'l' ? t('chan.left') : t('chan.right')))
 
   const setSolo = (next: boolean) => {
     openRef.current = next
@@ -218,7 +221,7 @@ function ChanSourceSelect({
             className={off ? 'on' : undefined}
             onClick={() => choose('')}
           >
-            выключен
+            {t('chan.off')}
           </button>
         </div>,
         document.body,
@@ -240,6 +243,7 @@ function ZoneCard({
 }) {
   const run = useRun()
   const { confirm, toast } = useUi()
+  const { t, lang } = useI18n()
   const [popup, setPopup] = useState<null | 'add' | 'settings' | 'channels'>(null)
   // members: локальный override (с PATCH-ответа). Пока он есть, poll его не
   // затирает — иначе полл-интервал может откатить только что отправленный тогл.
@@ -314,12 +318,12 @@ function ZoneCard({
     void (async () => {
       let ok = false
       try {
-        ok = await run(api.patchZone(zone.id, body), 'карта каналов')
+        ok = await run(api.patchZone(zone.id, body), t('zones.mapWhat'))
       } catch (e) {
         // run не ловит отказ fetch наружу: без finally флаг остался бы true
         // и колонка молчала бы до перезагрузки.
         console.error(e)
-        toast('карта каналов: нет связи')
+        toast(t('toast.noLink', { what: t('zones.mapWhat') }))
       } finally {
         mapFlight.current[key] = false
       }
@@ -379,7 +383,7 @@ function ZoneCard({
           membersRef.current = view.members
           setMembers(view.members)
         } else {
-          toast(`зона: HTTP ${r.status}`)
+          toast(`${t('zones.zoneWhat')}: HTTP ${r.status}`)
           membersRef.current = null
           setMembers(null) // откат к серверному состоянию
         }
@@ -401,7 +405,7 @@ function ZoneCard({
     .map((id) => byId.get(id)?.display_name ?? byId.get(id)?.name ?? id)
     .join(', ')
 
-  const sourceNames = sources.map((src) => sourceCaption(src, byId))
+  const sourceNames = sources.map((src) => sourceCaption(src, byId, lang))
   const manySources = sources.length > 1
   const freeRx = rxNodes.filter((n) => !effective.includes(n.node_id))
 
@@ -410,62 +414,62 @@ function ZoneCard({
       <div className="card-head">
         <div className="card-title">
           <span>{zone.name}</span>
-          {zone.active && <Badge tone="play">играет</Badge>}
-          {zone.silenced && <Badge tone="quiet">тишина</Badge>}
+          {zone.active && <Badge tone="play">{t('zones.playing')}</Badge>}
+          {zone.silenced && <Badge tone="quiet">{t('zones.silence')}</Badge>}
           {zone.stolen.length > 0 && (
-            <Badge tone="steal" title={`Угнаны: ${stolenTitle}`}>
-              угнано: {zone.stolen.length}
+            <Badge tone="steal" title={t('zones.stolenTitle', { names: stolenTitle })}>
+              {t('zones.stolen', { n: zone.stolen.length })}
             </Badge>
           )}
         </div>
         <div className="card-actions">
           {zone.active ? (
-            <Button onClick={() => void run(api.zoneCmd(zone.id, 'stop'), 'стоп зоны')}>Стоп</Button>
+            <Button onClick={() => void run(api.zoneCmd(zone.id, 'stop'), t('zones.stopWhat'))}>{t('zones.stop')}</Button>
           ) : (
-            <Button variant="primary" onClick={() => void run(api.zoneCmd(zone.id, 'start'), 'пуск зоны')}>Пуск</Button>
+            <Button variant="primary" onClick={() => void run(api.zoneCmd(zone.id, 'start'), t('zones.startWhat'))}>{t('zones.start')}</Button>
           )}
           <Button
             variant="danger"
             onClick={() => {
               void (async () => {
                 const ok = await confirm({
-                  title: 'Удалить зону',
-                  body: `Зона «${zone.name}» исчезнет вместе с её колонками и картой.`,
-                  confirmLabel: 'Удалить',
+                  title: t('zones.deleteTitle'),
+                  body: t('zones.deleteBody', { name: zone.name }),
+                  confirmLabel: t('zones.delete'),
                   danger: true,
                 })
-                if (ok) void run(api.deleteZone(zone.id), 'удаление зоны')
+                if (ok) void run(api.deleteZone(zone.id), t('zones.deleteWhat'))
               })()
             }}
           >
-            Удалить
+            {t('zones.delete')}
           </Button>
         </div>
       </div>
-      <div className="lede">Источники: {sourceNames.join(', ')}</div>
-      <div className="lede">запас {zone.jb_ms} мс</div>
-      <div className="lede">Колонки</div>
-      {effective.length === 0 && <p className="lede">В зоне пока нет колонок.</p>}
+      <div className="lede">{t('zones.sources', { list: sourceNames.join(', ') })}</div>
+      <div className="lede">{t('zones.reserve', { ms: zone.jb_ms })}</div>
+      <div className="lede">{t('zones.speakers')}</div>
+      {effective.length === 0 && <p className="lede">{t('zones.noSpeakers')}</p>}
       {effective.map((id) => {
         const n = byId.get(id)
         return (
           <div key={id} className="member-row">
             <span>{n ? nodeLabel(n) : id}</span>
             <Button className="btn-compact" disabled={membersPending} onClick={() => toggleMember(id, false)}>
-              Убрать
+              {t('zones.remove')}
             </Button>
           </div>
         )
       })}
       <div className="card-actions" style={{ marginTop: '0.75rem' }}>
-        <Button onClick={() => setPopup('add')}>Добавить колонку</Button>
-        <Button onClick={() => setPopup('settings')}>Настройки</Button>
-        <Button onClick={() => setPopup('channels')}>Каналы</Button>
+        <Button onClick={() => setPopup('add')}>{t('zones.addSpeaker')}</Button>
+        <Button onClick={() => setPopup('settings')}>{t('zones.settings')}</Button>
+        <Button onClick={() => setPopup('channels')}>{t('zones.channels')}</Button>
       </div>
       {popup === 'add' && (
-        <Popup title="Добавить колонку" onClose={() => setPopup(null)}>
+        <Popup title={t('zones.addSpeaker')} onClose={() => setPopup(null)}>
           {freeRx.length === 0 ? (
-            <p>Свободных приёмников нет.</p>
+            <p>{t('zones.noFreeRx')}</p>
           ) : (
             freeRx.map((n) => (
               <Button
@@ -491,24 +495,24 @@ function ZoneCard({
         />
       )}
       {popup === 'channels' && (
-        <Popup title="Каналы" wide onClose={() => setPopup(null)}>
-          <p>{channelMapLead(sources)}</p>
-          {effective.length === 0 && <p>Сначала добавьте колонку.</p>}
+        <Popup title={t('zones.channels')} wide onClose={() => setPopup(null)}>
+          <p>{channelMapLead(sources, lang)}</p>
+          {effective.length === 0 && <p>{t('zones.addSpeakerFirst')}</p>}
           {effective.map((id) => {
             const n = byId.get(id)
             const label = n ? nodeLabel(n) : id
-            const rows = speakerOutputRows(n?.outputs ?? [])
+            const rows = speakerOutputRows(n?.outputs ?? [], lang)
             const silentOut = (n?.outputs ?? []).filter((o) => o.enabled && o.stream == null)
             return (
               <section key={id} className="chan-speaker">
-                <h3>{label} <span>колонка</span></h3>
-                {rows.length === 0 && <p className="hint">У колонки нет включённых выходов в стереопотоке.</p>}
+                <h3>{label} <span>{t('zones.speakerRole')}</span></h3>
+                {rows.length === 0 && <p className="hint">{t('zones.noStereoOut')}</p>}
                 {sources.map((source, sourceIndex) => {
                   const src = byId.get(source.node_id)
-                  const srcName = sourceCaption(source, byId)
+                  const srcName = sourceCaption(source, byId, lang)
                   const srcOptions = source.kind === 'line'
-                    ? mappingChoices(src?.inputs ?? [])
-                    : feedMappingChoices(source.kind)
+                    ? mappingChoices(src?.inputs ?? [], lang)
+                    : feedMappingChoices(source.kind, lang)
                   const mapKey = sourceMapKey(source)
                   const sourceKey = manySources ? mapKey : null
                   const map = mapOverrides[mapStorageKey(id, sourceKey)]
@@ -519,8 +523,8 @@ function ZoneCard({
                       <div className="chan-source-name">{srcName}</div>
                       {sourceIndex === 0 && rows.length > 0 && (
                         <div className="chan-heads">
-                          <span>Источник</span>
-                          <span>Играет</span>
+                          <span>{t('zones.sourceHead')}</span>
+                          <span>{t('zones.playsHead')}</span>
                         </div>
                       )}
                       {rows.map((row) => {
@@ -528,14 +532,14 @@ function ZoneCard({
                         return (
                           <div key={`${mapKey}-${row.id}`} className={value == null ? 'chan-route off' : 'chan-route'}>
                             <ChanSourceSelect
-                              label={`Источник для ${row.label}, ${label}, ${srcName}`}
+                              label={t('zones.sourceFor', { output: row.label, speaker: label, source: srcName })}
                               options={srcOptions}
                               value={value}
                               onChange={(v) => patchMap(id, sourceKey, row.side, v)}
                             />
                             <div className="chan-arrow" aria-hidden="true">→</div>
                             <div className="chan-play">
-                              <span className="chan-mark">{row.side === 'out_l' ? 'Л' : 'П'}</span>
+                              <span className="chan-mark">{row.side === 'out_l' ? t('chan.leftMark') : t('chan.rightMark')}</span>
                               <b>{row.label}</b>
                             </div>
                           </div>
@@ -543,14 +547,14 @@ function ZoneCard({
                       })}
                       {rows.length >= 2 && (
                         <button type="button" className="chan-swap" onClick={() => swapSides(id, sourceKey)}>
-                          Поменять стороны
+                          {t('zones.swap')}
                         </button>
                       )}
                     </div>
                   )
                 })}
                 {silentOut.length > 0 && (
-                  <p className="hint">В стереопоток не входят: {silentOut.map((o) => o.name).join(', ')}.</p>
+                  <p className="hint">{t('zones.notInStereo', { list: silentOut.map((o) => o.name).join(', ') })}</p>
                 )}
               </section>
             )
@@ -558,13 +562,13 @@ function ZoneCard({
           {sources.map((source) => {
             if (source.kind !== 'line') return null
             const src = byId.get(source.node_id)
-            const listed = new Set(mappingChoices(src?.inputs ?? []).map((c) => c.id))
+            const listed = new Set(mappingChoices(src?.inputs ?? [], lang).map((c) => c.id))
             const idle = (src?.inputs ?? []).filter((i) => i.enabled && i.stream == null && !listed.has(i.id))
             if (idle.length === 0) return null
-            const prefix = manySources ? `${sourceCaption(source, byId)}: ` : ''
+            const prefix = manySources ? `${sourceCaption(source, byId, lang)}: ` : ''
             return (
               <p key={sourceMapKey(source)} className="hint">
-                {prefix}В стереопоток не входят: {idle.map((i) => i.name).join(', ')}.
+                {prefix}{t('zones.notInStereo', { list: idle.map((i) => i.name).join(', ') })}
               </p>
             )
           })}
@@ -585,6 +589,7 @@ function ZoneSettings({
 }) {
   const run = useRun()
   const { toast } = useUi()
+  const { t, lang } = useI18n()
   const [name, setName] = useState(zone.name)
   const [picked, setPicked] = useState(zoneSources(zone))
   const lineOn = (id: string) => picked.some((s) => s.kind === 'line' && s.node_id === id)
@@ -611,24 +616,24 @@ function ZoneSettings({
     const min = Number(minutes)
     const threshold = Number(db)
     if (!trimmed) {
-      toast('Название зоны пустое')
+      toast(t('zones.nameEmpty'))
       return
     }
     if (!Number.isInteger(min) || min < 0) {
-      toast('Таймаут тишины — целое число минут, 0 выключает')
+      toast(t('zones.timeoutBad'))
       return
     }
     if (!Number.isFinite(threshold)) {
-      toast('Порог — число в дБ')
+      toast(t('zones.thresholdBad'))
       return
     }
     const jb = Number(jbMs)
     if (jbMs.trim() === '' || !Number.isInteger(jb) || jb < 1 || jb > 500) {
-      toast('Запас сети — целое число от 1 до 500')
+      toast(t('zones.reserveBad'))
       return
     }
     if (picked.length === 0) {
-      toast('Выберите хотя бы один источник')
+      toast(t('zones.needSource'))
       return
     }
     void run(api.patchZone(zone.id, {
@@ -637,34 +642,34 @@ function ZoneSettings({
       silence_timeout_s: min * 60,
       silence_threshold_db: threshold,
       jb_ms: jb,
-    }), 'настройки зоны').then((ok) => {
+    }), t('zones.settingsWhat')).then((ok) => {
       if (ok) onClose()
     })
   }
 
   return (
     <Popup
-      title="Настройки зоны"
+      title={t('zones.settingsTitle')}
       onClose={onClose}
       footer={(
         <div className="row">
-          <Button onClick={onClose}>Отмена</Button>
-          <Button variant="primary" onClick={save}>Сохранить</Button>
+          <Button onClick={onClose}>{t('common.cancel')}</Button>
+          <Button variant="primary" onClick={save}>{t('common.save')}</Button>
         </div>
       )}
     >
       <div className="stack">
         <label className="inline">
-          Название
-          <input className="field" aria-label="Название зоны" value={name} onChange={(e) => setName(e.target.value)} />
+          {t('zones.name')}
+          <input className="field" aria-label={t('zones.nameAria')} value={name} onChange={(e) => setName(e.target.value)} />
         </label>
         <div>
-          <div className="lede">Источники</div>
+          <div className="lede">{t('zones.sourcesLabel')}</div>
           {txNodes.map((n) => (
             <label key={`${n.node_id}@${n.ip}`} className="source-row">
               <input
                 type="checkbox"
-                aria-label={`Источник ${nodeLabel(n)}`}
+                aria-label={t('zones.sourceAria', { name: nodeLabel(n) })}
                 checked={lineOn(n.node_id)}
                 onChange={() => toggleLine(n.node_id)}
               />
@@ -677,11 +682,11 @@ function ZoneSettings({
               <label key={s.node_id} className="source-row">
                 <input
                   type="checkbox"
-                  aria-label={`Источник ${s.node_id}`}
+                  aria-label={t('zones.sourceAria', { name: s.node_id })}
                   checked
                   onChange={() => toggleLine(s.node_id)}
                 />
-                <span>{s.node_id} (нет в реестре)</span>
+                <span>{t('zones.notInRegistry', { name: s.node_id })}</span>
               </label>
             ))}
           {FEED_KINDS.map((kind) => {
@@ -691,7 +696,7 @@ function ZoneSettings({
             return (
               <div key={kind}>
                 {hosts.map((n) => {
-                  const label = feedChoiceLabel(nodeLabel(n), kind)
+                  const label = feedChoiceLabel(nodeLabel(n), kind, lang)
                   return (
                     <label key={`${kind}:${n.node_id}`} className="source-row">
                       <input
@@ -709,35 +714,35 @@ function ZoneSettings({
           })}
         </div>
         <label className="inline">
-          Тишина, мин
+          {t('zones.silenceMin')}
           <input
             className="field"
             type="number"
             min={0}
-            aria-label="Таймаут тишины, минуты"
+            aria-label={t('zones.silenceAria')}
             value={minutes}
             onChange={(e) => setMinutes(e.target.value)}
           />
         </label>
         <label className="inline">
-          Порог, дБ
+          {t('zones.threshold')}
           <input
             className="field"
             type="number"
-            aria-label="Порог тишины, дБ"
+            aria-label={t('zones.thresholdAria')}
             value={db}
             onChange={(e) => setDb(e.target.value)}
           />
         </label>
         <label className="inline">
-          Запас сети, мс
+          {t('zones.reserveLabel')}
           <input
             className="field"
             type="number"
             min={1}
             max={500}
             step={1}
-            aria-label="Запас сети, мс"
+            aria-label={t('zones.reserveAria')}
             value={jbMs}
             onChange={(e) => setJbMs(e.target.value)}
           />
@@ -750,6 +755,7 @@ function ZoneSettings({
 export default function Zones() {
   const run = useRun()
   const { toast } = useUi()
+  const { t } = useI18n()
   const [zones, setZones] = useState<ZoneView[]>([])
   const [nodes, setNodes] = useState<NodeView[]>([])
 
@@ -776,16 +782,16 @@ export default function Zones() {
   const addZone = () => {
     const firstTx = txNodes[0]
     if (!firstTx) {
-      toast('Нет передатчиков в сети — нечего назначить источником')
+      toast(t('zones.noTx'))
       return
     }
     void run(
       api.createZone({
-        name: 'Новая зона',
+        name: t('zones.new'),
         sources: [{ kind: 'line', node_id: firstTx.node_id }],
         members: [],
       }),
-      'создание зоны',
+      t('zones.createWhat'),
     )
   }
 
@@ -793,13 +799,13 @@ export default function Zones() {
     <main className="page">
       <div className="page-head">
         <div>
-          <h1>Зоны</h1>
-          <p className="lede">Колонки зоны, источники и карта каналов — в отдельных окнах.</p>
+          <h1>{t('zones.title')}</h1>
+          <p className="lede">{t('zones.lead')}</p>
         </div>
-        <Button variant="primary" onClick={addZone}>Новая зона</Button>
+        <Button variant="primary" onClick={addZone}>{t('zones.new')}</Button>
       </div>
       {zones.length === 0 ? (
-        <p className="empty">Создайте зону и добавьте в неё колонки.</p>
+        <p className="empty">{t('zones.empty')}</p>
       ) : (
         <div className="cards">
           {zones.map((z) => (

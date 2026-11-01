@@ -8,6 +8,7 @@ import {
   type ButtonHTMLAttributes,
   type ReactNode,
 } from 'react'
+import { useI18n } from './locale'
 
 type ConfirmOpts = {
   title: string
@@ -37,6 +38,7 @@ export function useUi(): UiApi {
 /// POST/PATCH с тостом вместо alert. true — ответ 2xx.
 export function useRun() {
   const { toast } = useUi()
+  const { t } = useI18n()
   return useCallback(async (p: Promise<Response>, what: string) => {
     try {
       const r = await p
@@ -47,13 +49,14 @@ export function useRun() {
       return true
     } catch (e) {
       console.error(e)
-      toast(`${what}: нет связи`)
+      toast(t('toast.noLink', { what }))
       return false
     }
-  }, [toast])
+  }, [toast, t])
 }
 
 export function UiProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n()
   const [dialog, setDialog] = useState<DialogState | null>(null)
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const seq = useRef(0)
@@ -109,7 +112,7 @@ export function UiProvider({ children }: { children: ReactNode }) {
             <p>{dialog.body}</p>
             <div className="row">
               <button type="button" className="btn btn-ghost" onClick={() => close(false)}>
-                {dialog.cancelLabel ?? 'Отмена'}
+                {dialog.cancelLabel ?? t('dialog.cancel')}
               </button>
               <button
                 type="button"
@@ -117,7 +120,7 @@ export function UiProvider({ children }: { children: ReactNode }) {
                 autoFocus
                 onClick={() => close(true)}
               >
-                {dialog.confirmLabel ?? 'Да'}
+                {dialog.confirmLabel ?? t('dialog.yes')}
               </button>
             </div>
           </div>

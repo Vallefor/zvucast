@@ -81,11 +81,12 @@ test('окно каналов одной фразой читается слев�
   const feed = [{ kind: 'spotify' as const, node_id: 'pc' }]
   const line = [{ kind: 'line' as const, node_id: 'pc' }]
   const both = [...line, ...feed]
-  const lead = 'Слева — откуда звук. Справа — выход, который его играет.'
-  assert.equal(channelMapLead(feed), lead)
-  assert.equal(channelMapLead(line), lead)
-  assert.equal(channelMapLead(both), lead)
-  assert.equal(channelMapLead([]), lead)
+  const en = 'Sound comes from the left. The output that plays it is on the right.'
+  const ru = 'Слева — откуда звук. Справа — выход, который его играет.'
+  for (const list of [feed, line, both, [] as typeof feed]) {
+    assert.equal(channelMapLead(list), en)
+    assert.equal(channelMapLead(list, 'ru'), ru)
+  }
 })
 
 test('поменять стороны меняет оба выхода одним объектом', () => {
@@ -95,9 +96,12 @@ test('поменять стороны меняет оба выхода одни�
 })
 
 test('подписи вида короткие, выбор хозяина с именем узла', () => {
-  assert.equal(feedChannelLabel('spotify', 'l'), 'Spotify (левый)')
-  assert.equal(feedChannelLabel('virtual', 'r'), 'Виртуальная колонка (правый)')
+  assert.equal(feedChannelLabel('spotify', 'l'), 'Spotify (left)')
+  assert.equal(feedChannelLabel('spotify', 'l', 'ru'), 'Spotify (левый)')
+  assert.equal(feedChannelLabel('virtual', 'r'), 'Virtual speaker (right)')
+  assert.equal(feedChannelLabel('virtual', 'r', 'ru'), 'Виртуальная колонка (правый)')
   assert.equal(feedChoiceLabel('pi4-tx', 'sendspin'), 'Sendspin — pi4-tx')
+  assert.equal(feedChoiceLabel('pi4-tx', 'virtual', 'ru'), 'Виртуальная колонка — pi4-tx')
   assert.equal(sourceMapKey({ kind: 'line', node_id: 'pi4-tx' }), 'pi4-tx')
   assert.equal(sourceMapKey({ kind: 'spotify', node_id: 'pc' }), 'spotify:pc')
   const next = selectFeed(
@@ -124,4 +128,6 @@ test('два левых выхода остаются двумя строкам�
   assert.deepEqual(rows.map((r) => r.side), ['out_l', 'out_l', 'out_r', 'out_r'])
   assert.deepEqual(rows.map((r) => r.label), ['jack л', 'цап л', 'jack п', 'цап п'])
   assert.deepEqual(speakerOutputRows([]).map((r) => r.id), ['default-l', 'default-r'])
+  assert.deepEqual(speakerOutputRows([]).map((r) => r.label), ['Left output', 'Right output'])
+  assert.deepEqual(speakerOutputRows([], 'ru').map((r) => r.label), ['Левый выход', 'Правый выход'])
 })

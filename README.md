@@ -13,7 +13,7 @@ Each of those is its own stream. The speakers mix the ones you link to the zone.
 
 Audio is 48 kHz stereo PCM. The machines keep a shared clock, so speakers in one zone stay together.
 
-The panel text is Russian. The names used below are translated next to the buttons you will see.
+The panel opens in English. **EN** and **RU** in the header switch the language. The choice stays in the browser.
 
 ## Install
 
@@ -34,7 +34,7 @@ The script asks four things. Press Enter to accept the default in brackets.
 
 `yes` and `no` work as well. `да` and `нет` still work.
 
-Pick **one** controller. That machine serves the panel. The others find it on the LAN. To move the panel later, use **Сделать мастером** on the Nodes page. A PCM5102 answer belongs on a Raspberry Pi that has that board. A PC and an Orange Pi stay on `1`.
+Pick **one** controller. That machine serves the panel. The others find it on the LAN. To move the panel later, use **Make master** on the Nodes page. A PCM5102 answer belongs on a Raspberry Pi that has that board. A PC and an Orange Pi stay on `1`.
 
 The same choices can be given without a terminal. Set both flags together. `ZVUCAST_DAC` is optional and defaults to none.
 
@@ -105,40 +105,40 @@ The controller listens on `0.0.0.0:8080`. `/` opens the Nodes page. The two page
 
 | Path | Panel | What it is |
 |---|---|---|
-| `/nodes` | Узлы | The machines: capture, playback, Spotify, Sendspin, the virtual output, and updates. |
-| `/zones` | Зоны | Speaker groups, their sources, and the channel map. |
+| `/nodes` | Nodes | The machines: capture, playback, Spotify, Sendspin, the virtual output, and updates. |
+| `/zones` | Zones | Speaker groups, their sources, and the channel map. |
 
 Other nodes find this address by themselves. You do not point them at it.
 
 ### Nodes
 
-The page lists every node the controller knows, and how many are online. **Настройки** opens that machine.
+The page lists every node the controller knows, and how many are online. **Settings** opens that machine.
 
-- **Имя** is the name shown in the panel. The hostname stays underneath.
-- **Входы** are capture channels. Enable the line input, microphone, or USB input that this board should send.
-- **Выходы** are playback channels. Enable the DAC, USB card, or other output that should speak for a zone.
-- **Громкость** sets capture level (**Захват**) and playback level (**Воспроизведение**). A device can also have its own level.
-- **Виртуальная колонка** creates the virtual output. Add it to a zone before an application can play to `Zvucast: <zone>`.
-- **Spotify** starts Soloist on this machine while the box is checked. **Ключ Spotify** is the key. Soloist has to be installed.
+- **Name** is the name shown in the panel. The hostname stays underneath.
+- **Inputs** are capture channels. Enable the line input, microphone, or USB input that this board should send.
+- **Outputs** are playback channels. Enable the DAC, USB card, or other output that should speak for a zone.
+- **Volume** sets capture level (**Capture**) and playback level (**Playback**). A device can also have its own level.
+- **Virtual speaker** creates the virtual output. Add it to a zone before an application can play to `Zvucast: <zone>`.
+- **Spotify** starts Soloist on this machine while the box is checked. **Spotify key** is the key. Soloist has to be installed.
 - **Sendspin** announces this machine to Sendspin servers while the box is checked.
-- **Сделать мастером** moves the panel to this machine and stops the controller on the old one. The page shows the new address if the browser does not follow.
-- **Старт** and **Стоп** start and stop this node. **Старт всех** and **Стоп всех** do that for every node.
-- **Обновить** installs the latest release on this machine. **Обновить все** does it for every machine. The page checks GitHub Releases while it is open. Nodes do not upgrade themselves in the background.
+- **Make master** moves the panel to this machine and stops the controller on the old one. The page shows the new address if the browser does not follow.
+- **Start** and **Stop** start and stop this node. **Start all** and **Stop all** do that for every node.
+- **Update** installs the latest release on this machine. **Update all** does it for every machine. The page checks GitHub Releases while it is open. Nodes do not upgrade themselves in the background.
 
 Clearing the virtual output, Spotify, or Sendspin on a node removes that source from every zone.
 
-**Системе не хватает** appears when an online machine is missing something the installer normally provides, such as a running PipeWire session or Soloist while Spotify is enabled. Each row includes a command.
+**The system is missing** appears when an online machine is missing something the installer normally provides, such as a running PipeWire session or Soloist while Spotify is enabled. Each row includes a command.
 
 ### Zones
 
-**Новая зона** creates a zone. The first capture node on the LAN is its first source. You can change that.
+**New zone** creates a zone. The first capture node on the LAN is its first source. You can change that.
 
-- **Добавить колонку** adds a speaker. **Убрать** removes one. A speaker is any node with playback.
-- **Настройки** names the zone and chooses sources: line inputs, and the virtual output, Spotify, or Sendspin of a node where that feature is turned on. It also sets how long silence must last (**Тишина, мин**; `0` keeps the speakers up), the level that still counts as silence (**Порог, дБ**), and how much audio to keep ahead of the network (**Запас сети, мс**, from 1 to 500).
-- **Каналы** maps each source onto the left and right of a speaker. **Поменять стороны** swaps them.
-- **Пуск** and **Стоп** start and stop the zone. **Удалить** deletes it, including its speakers and channel map.
+- **Add speaker** adds a speaker. **Remove** removes one. A speaker is any node with playback.
+- **Settings** names the zone and chooses sources: line inputs, and the virtual output, Spotify, or Sendspin of a node where that feature is turned on. It also sets how long silence must last (**Silence, min**; `0` keeps the speakers up), the level that still counts as silence (**Threshold, dB**), and how much audio to keep ahead of the network (**Network reserve, ms**, from 1 to 500).
+- **Channels** maps each source onto the left and right of a speaker. **Swap sides** swaps them.
+- **Start** and **Stop** start and stop the zone. **Delete** deletes it, including its speakers and channel map.
 
-**играет** means the zone is playing. **тишина** means it has gone quiet and the speakers have dropped.
+**playing** means the zone is playing. **silence** means it has gone quiet and the speakers have dropped.
 
 The virtual device, the Spotify device, and the Sendspin speaker for a zone exist while that source is linked. Their names use the zone name.
 

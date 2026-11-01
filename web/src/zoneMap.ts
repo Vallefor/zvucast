@@ -2,6 +2,8 @@
 // сторона берётся из уже выбранного (ещё не догнанного поллом) значения,
 // а не из последнего ответа сервера.
 
+import { translate, type Lang } from './i18n.ts'
+
 export type ChanSel = 'l' | 'r'
 
 /// Канал входа, как его отдаёт список узлов. Карта зоны выбирает сторону
@@ -27,11 +29,11 @@ export function isZoneCableKey(key: string): boolean {
 /// Что можно выбрать источником выхода колонки.
 /// Пустой список входов — два имени по умолчанию, пока агент их не прислал.
 /// У кабеля подпись с именем устройства: иначе все «Левый» неразличимы.
-export function mappingChoices(inputs: readonly MappingInput[]): MappingChoice[] {
+export function mappingChoices(inputs: readonly MappingInput[], lang: Lang = 'en'): MappingChoice[] {
   if (inputs.length === 0) {
     return [
-      { id: 'default-l', side: 'l', label: 'Левый' },
-      { id: 'default-r', side: 'r', label: 'Правый' },
+      { id: 'default-l', side: 'l', label: translate(lang, 'map.left') },
+      { id: 'default-r', side: 'r', label: translate(lang, 'map.right') },
     ]
   }
   const choices: MappingChoice[] = []
@@ -70,11 +72,11 @@ export type SpeakerOutputRow = {
 /// Включённые выходы со слотом `l` или `r`. Пустой список — две строки
 /// по умолчанию, пока агент их не прислал. Id канала остаётся своим, чтобы
 /// две строки одной стороны не схлопнулись в одну.
-export function speakerOutputRows(outputs: readonly SpeakerOutput[]): SpeakerOutputRow[] {
+export function speakerOutputRows(outputs: readonly SpeakerOutput[], lang: Lang = 'en'): SpeakerOutputRow[] {
   if (outputs.length === 0) {
     return [
-      { id: 'default-l', side: 'out_l', label: 'Левый выход' },
-      { id: 'default-r', side: 'out_r', label: 'Правый выход' },
+      { id: 'default-l', side: 'out_l', label: translate(lang, 'map.leftOut') },
+      { id: 'default-r', side: 'out_r', label: translate(lang, 'map.rightOut') },
     ]
   }
   const rows: SpeakerOutputRow[] = []
@@ -173,32 +175,32 @@ export type ZoneSource = {
   node_id: string
 }
 
-export function feedTitle(kind: FeedKind): string {
+export function feedTitle(kind: FeedKind, lang: Lang = 'en'): string {
   switch (kind) {
     case 'spotify':
       return 'Spotify'
     case 'sendspin':
       return 'Sendspin'
     case 'virtual':
-      return 'Виртуальная колонка'
+      return translate(lang, 'feed.virtual')
   }
 }
 
-export function feedChannelLabel(kind: FeedKind, side: 'l' | 'r'): string {
-  const sideName = side === 'l' ? 'левый' : 'правый'
-  return `${feedTitle(kind)} (${sideName})`
+export function feedChannelLabel(kind: FeedKind, side: 'l' | 'r', lang: Lang = 'en'): string {
+  const sideName = translate(lang, side === 'l' ? 'chan.left' : 'chan.right')
+  return translate(lang, 'feed.side', { title: feedTitle(kind, lang), side: sideName })
 }
 
-export function feedChoiceLabel(nodeLabel: string, kind: FeedKind): string {
-  return `${feedTitle(kind)} — ${nodeLabel}`
+export function feedChoiceLabel(nodeLabel: string, kind: FeedKind, lang: Lang = 'en'): string {
+  return `${feedTitle(kind, lang)} — ${nodeLabel}`
 }
 
 /// В «Каналах» у вида только две стороны, не входы узла.
-export function feedMappingChoices(kind: FeedKind): MappingChoice[] {
+export function feedMappingChoices(kind: FeedKind, lang: Lang = 'en'): MappingChoice[] {
   return (['l', 'r'] as const).map((side) => ({
     id: `${kind}-${side}`,
     side,
-    label: feedChannelLabel(kind, side),
+    label: feedChannelLabel(kind, side, lang),
   }))
 }
 
@@ -233,7 +235,7 @@ export function sourceMapKey(source: ZoneSource): string {
 
 /// Подпись окна «Каналы». Окно уже открыто на одну зону, поэтому линия,
 /// вид и пустой список читаются одной фразой.
-export function channelMapLead(sources: readonly ZoneSource[]): string {
+export function channelMapLead(sources: readonly ZoneSource[], lang: Lang = 'en'): string {
   void sources
-  return 'Слева — откуда звук. Справа — выход, который его играет.'
+  return translate(lang, 'map.lead')
 }
