@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 pub const RESUME_AFTER: Duration = Duration::from_secs(2);
 /// Телеметрия старше этого — как будто её нет.
 pub const TELEM_STALE: Duration = Duration::from_secs(10);
+/// Сколько тишины подряд гасит усилитель.
+pub const AMP_RELEASE: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sample {
@@ -25,6 +27,41 @@ pub fn classify(age: Duration, playing: bool, rms_l: f64, rms_r: f64, threshold_
         Sample::Loud
     } else {
         Sample::Quiet
+    }
+}
+
+/// Музыка на источнике: любой конечный канал не тише порога.
+/// «Старт» сюда не входит. Оба канала ровно 0.0 — замера ещё нет.
+/// Просроченная телеметрия — музыки нет.
+pub fn source_has_music(age: Duration, rms_l: f64, rms_r: f64, threshold_db: f64) -> bool {
+    if age > TELEM_STALE || (rms_l == 0.0 && rms_r == 0.0) {
+        return false;
+    }
+    let loud = |v: f64| v.is_finite() && v >= threshold_db;
+    loud(rms_l) || loud(rms_r)
+}
+
+/// Усилитель колонки. Включается сразу, как только на источнике есть музыка,
+/// и гаснет после `AMP_RELEASE` тишины.
+#[derive(Debug, Clone, Default)]
+pub struct AmpFollow {
+    on: bool,
+    quiet_since: Option<Instant>,
+}
+
+impl AmpFollow {
+    pub fn step(&mut self, now: Instant, music: bool) -> bool {
+        if music {
+            self.quiet_since = None;
+            self.on = true;
+        } else if self.on {
+            let since = *self.quiet_since.get_or_insert(now);
+            if now.duration_since(since) >= AMP_RELEASE {
+                self.on = false;
+                self.quiet_since = None;
+            }
+        }
+        self.on
     }
 }
 
@@ -163,6 +200,33 @@ mod tests {
         assert_eq!(classify(stale, true, -90.0, -90.0, -60.0), Sample::NoData);
         assert_eq!(classify(fresh, true, 0.0, -90.0, -60.0), Sample::Loud);
         assert_eq!(classify(fresh, true, 0.0, 0.0, -60.0), Sample::NoData);
+    }
+
+    #[test]
+    fn source_music_is_any_channel_without_start() {
+        let fresh = Duration::from_secs(1);
+        let stale = Duration::from_secs(11);
+        assert!(source_has_music(fresh, -20.0, -90.0, -60.0));
+        assert!(source_has_music(fresh, -90.0, -20.0, -60.0));
+        assert!(source_has_music(fresh, -60.0, -90.0, -60.0));
+        assert!(!source_has_music(fresh, -90.0, -90.0, -60.0));
+        assert!(!source_has_music(fresh, 0.0, 0.0, -60.0));
+        assert!(!source_has_music(stale, -10.0, -10.0, -60.0));
+        assert!(!source_has_music(fresh, f64::NAN, -90.0, -60.0));
+    }
+
+    #[test]
+    fn amp_follows_music_and_ignores_a_short_gap() {
+        let mut gate = AmpFollow::default();
+        let t0 = Instant::now();
+        assert!(!gate.step(t0, false));
+        assert!(gate.step(t0, true));
+        assert!(gate.step(t0 + Duration::from_secs(1), false));
+        assert!(
+            !gate.step(t0 + Duration::from_secs(1) + AMP_RELEASE, false),
+            "тишина дольше отпуска гасит выход"
+        );
+        assert!(gate.step(t0 + Duration::from_secs(10), true));
     }
 
     #[test]

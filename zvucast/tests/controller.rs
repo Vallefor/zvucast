@@ -262,8 +262,12 @@ impl MockAgent {
     }
 
     async fn send_tx_rms(&mut self, rms_l: f64, rms_r: f64) {
+        self.send_tx_state(PipelineState::Playing, rms_l, rms_r).await;
+    }
+
+    async fn send_tx_state(&mut self, state: PipelineState, rms_l: f64, rms_r: f64) {
         let t = AgentMsg::Telemetry(Telemetry {
-            tx: Some(RoleTx { state: PipelineState::Playing, rms_l, rms_r }),
+            tx: Some(RoleTx { state, rms_l, rms_r }),
             rx: None,
             ptp_offset_ns: 0,
             uptime_s: 3,
@@ -3430,4 +3434,61 @@ async fn amp_gpio_reaches_only_a_node_that_plays() {
         }
     }
     assert!(seen, "hello не принёс линию усилителя");
+}
+
+/// Усилитель колонки смотрит на музыку источника, не на «Старт».
+/// Громкий правый канал при остановленном пайплайне включает выход.
+/// Тишина короче 5 минут его не гасит.
+#[tokio::test]
+async fn amp_follows_source_music_on_any_channel() {
+    let path = temp_state_path("amp-music");
+    let state = AppState::with_state(&path);
+    spawn_endpoint_pusher(state.clone());
+    let port = serve(state).await;
+
+    let mut mic = MockAgent::connect_as(port, "mic", Role::Tx).await;
+    let mut spk = MockAgent::connect(port, "spk").await;
+    wait_node(port, "mic").await;
+    wait_node(port, "spk").await;
+
+    let (status, zone) = create_zone(port, r#"{"name":"Зал","tx":"mic","members":["spk"]}"#).await;
+    assert_eq!(status, 200, "{zone}");
+    let id = zone["id"].as_str().unwrap();
+    let (status, _) = http(port, "POST", &format!("/api/zones/{id}/start")).await;
+    assert_eq!(status, 200);
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":17}"#).await;
+    assert_eq!(status, 200, "{body}");
+
+    mic.send_tx_state(PipelineState::Stopped, -90.0, -20.0).await;
+    assert!(
+        wait_amp_drive(&mut spk, true, 4).await,
+        "музыка в правом канале без старта не включила усилитель"
+    );
+
+    mic.send_tx_state(PipelineState::Playing, -90.0, -90.0).await;
+    let quiet = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < quiet {
+        let left = quiet.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, spk.recv_ctl()).await {
+            Ok(CtlMsg::SetAmpDrive { on: false }) => {
+                panic!("тишина короче 5 минут погасила усилитель")
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    drop(mic);
+}
+
+async fn wait_amp_drive(agent: &mut MockAgent, want: bool, secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, agent.recv_ctl()).await {
+            Ok(CtlMsg::SetAmpDrive { on }) if on == want => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
+    false
 }

@@ -1510,6 +1510,10 @@ fn gst_domain(
     };
     let mut next_vol = std::time::Instant::now();
     let mut amp = crate::amp::Amp::new();
+    // None — контроллер ещё не сказал, есть ли музыка. Тогда выход
+    // повторяет старое правило «приём играет», чтобы старый мастер
+    // не оставлял колонку без усилителя.
+    let mut amp_drive: Option<bool> = None;
 
     loop {
         // Sup-события дрейним ДО команд: Stop в командной фазе того же тика
@@ -1849,6 +1853,13 @@ fn gst_domain(
                     }
                 }
             }
+            Ok(CtlMsg::SetAmpDrive { on }) => {
+                if rx_half.is_none() {
+                    tracing::debug!("SetAmpDrive: нет rx — игнорируем");
+                } else {
+                    amp_drive = Some(on);
+                }
+            }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -2068,7 +2079,8 @@ fn gst_domain(
                     .unwrap_or_default(),
             });
         }
-        amp.apply(rx_playing(&rx_half));
+        let amp_on = amp_drive.unwrap_or_else(|| rx_playing(&rx_half));
+        amp.apply(amp_on);
     }
 
     if let Some(h) = &tx_half {
@@ -2085,8 +2097,8 @@ fn gst_domain(
     tracing::info!("gst-домен завершён");
 }
 
-/// Усилитель включён, пока приём должен играть или пайплайн ещё в Playing.
-/// Stop снимает want_playing сразу, но хвост пайплайна не роняет пин раньше звука.
+/// Запасной признак, пока мастер не прислал `SetAmpDrive`.
+/// «Старт» включает приём. Музыку источника считает контроллер.
 fn rx_playing(half: &Option<RoleHalf>) -> bool {
     let Some(h) = half else { return false };
     h.gate.want_playing

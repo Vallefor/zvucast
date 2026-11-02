@@ -37,7 +37,9 @@ use crate::registry::{NodeView, Registry, RegistryError};
 use crate::update::{
     asset_url_ok, fetch_latest, update_body_ok, update_offer, update_order, Offer, Release, ReleaseCache,
 };
-use crate::silence::{classify, fold_samples, Sample, SilenceBook, ZoneTick};
+use crate::silence::{
+    classify, fold_samples, source_has_music, AmpFollow, Sample, SilenceBook, ZoneTick,
+};
 use crate::state::{
     assignment, clear_feed, default_jb_ms, drop_missing_feed_keys, keep_single_source_map,
     normalize_sources, owner_ids, owner_maps, zone_groups, NodeMeta, State as MasterState, StateStore,
@@ -1972,14 +1974,23 @@ async fn patch_node(
 pub fn spawn_silence_ticker(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut book = SilenceBook::default();
+        let mut amp_follow: HashMap<String, AmpFollow> = HashMap::new();
+        let mut amp_sent: HashMap<String, bool> = HashMap::new();
+        let mut amp_hello: HashMap<String, u64> = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
             let now = Instant::now();
-            let zones = state.store.lock().await.state().zones.clone();
+            let (zones, targets) = {
+                let store = state.store.lock().await;
+                let st = store.state();
+                (st.zones.clone(), amp_targets(st))
+            };
             let mut ticks = Vec::new();
             {
-                let reg = state.reg.lock().await;
+                let mut reg = state.reg.lock().await;
+                let hello = reg.hello_seqs();
+                let mut zone_music: HashMap<String, bool> = HashMap::new();
                 for z in &zones {
                     let samples: Vec<Sample> = z
                         .zone_sources()
@@ -2000,6 +2011,7 @@ pub fn spawn_silence_ticker(state: AppState) -> tokio::task::JoinHandle<()> {
                         })
                         .collect();
                     let sample = fold_samples(&samples);
+                    zone_music.insert(z.id.clone(), zone_has_music(&reg, z, now));
                     ticks.push(ZoneTick {
                         id: z.id.clone(),
                         active: z.active,
@@ -2007,6 +2019,40 @@ pub fn spawn_silence_ticker(state: AppState) -> tokio::task::JoinHandle<()> {
                         sample,
                     });
                 }
+                let mut live: HashSet<String> = HashSet::new();
+                for (id, zone_id) in &targets {
+                    live.insert(id.clone());
+                    let music = zone_id
+                        .as_ref()
+                        .and_then(|zone| zone_music.get(zone))
+                        .copied()
+                        .unwrap_or(false);
+                    let on = amp_follow.entry(id.clone()).or_default().step(now, music);
+                    let fresh = amp_hello.get(id) != hello.get(id);
+                    if amp_sent.get(id) == Some(&on) && !fresh {
+                        continue;
+                    }
+                    match reg.send_cmd(id, CtlMsg::SetAmpDrive { on }) {
+                        Ok(()) => tracing::info!(node = id, on, "усилитель по музыке источника"),
+                        Err(RegistryError::Closed) => {
+                            reg.mark_offline(id);
+                        }
+                        Err(e) => tracing::warn!(node = id, "усилитель не доставлен: {e}"),
+                    }
+                    amp_sent.insert(id.clone(), on);
+                }
+                let gone: Vec<String> = amp_sent
+                    .keys()
+                    .filter(|id| !live.contains(*id))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    amp_follow.remove(&id);
+                    if amp_sent.remove(&id) == Some(true) {
+                        let _ = reg.send_cmd(&id, CtlMsg::SetAmpDrive { on: false });
+                    }
+                }
+                amp_hello = hello;
             }
             let held = book.recompute(now, &ticks);
             let mut slot = state.silence_holds.lock().await;
@@ -2017,6 +2063,41 @@ pub fn spawn_silence_ticker(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// Музыка на источнике зоны: любой канал не тише порога.
+/// Состояние «Старт» в замер не входит.
+fn zone_has_music(reg: &Registry, zone: &Zone, now: Instant) -> bool {
+    if !zone.active {
+        return false;
+    }
+    zone.zone_sources().iter().any(|src| {
+        let got = match src {
+            ZoneSource::Line(id) => reg.tx_sample(id, now),
+            ZoneSource::Feed { node_id, kind } => reg.feed_sample(node_id, &zone.id, *kind, now),
+        };
+        match got {
+            Some((age, _started, rms_l, rms_r)) => {
+                source_has_music(age, rms_l, rms_r, zone.silence_threshold_db)
+            }
+            None => false,
+        }
+    })
+}
+
+/// Колонки с линией усилителя и зона-владелец, если она активна.
+fn amp_targets(state: &MasterState) -> Vec<(String, Option<String>)> {
+    let owners = owner_ids(state);
+    let mut out: Vec<(String, Option<String>)> = state
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            node.amp_gpio.filter(|line| crate::amp::line_ok(*line))?;
+            Some((id.clone(), owners.get(id).cloned()))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 pub fn spawn_endpoint_pusher(state: AppState) -> tokio::task::JoinHandle<()> {

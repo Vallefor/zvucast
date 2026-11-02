@@ -327,13 +327,17 @@ pub mod proto {
             sha256: String,
         },
         /// Линия gpiochip0 для усилителя. None — отпустить выход.
-        /// Без инверсии агент держит её высокой, только пока играет приём.
-        /// `invert` — играет низкая, молчит высокая. Старое сообщение без поля читается как false.
+        /// `invert` — музыка даёт низкий уровень, тишина — высокий.
+        /// Старое сообщение без поля читается как false.
+        /// Сам факт музыки приходит отдельно, `SetAmpDrive`.
         SetAmpGpio {
             line: Option<u32>,
             #[serde(default)]
             invert: bool,
         },
+        /// Включить выход усилителя. `on` — на источнике колонки есть музыка
+        /// в любом канале. Нажатый «Старт» сам по себе выход не включает.
+        SetAmpDrive { on: bool },
     }
 }
 
@@ -798,6 +802,10 @@ mod tests {
             serde_json::from_str::<CtlMsg>(r#"{"type":"SetAmpGpio","line":null}"#).unwrap(),
             CtlMsg::SetAmpGpio { line: None, invert: false }
         );
+        let drive = CtlMsg::SetAmpDrive { on: true };
+        let drive_wire = serde_json::to_string(&drive).unwrap();
+        assert!(drive_wire.contains("\"type\":\"SetAmpDrive\""), "{drive_wire}");
+        assert_eq!(serde_json::from_str::<CtlMsg>(&drive_wire).unwrap(), drive);
     }
 
     #[test]
