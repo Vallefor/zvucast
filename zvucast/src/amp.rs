@@ -1,4 +1,5 @@
 //! Выход усилителя. Пока приём играет, выбранная линия gpiochip0 высокая.
+//! Галочка «инвертировать» меняет это: играет — низкая, молчит — высокая.
 //! Номер в настройках — смещение линии. На Raspberry Pi 4 это номер BCM.
 
 use std::fs::OpenOptions;
@@ -19,9 +20,9 @@ pub fn line_ok(line: u32) -> bool {
     (LINE_MIN..=LINE_MAX).contains(&line)
 }
 
-/// Высокий уровень только пока узел играет.
-pub fn level_high(playing: bool) -> bool {
-    playing
+/// Обычный выход высокий, пока узел играет. Инверсия — наоборот.
+pub fn level_high(playing: bool, invert: bool) -> bool {
+    playing ^ invert
 }
 
 trait LineDrive {
@@ -34,13 +35,18 @@ trait LineDrive {
 struct AmpDrive<L: LineDrive> {
     line: L,
     chosen: Option<u32>,
+    invert: bool,
     high: bool,
     warned: bool,
 }
 
 impl<L: LineDrive> AmpDrive<L> {
     fn new(line: L) -> Self {
-        Self { line, chosen: None, high: false, warned: false }
+        Self { line, chosen: None, invert: false, high: false, warned: false }
+    }
+
+    fn set_invert(&mut self, invert: bool) {
+        self.invert = invert;
     }
 
     fn set_line(&mut self, next: Option<u32>) {
@@ -60,7 +66,7 @@ impl<L: LineDrive> AmpDrive<L> {
     }
 
     fn apply(&mut self, playing: bool) {
-        let high = level_high(playing);
+        let high = level_high(playing, self.invert);
         if self.chosen.is_none() || !self.line.is_open() || self.high == high {
             return;
         }
@@ -94,6 +100,10 @@ impl Amp {
 
     pub fn set_line(&mut self, line: Option<u32>) {
         self.drive.set_line(line);
+    }
+
+    pub fn set_invert(&mut self, invert: bool) {
+        self.drive.set_invert(invert);
     }
 
     pub fn apply(&mut self, playing: bool) {
@@ -278,8 +288,8 @@ mod tests {
 
     #[test]
     fn playing_drives_the_pin_high_and_silence_drives_it_low() {
-        assert!(level_high(true));
-        assert!(!level_high(false));
+        assert!(level_high(true, false));
+        assert!(!level_high(false, false));
         let mut amp = AmpDrive::new(Fake::default());
         amp.apply(true);
         assert!(amp.line.events.is_empty(), "без линии уровень не трогаем");
@@ -306,6 +316,21 @@ mod tests {
         amp.clear();
         assert!(amp.line.open.is_none());
         assert_eq!(amp.line.level, Some(false));
+    }
+
+    #[test]
+    fn inverted_pin_is_low_while_playing_and_high_while_idle() {
+        assert!(!level_high(true, true));
+        assert!(level_high(false, true));
+        let mut amp = AmpDrive::new(Fake::default());
+        amp.set_invert(true);
+        amp.set_line(Some(17));
+        amp.apply(false);
+        assert_eq!(amp.line.level, Some(true));
+        amp.apply(true);
+        assert_eq!(amp.line.level, Some(false));
+        amp.apply(false);
+        assert_eq!(amp.line.level, Some(true));
     }
 
     #[test]

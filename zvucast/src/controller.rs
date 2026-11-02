@@ -404,6 +404,8 @@ struct NodeApi {
     sendspin: bool,
     /// Линия усилителя. `null` — выход не выбран.
     amp_gpio: Option<u32>,
+    /// Галочка «Инвертировать»: играет — низкий уровень, молчит — высокий.
+    amp_invert: bool,
     /// Сводка установки. `null` — агент отчёт не присылал.
     setup: Option<Vec<SetupIssue>>,
 }
@@ -499,6 +501,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
             let spotify = meta.is_some_and(|m| m.spotify);
             let sendspin = meta.is_some_and(|m| m.sendspin);
             let amp_gpio = meta.and_then(|m| m.amp_gpio);
+            let amp_invert = meta.is_some_and(|m| m.amp_invert);
             let setup = merge_setup(reported, issues, soloist, &command, spotify);
             NodeApi {
                 node,
@@ -511,6 +514,7 @@ async fn list_nodes(State(st): State<AppState>) -> Json<Vec<NodeApi>> {
                 spotify,
                 sendspin,
                 amp_gpio,
+                amp_invert,
                 setup,
             }
         })
@@ -1687,6 +1691,9 @@ struct PatchNode {
     /// None — не трогать. Some(None) — отпустить выход. Some(Some(n)) — линия.
     #[serde(default, deserialize_with = "de_touched")]
     amp_gpio: Option<Option<u32>>,
+    /// None — не трогать. Галочка «Инвертировать».
+    #[serde(default)]
+    amp_invert: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1757,7 +1764,7 @@ async fn patch_node(
             format!("неизвестный узел {id_or_name}"),
         ))?
     };
-    if let Some(pin) = b.amp_gpio {
+    if b.amp_gpio.is_some() || b.amp_invert.is_some() {
         let plays = {
             let reg = st.reg.lock().await;
             reg.roles_of(&node_id).is_some_and(|roles| roles.contains(&Role::Rx))
@@ -1765,7 +1772,7 @@ async fn patch_node(
         if !plays {
             return Err((StatusCode::BAD_REQUEST, "gpio только у узла с воспроизведением".into()));
         }
-        if let Some(line) = pin {
+        if let Some(Some(line)) = b.amp_gpio {
             if !crate::amp::line_ok(line) {
                 return Err((StatusCode::BAD_REQUEST, format!("gpio {line} вне 2..=27")));
             }
@@ -1823,6 +1830,14 @@ async fn patch_node(
         meta.amp_gpio = pin;
         changed = true;
     }
+    if let Some(invert) = b.amp_invert {
+        meta.amp_invert = invert;
+        changed = true;
+    }
+    let amp_cmd = (b.amp_gpio.is_some() || b.amp_invert.is_some()).then_some(CtlMsg::SetAmpGpio {
+        line: meta.amp_gpio,
+        invert: meta.amp_invert,
+    });
     let drop_virtual = b.virtual_output == Some(false) && was_virtual;
     let drop_spotify = b.spotify == Some(false) && was_spotify;
     let drop_sendspin = b.sendspin == Some(false) && was_sendspin;
@@ -1898,8 +1913,8 @@ async fn patch_node(
                 },
             );
         }
-        if let Some(pin) = b.amp_gpio {
-            let _ = reg.send_cmd(&node_id, CtlMsg::SetAmpGpio { line: pin });
+        if let Some(cmd) = amp_cmd {
+            let _ = reg.send_cmd(&node_id, cmd);
         }
     }
     let reg = st.reg.lock().await;
@@ -2843,17 +2858,15 @@ async fn handle_socket(socket: WebSocket, st: AppState, ip: String) {
     if roles.contains(&Role::Rx) {
         let amp = {
             let store = st.store.lock().await;
-            store
-                .state()
-                .nodes
-                .get(&node_id)
-                .and_then(|n| n.amp_gpio)
-                .filter(|line| crate::amp::line_ok(*line))
+            store.state().nodes.get(&node_id).and_then(|n| {
+                let line = n.amp_gpio.filter(|line| crate::amp::line_ok(*line))?;
+                Some((line, n.amp_invert))
+            })
         };
         let mut reg = st.reg.lock().await;
         push_playback_target(&mut reg, &node_id, &owned.1);
-        if let Some(line) = amp {
-            let _ = reg.send_cmd(&node_id, CtlMsg::SetAmpGpio { line: Some(line) });
+        if let Some((line, invert)) = amp {
+            let _ = reg.send_cmd(&node_id, CtlMsg::SetAmpGpio { line: Some(line), invert });
         }
     }
 

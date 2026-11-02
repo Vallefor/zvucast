@@ -1832,14 +1832,20 @@ fn gst_domain(
                 // Команду забирает ws-домен и запускает скрипт вне этого cgroup.
                 tracing::warn!("ApplyUpdate в gst-домене — игнорируем")
             }
-            Ok(CtlMsg::SetAmpGpio { line }) => {
+            Ok(CtlMsg::SetAmpGpio { line, invert }) => {
                 if rx_half.is_none() {
                     tracing::debug!("SetAmpGpio: нет rx — игнорируем");
                 } else {
                     match line {
-                        Some(n) if crate::amp::line_ok(n) => amp.set_line(Some(n)),
+                        Some(n) if crate::amp::line_ok(n) => {
+                            amp.set_invert(invert);
+                            amp.set_line(Some(n));
+                        }
                         Some(n) => tracing::warn!("SetAmpGpio: линия {n} вне 2..=27"),
-                        None => amp.set_line(None),
+                        None => {
+                            amp.set_invert(false);
+                            amp.set_line(None);
+                        }
                     }
                 }
             }

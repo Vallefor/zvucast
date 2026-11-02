@@ -80,6 +80,8 @@ export interface NodeView {
   setup?: SetupIssue[] | null
   /** Линия gpiochip0. Нет поля или null — усилитель не включён. */
   amp_gpio?: number | null
+  /** Галочка «Инвертировать»: играет — low, молчит — high. */
+  amp_invert?: boolean
 }
 
 export interface MasterInfo {
@@ -134,6 +136,7 @@ export const api = {
     playback_volume?: number
     device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
     amp_gpio?: number | null
+    amp_invert?: boolean
   }) =>
     fetch(`/api/nodes/${id}`, {
       method: 'PATCH',

@@ -3363,13 +3363,28 @@ async fn amp_gpio_reaches_only_a_node_that_plays() {
     let mut got = None;
     for _ in 0..8 {
         let msg = spk.recv_ctl_within(2).await;
-        if let CtlMsg::SetAmpGpio { line } = msg {
-            got = Some(line);
+        if let CtlMsg::SetAmpGpio { line, invert } = msg {
+            got = Some((line, invert));
             break;
         }
     }
-    assert_eq!(got, Some(Some(17)));
+    assert_eq!(got, Some((Some(17), false)));
     let nodes = wait_for(port, |nodes| node(nodes, "spk")["amp_gpio"].as_u64() == Some(17)).await;
+    assert_eq!(node(&nodes, "spk")["amp_gpio"], 17);
+    assert_eq!(node(&nodes, "spk")["amp_invert"], false);
+
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_invert":true}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let mut flipped = None;
+    for _ in 0..8 {
+        let msg = spk.recv_ctl_within(2).await;
+        if let CtlMsg::SetAmpGpio { line, invert } = msg {
+            flipped = Some((line, invert));
+            break;
+        }
+    }
+    assert_eq!(flipped, Some((Some(17), true)));
+    let nodes = wait_for(port, |nodes| node(nodes, "spk")["amp_invert"].as_bool() == Some(true)).await;
     assert_eq!(node(&nodes, "spk")["amp_gpio"], 17);
 
     let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":null}"#).await;
@@ -3377,7 +3392,7 @@ async fn amp_gpio_reaches_only_a_node_that_plays() {
     let mut cleared = None;
     for _ in 0..8 {
         let msg = spk.recv_ctl_within(2).await;
-        if let CtlMsg::SetAmpGpio { line } = msg {
+        if let CtlMsg::SetAmpGpio { line, .. } = msg {
             cleared = Some(line);
             break;
         }
@@ -3399,6 +3414,8 @@ async fn amp_gpio_reaches_only_a_node_that_plays() {
     }
     let (status, body) = http_body(port, "PATCH", "/api/nodes/mic", r#"{"amp_gpio":17}"#).await;
     assert_eq!(status, 400, "{body}");
+    let (status, body) = http_body(port, "PATCH", "/api/nodes/mic", r#"{"amp_invert":true}"#).await;
+    assert_eq!(status, 400, "{body}");
     tx.assert_silent_within(1).await;
 
     let (status, body) = http_body(port, "PATCH", "/api/nodes/spk", r#"{"amp_gpio":18}"#).await;
@@ -3407,7 +3424,7 @@ async fn amp_gpio_reaches_only_a_node_that_plays() {
     let mut seen = false;
     for _ in 0..8 {
         let msg = again.recv_raw_within(2).await;
-        if matches!(msg, CtlMsg::SetAmpGpio { line: Some(18) }) {
+        if matches!(msg, CtlMsg::SetAmpGpio { line: Some(18), invert: true }) {
             seen = true;
             break;
         }

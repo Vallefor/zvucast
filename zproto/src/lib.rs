@@ -327,8 +327,13 @@ pub mod proto {
             sha256: String,
         },
         /// Линия gpiochip0 для усилителя. None — отпустить выход.
-        /// Агент держит её высокой, только пока играет приём.
-        SetAmpGpio { line: Option<u32> },
+        /// Без инверсии агент держит её высокой, только пока играет приём.
+        /// `invert` — играет низкая, молчит высокая. Старое сообщение без поля читается как false.
+        SetAmpGpio {
+            line: Option<u32>,
+            #[serde(default)]
+            invert: bool,
+        },
     }
 }
 
@@ -784,13 +789,14 @@ mod tests {
         let wire = serde_json::to_string(&set).unwrap();
         assert_eq!(serde_json::from_str::<CtlMsg>(&wire).unwrap(), set);
 
-        let amp = CtlMsg::SetAmpGpio { line: Some(17) };
+        let amp = CtlMsg::SetAmpGpio { line: Some(17), invert: true };
         let amp_wire = serde_json::to_string(&amp).unwrap();
         assert!(amp_wire.contains("\"type\":\"SetAmpGpio\""), "{amp_wire}");
+        assert!(amp_wire.contains("\"invert\":true"), "{amp_wire}");
         assert_eq!(serde_json::from_str::<CtlMsg>(&amp_wire).unwrap(), amp);
         assert_eq!(
             serde_json::from_str::<CtlMsg>(r#"{"type":"SetAmpGpio","line":null}"#).unwrap(),
-            CtlMsg::SetAmpGpio { line: None }
+            CtlMsg::SetAmpGpio { line: None, invert: false }
         );
     }
 

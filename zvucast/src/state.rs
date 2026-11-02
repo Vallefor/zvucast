@@ -28,9 +28,12 @@ pub struct NodeMeta {
     #[serde(default)]
     pub sendspin: bool,
     /// Линия gpiochip0 усилителя. None — выход не используется.
-    /// Пока приём играет, агент держит её высокой.
+    /// Пока приём играет, агент держит её высокой, если нет инверсии.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amp_gpio: Option<u32>,
+    /// Галочка «Инвертировать»: играет — низкий уровень, молчит — высокий.
+    #[serde(default)]
+    pub amp_invert: bool,
 }
 
 /// Микрофон узла или вид на узле-хозяине.
@@ -683,10 +686,14 @@ mod tests {
         let raw = r#"{"display_name":"Kitchen"}"#;
         let meta: NodeMeta = serde_json::from_str(raw).unwrap();
         assert_eq!(meta.amp_gpio, None);
-        let on = NodeMeta { amp_gpio: Some(17), ..NodeMeta::default() };
+        assert!(!meta.amp_invert);
+        let on = NodeMeta { amp_gpio: Some(17), amp_invert: true, ..NodeMeta::default() };
         let s = serde_json::to_string(&on).unwrap();
         assert!(s.contains("\"amp_gpio\":17"), "{s}");
-        assert_eq!(serde_json::from_str::<NodeMeta>(&s).unwrap().amp_gpio, Some(17));
+        assert!(s.contains("\"amp_invert\":true"), "{s}");
+        let back: NodeMeta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.amp_gpio, Some(17));
+        assert!(back.amp_invert);
     }
 
     #[test]

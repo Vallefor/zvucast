@@ -389,6 +389,7 @@ function NodeSettings({
   const [captureDraft, setCaptureDraft] = useState<number | null>(null)
   const [playbackDraft, setPlaybackDraft] = useState<number | null>(null)
   const [ampLine, setAmpLine] = useState(() => ampChoice(node.amp_gpio))
+  const [ampInvert, setAmpInvert] = useState(node.amp_invert ?? false)
   const [saving, setSaving] = useState(false)
   const savingRef = useRef(false)
   const perDevice = (node.telemetry?.device_volumes?.length ?? 0) > 0
@@ -419,6 +420,7 @@ function NodeSettings({
       playback_volume?: number
       device_volumes?: { device: string; volume: number; card?: string; class?: string }[]
       amp_gpio?: number | null
+      amp_invert?: boolean
     } = { display_name: name.trim() || null }
     if (isTx) {
       const n = Number(dscp)
@@ -438,6 +440,7 @@ function NodeSettings({
     if (isRx) {
       body.outputs = outRows.map((row) => ({ id: row.id, name: row.name.trim(), enabled: row.enabled }))
       body.amp_gpio = ampLine === '' ? null : Number(ampLine)
+      body.amp_invert = ampInvert
     }
     if (captureShown) body.capture_volume = volumeFromPercent(capturePct)
     if (playbackShown) body.playback_volume = volumeFromPercent(playbackPct)
@@ -589,7 +592,16 @@ function NodeSettings({
               ))}
             </select>
           </label>
-          <p className="hint">{t('nodes.ampHint')}</p>
+          <label className="node-check">
+            <input
+              type="checkbox"
+              aria-label={t('nodes.ampInvert')}
+              checked={ampInvert}
+              onChange={(e) => setAmpInvert(e.target.checked)}
+            />
+            {t('nodes.ampInvert')}
+          </label>
+          <p className="hint">{t(ampInvert ? 'nodes.ampHintInvert' : 'nodes.ampHint')}</p>
         </section>
       )}
       {(captureShown || playbackShown) && (
