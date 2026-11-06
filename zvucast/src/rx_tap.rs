@@ -757,7 +757,7 @@ fn frames_of_ns(ns: u64) -> u32 {
     ((u128::from(ns) * 48_000) / 1_000_000_000) as u32
 }
 
-fn rtp_payload(bytes: &[u8]) -> Option<(u16, u32, &[u8])> {
+pub(crate) fn rtp_payload(bytes: &[u8]) -> Option<(u16, u32, &[u8])> {
     if bytes.len() < 12 || bytes[0] >> 6 != 2 {
         return None;
     }

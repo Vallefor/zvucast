@@ -767,8 +767,8 @@ const PLAY_PIPE_WAIT: Duration = Duration::from_millis(5);
 const PLAY_MS_MAX: u32 = 200;
 /// Период HiFiBerry. Кольцо карты считается этими квантами.
 /// `pw-play` просит тот же размер у группы карты и не ставит замок.
-const PLAY_QUANTUM: u32 = 256;
-const PLAY_LATENCY: &str = "256";
+const PLAY_QUANTUM: u32 = 128;
+const PLAY_LATENCY: &str = "128";
 
 fn play_ms(raw: Option<&str>) -> u32 {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -785,8 +785,8 @@ fn play_latency_frames(ms: u32) -> u32 {
     ms.saturating_mul(48)
 }
 
-/// Кадры в кольце карты: целое число квантов по 256.
-/// 40 мс → 2048, это 8 квантов. Середина кванта округляется вверх.
+/// Кадры в кольце карты: целое число квантов по 128.
+/// 40 мс → 1920, это 15 квантов. Середина кванта округляется вверх.
 fn play_stock_frames(ms: u32) -> u32 {
     let frames = play_latency_frames(ms);
     let quanta = frames.saturating_add(PLAY_QUANTUM / 2) / PLAY_QUANTUM;
@@ -1115,6 +1115,7 @@ fn feed_capture(
     appsrc.set_property("max-buffers", 32u64);
     let mut raw = [0u8; CAPTURE_BYTES];
     let mut acc = Vec::<u8>::with_capacity(FRAME_BYTES * 4);
+    let mut capture_times = crate::tx_tap::CaptureTimes::default();
     let mut pacer = FeedPacer::new(FRAME_BYTES, Duration::from_nanos(FRAME_NS));
     let mut clock = PtsClock {
         base_ns: 0,
@@ -1131,6 +1132,7 @@ fn feed_capture(
         if stdout.read_exact(&mut raw).is_err() {
             break;
         }
+        capture_times.note(crate::tx_tap::unix_us(), raw.len());
         acc.extend_from_slice(&raw);
         pacer.on_chunk(raw.len());
         let running = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
@@ -1147,9 +1149,11 @@ fn feed_capture(
             if rel.slot != PaceSlot::Frame || acc.len() < FRAME_BYTES {
                 break;
             }
+            let capture_us = capture_times.first_time().unwrap_or(0);
             let mut frame = [0u8; FRAME_BYTES];
             frame.copy_from_slice(&acc[..FRAME_BYTES]);
             acc.drain(..FRAME_BYTES);
+            capture_times.consume(FRAME_BYTES);
             let pts = clock.pts_ns();
             let now_run = appsrc.current_running_time().map(|t| t.nseconds()).unwrap_or(0);
             if pts > now_run.saturating_add(max_lead_ns) {
@@ -1165,6 +1169,7 @@ fn feed_capture(
                     break;
                 }
             }
+            crate::tx_tap::note_capture(appsrc.name().to_string(), capture_us, pts, FRAME_NS, &frame);
             match push_capture_chunk(&appsrc, &frame, pts, FRAME_NS) {
                 CapturePush::In => {}
                 CapturePush::Flushing => {
@@ -1172,6 +1177,7 @@ fn feed_capture(
                     // доводит Playing не мгновенно. Выход здесь оставлял
                     // виртуальную карту без pw-record до нового SetFeeds.
                     acc.clear();
+                    capture_times.clear();
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
@@ -2464,20 +2470,28 @@ appl_ptr    : 313632\n";
         assert_eq!(play_ms(Some("нет")), 40);
         assert_eq!(play_ms(Some("0")), 40);
         assert_eq!(play_latency_frames(play_ms(None)), 1920);
-        assert_eq!(play_stock_frames(40), 2048);
+        assert_eq!(play_stock_frames(40), 1920);
         assert_eq!(play_ms(Some("20")), 20);
         assert_eq!(play_latency_frames(20), 960);
         assert_eq!(play_stock_frames(20), 1024);
         assert_eq!(play_ms(Some(" 5 ")), 5);
         assert_eq!(play_latency_frames(5), 240);
         assert_eq!(play_stock_frames(5), 256);
-        assert_eq!(play_stock_frames(1), 256);
+        assert_eq!(play_stock_frames(1), 128);
         assert_eq!(play_ms(Some("400")), 200);
         let args = player_args("alsa_output.usb-test");
         let latency_at = args.iter().position(|arg| arg == "--latency").expect("latency");
         assert_eq!(args[latency_at + 1], PLAY_LATENCY);
         assert!(!args.iter().any(|arg| arg.contains("lock-quantum")));
         assert!(!args.iter().any(|arg| arg == "2048"));
+    }
+
+    #[test]
+    fn player_uses_a_128_frame_quantum() {
+        let args = player_args("alsa_output.hifiberry-test");
+        let latency_at = args.iter().position(|arg| arg == "--latency").expect("latency");
+        assert_eq!(args[latency_at + 1], "128");
+        assert_eq!(play_stock_frames(1), 128);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod setup;
 pub mod soloist;
 pub mod state;
 pub mod supervisor;
+pub mod tx_tap;
 pub mod uplink;
 pub mod update;
 pub mod volume;

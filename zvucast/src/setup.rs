@@ -19,7 +19,8 @@ const QUANTUM_MARKS: &[&str] = &[
     "default.clock.rate = 48000",
     "default.clock.allowed-rates = [ 48000 ]",
 ];
-/// Общий период 128, период 256 у HiFiBerry, запас наушников bcm2835.
+/// Общий период 128, период 128 у HiFiBerry, запас наушников bcm2835.
+/// Размер кольца HiFiBerry не фиксируем: 4 периода для PLAY=5, 20 для PLAY=40.
 const LATENCY_MARKS: &[&str] = &[
     "api.alsa.period-size = 128",
     "api.alsa.headroom = 0",
@@ -29,8 +30,7 @@ const LATENCY_MARKS: &[&str] = &[
     "api.alsa.headroom = 2048",
     "api.alsa.disable-batch = false",
     "alsa.card_name = \"snd_rpi_hifiberry_dac\"",
-    "HiFiBerry ест период 256",
-    "api.alsa.period-num = 20",
+    "HiFiBerry ест период 128",
     "api.alsa.headroom = 1920",
     "alsa.card_name = \"USB Audio CODEC\"",
     "api.alsa.period-size = 960",
@@ -312,7 +312,7 @@ fn marks_ok(text: &str, marks: &[&str]) -> bool {
 }
 
 /// Дропы установщика на месте: часы машины не заперты, частота 48 кГц,
-/// период 256 у HiFiBerry, большой буфер у встроенного джека Pi.
+/// период 128 у HiFiBerry, большой буфер у встроенного джека Pi.
 /// Старый файл с `clock.quantum` или без правила Headphones — нет.
 fn quanta_ok(quantum: Option<&str>, latency: Option<&str>) -> bool {
     match (quantum, latency) {
@@ -756,6 +756,37 @@ mod tests {
     #[test]
     fn installed_quanta_are_not_a_problem() {
         let host = healthy_debian();
+        assert!(inspect(&host)
+            .setup
+            .iter()
+            .all(|issue| issue.id != "pipewire-quantum"));
+    }
+
+    #[test]
+    fn latency_with_previous_hifiberry_period_is_reported() {
+        let mut host = healthy_debian();
+        host.files.insert(
+            LATENCY_CONF.into(),
+            LATENCY_MARKS
+                .join("\n")
+                .replace("HiFiBerry ест период 128", "HiFiBerry ест период 256"),
+        );
+        assert!(inspect(&host)
+            .setup
+            .iter()
+            .any(|issue| issue.id == "pipewire-quantum"));
+    }
+
+    #[test]
+    fn small_hifiberry_ring_for_play5_is_not_a_problem() {
+        let mut host = healthy_debian();
+        host.files.insert(
+            LATENCY_CONF.into(),
+            LATENCY_BODY.replace(
+                "api.alsa.period-size = 128\n        api.alsa.period-num = 20\n        api.alsa.headroom = 1920",
+                "api.alsa.period-size = 128\n        api.alsa.period-num = 4\n        api.alsa.headroom = 256",
+            ),
+        );
         assert!(inspect(&host)
             .setup
             .iter()

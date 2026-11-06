@@ -150,6 +150,7 @@ fn rx_head(
         .property("name", "mix")
         .property("ignore-inactive-pads", true)
         .property("latency", gst::ClockTime::from_mseconds(2))
+        .property("output-buffer-duration", 5_000_000u64)
         .property_from_str("start-time-selection", "first")
         .build()?;
     if let Some(pad) = mix.static_pad("src") {
@@ -333,7 +334,7 @@ pub fn build_rx_pw_ports(
         .property("async", false)
         .property("enable-last-sample", false)
         .property("drop", true)
-        .property("max-buffers", 8u32)
+        .property("max-buffers", 2u32)
         .build()?;
     pipe.add(&sink)?;
     gst::Element::link_many([&lev, &sink])?;
@@ -1180,6 +1181,9 @@ fn attach_feed_tail(
     pipe.add_many([&pay_conv, &pay_caps, &pay])?;
     tee.link(&pay_conv)?;
     gst::Element::link_many([&pay_conv, &pay_caps, &pay])?;
+    if let Some(pad) = pay.static_pad("src") {
+        crate::tx_tap::watch_rtp(&pad, b'U');
+    }
     attach_named_pay_tail(pipe, &pay, &feed.endpoints, dscp, bind, &tag)?;
     sync_added_tail(pipe, &src)?;
     Ok(())
@@ -1658,6 +1662,22 @@ mod tests {
         assert!(caps.to_string().contains("S16LE"), "{caps}");
         assert!(pipe.by_name("lev").is_some(), "level на месте (rms в телеметрию)");
         assert!(pipe.children().iter().all(|e| e.factory().unwrap().name() != "pipewiresink"));
+    }
+
+    #[test]
+    fn rx_pw_keeps_only_two_buffers_before_playback() {
+        gst::init().unwrap();
+        let pipe = build_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), &mut LoopbackUdp).unwrap();
+        let sink = pipe.by_name("asink").expect("sink name=asink");
+        assert_eq!(sink.property::<u32>("max-buffers"), 2);
+    }
+
+    #[test]
+    fn rx_pw_mixes_in_five_millisecond_blocks() {
+        gst::init().unwrap();
+        let pipe = build_rx_pw(&crate::config::PipelineCfg::default_rx(), &ChannelMap::default(), &mut LoopbackUdp).unwrap();
+        let mix = pipe.by_name("mix").expect("mixer name=mix");
+        assert_eq!(mix.property::<u64>("output-buffer-duration"), 5_000_000);
     }
 
     /// Живой L16 на порт колонки должен дойти до appsink. Зависший микшер
